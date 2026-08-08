@@ -1,0 +1,10 @@
+[package]
+name = "ignition_protocol_generated"
+version = "0.1.0"
+authors = ["sbetool"]
+description = "Ignition single-symbol CLOB protocol"
+edition = "2021"
+
+[lib]
+name = "ignition_protocol_generated"
+path = "src/lib.rs"

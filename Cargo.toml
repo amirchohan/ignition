@@ -3,4 +3,9 @@ name = "ignition"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "server"
+path = "bin/server.rs"
+
 [dependencies]
+ignition_protocol_generated = { path = "src/protocol/generated/ignition_protocol_generated" }
