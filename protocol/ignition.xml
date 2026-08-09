@@ -3,8 +3,8 @@
     xmlns:sbe="http://fixprotocol.io/2016/sbe"
     package="ignition_protocol_generated"
     id="7001"
-    version="1"
-    semanticVersion="1.0.0"
+    version="7"
+    semanticVersion="7.0.0"
     description="Ignition single-symbol CLOB protocol"
     byteOrder="littleEndian">
 
@@ -60,17 +60,15 @@
             <validValue name="Ask">2</validValue>
         </enum>
 
-        <enum name="ControlAction" encodingType="uint8">
-            <validValue name="Activate">1</validValue>
-            <validValue name="Deactivate">2</validValue>
-            <validValue name="Query">3</validValue>
+        <enum name="KillSwitchAction" encodingType="uint8">
+            <validValue name="HaltTrading">1</validValue>
+            <validValue name="Shutdown">2</validValue>
+            <validValue name="ResumeTrading">3</validValue>
         </enum>
 
-        <enum name="ControlStatus" encodingType="uint8">
+        <enum name="ControlResult" encodingType="uint8">
             <validValue name="Ok">1</validValue>
             <validValue name="Rejected">2</validValue>
-            <validValue name="Active">3</validValue>
-            <validValue name="Inactive">4</validValue>
         </enum>
 
         <enum name="ErrorCode" encodingType="uint8">
@@ -81,106 +79,103 @@
         </enum>
     </types>
 
-    <message name="NewOrder" id="1" description="Submit a new order">
-        <field name="clientOrderId" id="1" type="uint64"/>
-        <field name="accountId" id="2" type="uint64"/>
-        <field name="clientTs" id="3" type="uint64"/>
-        <field name="side" id="4" type="Side"/>
-        <field name="orderType" id="5" type="OrderType"/>
-        <field name="timeInForce" id="6" type="TimeInForce"/>
-        <field name="price" id="7" type="int64"/>
-        <field name="qty" id="8" type="uint64"/>
+    <message name="KillSwitch" id="1" description="Control kill-switch state">
+        <field name="requestId" id="1" type="uint32"/>
+        <field name="action" id="2" type="KillSwitchAction"/>
     </message>
 
-    <message name="CancelOrder" id="2" description="Cancel a resting order">
-        <field name="clientOrderId" id="1" type="uint64"/>
-        <field name="accountId" id="2" type="uint64"/>
-        <field name="origClientOrderId" id="3" type="uint64"/>
-        <field name="clientTs" id="4" type="uint64"/>
+    <message name="Snapshot" id="2" description="Request a book and engine-state snapshot">
+        <field name="requestId" id="1" type="uint32"/>
     </message>
 
-    <message name="CancelReplace" id="3" description="Replace a resting order">
-        <field name="clientOrderId" id="1" type="uint64"/>
-        <field name="accountId" id="2" type="uint64"/>
-        <field name="origClientOrderId" id="3" type="uint64"/>
-        <field name="clientTs" id="4" type="uint64"/>
-        <field name="price" id="5" type="int64"/>
-        <field name="qty" id="6" type="uint64"/>
+    <message name="Heartbeat" id="3" description="Control-plane heartbeat">
+        <field name="heartbeatSeq" id="1" type="uint32"/>
     </message>
 
-    <message name="MassCancel" id="4" description="Cancel all resting orders for an account">
-        <field name="clientOrderId" id="1" type="uint64"/>
-        <field name="accountId" id="2" type="uint64"/>
-        <field name="clientTs" id="3" type="uint64"/>
-    </message>
-
-    <message name="KillSwitch" id="10" description="Control kill-switch state">
-        <field name="requestId" id="1" type="uint64"/>
-        <field name="clientTs" id="2" type="uint64"/>
-        <field name="action" id="3" type="ControlAction"/>
-    </message>
-
-    <message name="Snapshot" id="11" description="Request a book and engine-state snapshot">
-        <field name="requestId" id="1" type="uint64"/>
-        <field name="clientTs" id="2" type="uint64"/>
-    </message>
-
-    <message name="Heartbeat" id="12" description="Control-plane heartbeat">
-        <field name="heartbeatSeq" id="1" type="uint64"/>
-        <field name="clientTs" id="2" type="uint64"/>
-    </message>
-
-    <message name="ExecutionReport" id="100" description="Order lifecycle report">
+    <message name="ControlResponse" id="50" description="Control-plane response">
         <field name="engineSeq" id="1" type="uint64"/>
-        <field name="clientOrderId" id="2" type="uint64"/>
-        <field name="accountId" id="3" type="uint64"/>
-        <field name="recvTs" id="4" type="uint64"/>
-        <field name="state" id="5" type="ExecState"/>
-        <field name="rejectReason" id="6" type="RejectReason"/>
-        <field name="fillPrice" id="7" type="int64"/>
-        <field name="fillQty" id="8" type="uint64"/>
-        <field name="remainingQty" id="9" type="uint64"/>
-    </message>
-
-    <message name="TradePrint" id="101" description="Market-data trade print">
-        <field name="mdSeq" id="1" type="uint64"/>
-        <field name="tradeId" id="2" type="uint64"/>
-        <field name="makerOrderId" id="3" type="uint64"/>
-        <field name="takerOrderId" id="4" type="uint64"/>
-        <field name="price" id="5" type="int64"/>
-        <field name="qty" id="6" type="uint64"/>
-        <field name="recvTs" id="7" type="uint64"/>
-    </message>
-
-    <message name="BookUpdate" id="102" description="Top-of-book update">
-        <field name="mdSeq" id="1" type="uint64"/>
-        <field name="prevMdSeq" id="2" type="uint64"/>
-        <field name="bidPrice" id="3" type="int64"/>
-        <field name="bidQty" id="4" type="uint64"/>
-        <field name="askPrice" id="5" type="int64"/>
-        <field name="askQty" id="6" type="uint64"/>
-        <field name="recvTs" id="7" type="uint64"/>
-    </message>
-
-    <message name="ControlResponse" id="110" description="Control-plane response">
-        <field name="engineSeq" id="1" type="uint64"/>
-        <field name="requestId" id="2" type="uint64"/>
+        <field name="requestId" id="2" type="uint32"/>
         <field name="recvTs" id="3" type="uint64"/>
-        <field name="status" id="4" type="ControlStatus"/>
+        <field name="result" id="4" type="ControlResult"/>
         <field name="reason" id="5" type="RejectReason"/>
     </message>
 
-    <message name="HeartbeatStatus" id="111" description="Control-plane heartbeat status">
+    <message name="HeartbeatStatus" id="51" description="Control-plane heartbeat status">
         <field name="engineSeq" id="1" type="uint64"/>
-        <field name="heartbeatSeq" id="2" type="uint64"/>
+        <field name="heartbeatSeq" id="2" type="uint32"/>
         <field name="recvTs" id="3" type="uint64"/>
-        <field name="status" id="4" type="ControlStatus"/>
+        <field name="result" id="4" type="ControlResult"/>
     </message>
 
-    <message name="ProtocolError" id="112" description="Outbound protocol-level error">
+    <message name="ProtocolError" id="99" description="Outbound protocol-level error">
         <field name="engineSeq" id="1" type="uint64"/>
         <field name="templateId" id="2" type="uint16"/>
         <field name="recvTs" id="3" type="uint64"/>
         <field name="errorCode" id="4" type="ErrorCode"/>
+    </message>
+
+    <message name="NewOrder" id="100" description="Submit a new order">
+        <field name="clientOrderId" id="1" type="uint64"/>
+        <field name="accountId" id="2" type="uint32"/>
+        <field name="clientTs" id="3" type="uint64"/>
+        <field name="side" id="4" type="Side"/>
+        <field name="orderType" id="5" type="OrderType"/>
+        <field name="timeInForce" id="6" type="TimeInForce"/>
+        <field name="price" id="7" type="uint64"/>
+        <field name="qty" id="8" type="uint64"/>
+    </message>
+
+    <message name="CancelOrder" id="101" description="Cancel a resting order">
+        <field name="clientOrderId" id="1" type="uint64"/>
+        <field name="accountId" id="2" type="uint32"/>
+        <field name="origClientOrderId" id="3" type="uint64"/>
+        <field name="clientTs" id="4" type="uint64"/>
+    </message>
+
+    <message name="CancelReplace" id="102" description="Replace a resting order">
+        <field name="clientOrderId" id="1" type="uint64"/>
+        <field name="accountId" id="2" type="uint32"/>
+        <field name="origClientOrderId" id="3" type="uint64"/>
+        <field name="clientTs" id="4" type="uint64"/>
+        <field name="price" id="5" type="uint64"/>
+        <field name="qty" id="6" type="uint64"/>
+    </message>
+
+    <message name="MassCancel" id="103" description="Cancel all resting orders for an account">
+        <field name="clientOrderId" id="1" type="uint64"/>
+        <field name="accountId" id="2" type="uint32"/>
+        <field name="clientTs" id="3" type="uint64"/>
+    </message>
+
+    <message name="ExecutionReport" id="150" description="Order lifecycle report">
+        <field name="engineSeq" id="1" type="uint64"/>
+        <field name="clientOrderId" id="2" type="uint64"/>
+        <field name="accountId" id="3" type="uint32"/>
+        <field name="recvTs" id="4" type="uint64"/>
+        <field name="state" id="5" type="ExecState"/>
+        <field name="rejectReason" id="6" type="RejectReason"/>
+        <field name="fillPrice" id="7" type="uint64"/>
+        <field name="fillQty" id="8" type="uint64"/>
+        <field name="remainingQty" id="9" type="uint64"/>
+    </message>
+
+    <message name="TradePrint" id="200" description="Market-data trade print">
+        <field name="mdSeq" id="1" type="uint64"/>
+        <field name="tradeId" id="2" type="uint64"/>
+        <field name="makerOrderId" id="3" type="uint64"/>
+        <field name="takerOrderId" id="4" type="uint64"/>
+        <field name="price" id="5" type="uint64"/>
+        <field name="qty" id="6" type="uint64"/>
+        <field name="recvTs" id="7" type="uint64"/>
+    </message>
+
+    <message name="BookUpdate" id="201" description="Top-of-book update">
+        <field name="mdSeq" id="1" type="uint64"/>
+        <field name="prevMdSeq" id="2" type="uint64"/>
+        <field name="bidPrice" id="3" type="uint64"/>
+        <field name="bidQty" id="4" type="uint64"/>
+        <field name="askPrice" id="5" type="uint64"/>
+        <field name="askQty" id="6" type="uint64"/>
+        <field name="recvTs" id="7" type="uint64"/>
     </message>
 </sbe:messageSchema>

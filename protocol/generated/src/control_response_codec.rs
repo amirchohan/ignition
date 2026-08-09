@@ -1,35 +1,35 @@
 use crate::*;
 
-pub use decoder::ProtocolErrorDecoder;
-pub use encoder::ProtocolErrorEncoder;
+pub use decoder::ControlResponseDecoder;
+pub use encoder::ControlResponseEncoder;
 
 pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 19;
-pub const SBE_TEMPLATE_ID: u16 = 112;
+pub const SBE_BLOCK_LENGTH: u16 = 22;
+pub const SBE_TEMPLATE_ID: u16 = 50;
 
 pub mod encoder {
     use super::*;
     use message_header_codec::*;
 
     #[derive(Debug, Default)]
-    pub struct ProtocolErrorEncoder<'a> {
+    pub struct ControlResponseEncoder<'a> {
         buf: WriteBuf<'a>,
         initial_offset: usize,
         offset: usize,
         limit: usize,
     }
 
-    impl<'a> Writer<'a> for ProtocolErrorEncoder<'a> {
+    impl<'a> Writer<'a> for ControlResponseEncoder<'a> {
         #[inline]
         fn get_buf_mut(&mut self) -> &mut WriteBuf<'a> {
             &mut self.buf
         }
     }
 
-    impl<'a> Encoder<'a> for ProtocolErrorEncoder<'a> {
+    impl<'a> Encoder<'a> for ControlResponseEncoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -41,7 +41,7 @@ pub mod encoder {
         }
     }
 
-    impl<'a> ProtocolErrorEncoder<'a> {
+    impl<'a> ControlResponseEncoder<'a> {
         pub fn wrap(mut self, buf: WriteBuf<'a>, offset: usize) -> Self {
             let limit = offset + SBE_BLOCK_LENGTH as usize;
             self.buf = buf;
@@ -82,19 +82,19 @@ pub mod encoder {
             self
         }
 
-        /// primitive field 'templateId'
+        /// primitive field 'requestId'
         /// - min value: 0
-        /// - max value: 65534
-        /// - null value: 0xffff_u16
+        /// - max value: 4294967294
+        /// - null value: 0xffffffff_u32
         /// - characterEncoding: null
         /// - semanticType: null
         /// - encodedOffset: 8
-        /// - encodedLength: 2
+        /// - encodedLength: 4
         /// - version: 0
         #[inline]
-        pub fn template_id(&mut self, value: u16) -> &mut Self {
+        pub fn request_id(&mut self, value: u32) -> &mut Self {
             let offset = self.offset + 8;
-            self.get_buf_mut().put_u16_at(offset, value);
+            self.get_buf_mut().put_u32_at(offset, value);
             self
         }
 
@@ -104,20 +104,28 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 10
+        /// - encodedOffset: 12
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn recv_ts(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 10;
+            let offset = self.offset + 12;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
 
         /// REQUIRED enum
         #[inline]
-        pub fn error_code(&mut self, value: error_code::ErrorCode) -> &mut Self {
-            let offset = self.offset + 18;
+        pub fn result(&mut self, value: control_result::ControlResult) -> &mut Self {
+            let offset = self.offset + 20;
+            self.get_buf_mut().put_u8_at(offset, value as u8);
+            self
+        }
+
+        /// REQUIRED enum
+        #[inline]
+        pub fn reason(&mut self, value: reject_reason::RejectReason) -> &mut Self {
+            let offset = self.offset + 21;
             self.get_buf_mut().put_u8_at(offset, value as u8);
             self
         }
@@ -129,7 +137,7 @@ pub mod decoder {
     use message_header_codec::*;
 
     #[derive(Clone, Copy, Debug, Default)]
-    pub struct ProtocolErrorDecoder<'a> {
+    pub struct ControlResponseDecoder<'a> {
         buf: ReadBuf<'a>,
         initial_offset: usize,
         offset: usize,
@@ -138,21 +146,21 @@ pub mod decoder {
         pub acting_version: u16,
     }
 
-    impl ActingVersion for ProtocolErrorDecoder<'_> {
+    impl ActingVersion for ControlResponseDecoder<'_> {
         #[inline]
         fn acting_version(&self) -> u16 {
             self.acting_version
         }
     }
 
-    impl<'a> Reader<'a> for ProtocolErrorDecoder<'a> {
+    impl<'a> Reader<'a> for ControlResponseDecoder<'a> {
         #[inline]
         fn get_buf(&self) -> &ReadBuf<'a> {
             &self.buf
         }
     }
 
-    impl<'a> Decoder<'a> for ProtocolErrorDecoder<'a> {
+    impl<'a> Decoder<'a> for ControlResponseDecoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -164,7 +172,7 @@ pub mod decoder {
         }
     }
 
-    impl<'a> ProtocolErrorDecoder<'a> {
+    impl<'a> ControlResponseDecoder<'a> {
         pub fn wrap(
             mut self,
             buf: ReadBuf<'a>,
@@ -209,20 +217,26 @@ pub mod decoder {
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn template_id(&self) -> u16 {
-            self.get_buf().get_u16_at(self.offset + 8)
+        pub fn request_id(&self) -> u32 {
+            self.get_buf().get_u32_at(self.offset + 8)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
         pub fn recv_ts(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 10)
+            self.get_buf().get_u64_at(self.offset + 12)
         }
 
         /// REQUIRED enum
         #[inline]
-        pub fn error_code(&self) -> error_code::ErrorCode {
-            self.get_buf().get_u8_at(self.offset + 18).into()
+        pub fn result(&self) -> control_result::ControlResult {
+            self.get_buf().get_u8_at(self.offset + 20).into()
+        }
+
+        /// REQUIRED enum
+        #[inline]
+        pub fn reason(&self) -> reject_reason::RejectReason {
+            self.get_buf().get_u8_at(self.offset + 21).into()
         }
     }
 } // end decoder

@@ -4,12 +4,21 @@
 //! hand-written facade used by the rest of the crate. Business logic must not
 //! import generated codecs directly.
 
-pub mod codec;
 pub mod error;
-pub mod generated;
+pub mod frame;
+pub mod wire;
 
-pub use codec::{
+/// Generated SBE codecs.
+///
+/// Files in this module are generated from `protocol/ignition.xml` and must not
+/// be edited by hand. The handwritten facade in `crate::protocol::frame` is the
+/// public integration point for the rest of the crate.
+pub mod generated {
+    pub use ignition_protocol_generated as codecs;
+}
+
+pub use error::{ProtocolError, ProtocolResult};
+pub use frame::{
     MessageKind, ProtocolFrame, SBE_HEADER_LEN, SCHEMA_ID, SCHEMA_VERSION, decode_header,
     encode_header,
 };
-pub use error::{ProtocolError, ProtocolResult};

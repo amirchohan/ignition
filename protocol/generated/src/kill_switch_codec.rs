@@ -7,8 +7,8 @@ pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 17;
-pub const SBE_TEMPLATE_ID: u16 = 10;
+pub const SBE_BLOCK_LENGTH: u16 = 5;
+pub const SBE_TEMPLATE_ID: u16 = 1;
 
 pub mod encoder {
     use super::*;
@@ -68,40 +68,24 @@ pub mod encoder {
 
         /// primitive field 'requestId'
         /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
+        /// - max value: 4294967294
+        /// - null value: 0xffffffff_u32
         /// - characterEncoding: null
         /// - semanticType: null
         /// - encodedOffset: 0
-        /// - encodedLength: 8
+        /// - encodedLength: 4
         /// - version: 0
         #[inline]
-        pub fn request_id(&mut self, value: u64) -> &mut Self {
+        pub fn request_id(&mut self, value: u32) -> &mut Self {
             let offset = self.offset;
-            self.get_buf_mut().put_u64_at(offset, value);
-            self
-        }
-
-        /// primitive field 'clientTs'
-        /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
-        /// - characterEncoding: null
-        /// - semanticType: null
-        /// - encodedOffset: 8
-        /// - encodedLength: 8
-        /// - version: 0
-        #[inline]
-        pub fn client_ts(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 8;
-            self.get_buf_mut().put_u64_at(offset, value);
+            self.get_buf_mut().put_u32_at(offset, value);
             self
         }
 
         /// REQUIRED enum
         #[inline]
-        pub fn action(&mut self, value: control_action::ControlAction) -> &mut Self {
-            let offset = self.offset + 16;
+        pub fn action(&mut self, value: kill_switch_action::KillSwitchAction) -> &mut Self {
+            let offset = self.offset + 4;
             self.get_buf_mut().put_u8_at(offset, value as u8);
             self
         }
@@ -187,20 +171,14 @@ pub mod decoder {
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn request_id(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset)
-        }
-
-        /// primitive field - 'REQUIRED'
-        #[inline]
-        pub fn client_ts(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 8)
+        pub fn request_id(&self) -> u32 {
+            self.get_buf().get_u32_at(self.offset)
         }
 
         /// REQUIRED enum
         #[inline]
-        pub fn action(&self) -> control_action::ControlAction {
-            self.get_buf().get_u8_at(self.offset + 16).into()
+        pub fn action(&self) -> kill_switch_action::KillSwitchAction {
+            self.get_buf().get_u8_at(self.offset + 4).into()
         }
     }
 } // end decoder

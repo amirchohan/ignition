@@ -7,8 +7,8 @@ pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 16;
-pub const SBE_TEMPLATE_ID: u16 = 12;
+pub const SBE_BLOCK_LENGTH: u16 = 4;
+pub const SBE_TEMPLATE_ID: u16 = 3;
 
 pub mod encoder {
     use super::*;
@@ -68,33 +68,17 @@ pub mod encoder {
 
         /// primitive field 'heartbeatSeq'
         /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
+        /// - max value: 4294967294
+        /// - null value: 0xffffffff_u32
         /// - characterEncoding: null
         /// - semanticType: null
         /// - encodedOffset: 0
-        /// - encodedLength: 8
+        /// - encodedLength: 4
         /// - version: 0
         #[inline]
-        pub fn heartbeat_seq(&mut self, value: u64) -> &mut Self {
+        pub fn heartbeat_seq(&mut self, value: u32) -> &mut Self {
             let offset = self.offset;
-            self.get_buf_mut().put_u64_at(offset, value);
-            self
-        }
-
-        /// primitive field 'clientTs'
-        /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
-        /// - characterEncoding: null
-        /// - semanticType: null
-        /// - encodedOffset: 8
-        /// - encodedLength: 8
-        /// - version: 0
-        #[inline]
-        pub fn client_ts(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 8;
-            self.get_buf_mut().put_u64_at(offset, value);
+            self.get_buf_mut().put_u32_at(offset, value);
             self
         }
     }
@@ -179,14 +163,8 @@ pub mod decoder {
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn heartbeat_seq(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset)
-        }
-
-        /// primitive field - 'REQUIRED'
-        #[inline]
-        pub fn client_ts(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 8)
+        pub fn heartbeat_seq(&self) -> u32 {
+            self.get_buf().get_u32_at(self.offset)
         }
     }
 } // end decoder

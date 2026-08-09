@@ -8,4 +8,6 @@ name = "server"
 path = "bin/server.rs"
 
 [dependencies]
-ignition_protocol_generated = { path = "src/protocol/generated/ignition_protocol_generated" }
+ignition_protocol_generated = { path = "protocol/generated" }
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"

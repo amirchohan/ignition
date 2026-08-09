@@ -14,4 +14,6 @@ pub enum ProtocolError {
     UnsupportedVersion { version: u16 },
     /// The frame references an unknown SBE template ID.
     UnknownTemplate { template_id: u16 },
+    /// The frame references a known template that is not accepted by this endpoint.
+    UnexpectedTemplate { template_id: u16 },
 }

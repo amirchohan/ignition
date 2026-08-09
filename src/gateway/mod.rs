@@ -1,8 +1,8 @@
 //! Gateway boundary.
 //!
 //! The gateway owns frame/session ingress and egress. It may decode protocol
-//! frames and forward typed commands, but it must not make matching, risk, or
-//! market-data decisions.
+//! frames and forward typed control requests or order entries, but it must not
+//! make matching, risk, or market-data decisions.
 
 use crate::protocol::{ProtocolFrame, ProtocolResult};
 

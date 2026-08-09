@@ -1,35 +1,35 @@
 use crate::*;
 
-pub use decoder::HeartbeatStatusDecoder;
-pub use encoder::HeartbeatStatusEncoder;
+pub use decoder::MassCancelDecoder;
+pub use encoder::MassCancelEncoder;
 
 pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 25;
-pub const SBE_TEMPLATE_ID: u16 = 111;
+pub const SBE_BLOCK_LENGTH: u16 = 20;
+pub const SBE_TEMPLATE_ID: u16 = 103;
 
 pub mod encoder {
     use super::*;
     use message_header_codec::*;
 
     #[derive(Debug, Default)]
-    pub struct HeartbeatStatusEncoder<'a> {
+    pub struct MassCancelEncoder<'a> {
         buf: WriteBuf<'a>,
         initial_offset: usize,
         offset: usize,
         limit: usize,
     }
 
-    impl<'a> Writer<'a> for HeartbeatStatusEncoder<'a> {
+    impl<'a> Writer<'a> for MassCancelEncoder<'a> {
         #[inline]
         fn get_buf_mut(&mut self) -> &mut WriteBuf<'a> {
             &mut self.buf
         }
     }
 
-    impl<'a> Encoder<'a> for HeartbeatStatusEncoder<'a> {
+    impl<'a> Encoder<'a> for MassCancelEncoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -41,7 +41,7 @@ pub mod encoder {
         }
     }
 
-    impl<'a> HeartbeatStatusEncoder<'a> {
+    impl<'a> MassCancelEncoder<'a> {
         pub fn wrap(mut self, buf: WriteBuf<'a>, offset: usize) -> Self {
             let limit = offset + SBE_BLOCK_LENGTH as usize;
             self.buf = buf;
@@ -66,7 +66,7 @@ pub mod encoder {
             header
         }
 
-        /// primitive field 'engineSeq'
+        /// primitive field 'clientOrderId'
         /// - min value: 0
         /// - max value: -2
         /// - null value: 0xffffffffffffffff_u64
@@ -76,49 +76,41 @@ pub mod encoder {
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
-        pub fn engine_seq(&mut self, value: u64) -> &mut Self {
+        pub fn client_order_id(&mut self, value: u64) -> &mut Self {
             let offset = self.offset;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
 
-        /// primitive field 'heartbeatSeq'
+        /// primitive field 'accountId'
         /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
+        /// - max value: 4294967294
+        /// - null value: 0xffffffff_u32
         /// - characterEncoding: null
         /// - semanticType: null
         /// - encodedOffset: 8
-        /// - encodedLength: 8
+        /// - encodedLength: 4
         /// - version: 0
         #[inline]
-        pub fn heartbeat_seq(&mut self, value: u64) -> &mut Self {
+        pub fn account_id(&mut self, value: u32) -> &mut Self {
             let offset = self.offset + 8;
-            self.get_buf_mut().put_u64_at(offset, value);
+            self.get_buf_mut().put_u32_at(offset, value);
             self
         }
 
-        /// primitive field 'recvTs'
+        /// primitive field 'clientTs'
         /// - min value: 0
         /// - max value: -2
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 16
+        /// - encodedOffset: 12
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
-        pub fn recv_ts(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 16;
+        pub fn client_ts(&mut self, value: u64) -> &mut Self {
+            let offset = self.offset + 12;
             self.get_buf_mut().put_u64_at(offset, value);
-            self
-        }
-
-        /// REQUIRED enum
-        #[inline]
-        pub fn status(&mut self, value: control_status::ControlStatus) -> &mut Self {
-            let offset = self.offset + 24;
-            self.get_buf_mut().put_u8_at(offset, value as u8);
             self
         }
     }
@@ -129,7 +121,7 @@ pub mod decoder {
     use message_header_codec::*;
 
     #[derive(Clone, Copy, Debug, Default)]
-    pub struct HeartbeatStatusDecoder<'a> {
+    pub struct MassCancelDecoder<'a> {
         buf: ReadBuf<'a>,
         initial_offset: usize,
         offset: usize,
@@ -138,21 +130,21 @@ pub mod decoder {
         pub acting_version: u16,
     }
 
-    impl ActingVersion for HeartbeatStatusDecoder<'_> {
+    impl ActingVersion for MassCancelDecoder<'_> {
         #[inline]
         fn acting_version(&self) -> u16 {
             self.acting_version
         }
     }
 
-    impl<'a> Reader<'a> for HeartbeatStatusDecoder<'a> {
+    impl<'a> Reader<'a> for MassCancelDecoder<'a> {
         #[inline]
         fn get_buf(&self) -> &ReadBuf<'a> {
             &self.buf
         }
     }
 
-    impl<'a> Decoder<'a> for HeartbeatStatusDecoder<'a> {
+    impl<'a> Decoder<'a> for MassCancelDecoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -164,7 +156,7 @@ pub mod decoder {
         }
     }
 
-    impl<'a> HeartbeatStatusDecoder<'a> {
+    impl<'a> MassCancelDecoder<'a> {
         pub fn wrap(
             mut self,
             buf: ReadBuf<'a>,
@@ -203,26 +195,20 @@ pub mod decoder {
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn engine_seq(&self) -> u64 {
+        pub fn client_order_id(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn heartbeat_seq(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 8)
+        pub fn account_id(&self) -> u32 {
+            self.get_buf().get_u32_at(self.offset + 8)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn recv_ts(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 16)
-        }
-
-        /// REQUIRED enum
-        #[inline]
-        pub fn status(&self) -> control_status::ControlStatus {
-            self.get_buf().get_u8_at(self.offset + 24).into()
+        pub fn client_ts(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 12)
         }
     }
 } // end decoder

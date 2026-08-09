@@ -1,35 +1,35 @@
 use crate::*;
 
-pub use decoder::CancelReplaceDecoder;
-pub use encoder::CancelReplaceEncoder;
+pub use decoder::NewOrderDecoder;
+pub use encoder::NewOrderEncoder;
 
 pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 48;
-pub const SBE_TEMPLATE_ID: u16 = 3;
+pub const SBE_BLOCK_LENGTH: u16 = 39;
+pub const SBE_TEMPLATE_ID: u16 = 100;
 
 pub mod encoder {
     use super::*;
     use message_header_codec::*;
 
     #[derive(Debug, Default)]
-    pub struct CancelReplaceEncoder<'a> {
+    pub struct NewOrderEncoder<'a> {
         buf: WriteBuf<'a>,
         initial_offset: usize,
         offset: usize,
         limit: usize,
     }
 
-    impl<'a> Writer<'a> for CancelReplaceEncoder<'a> {
+    impl<'a> Writer<'a> for NewOrderEncoder<'a> {
         #[inline]
         fn get_buf_mut(&mut self) -> &mut WriteBuf<'a> {
             &mut self.buf
         }
     }
 
-    impl<'a> Encoder<'a> for CancelReplaceEncoder<'a> {
+    impl<'a> Encoder<'a> for NewOrderEncoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -41,7 +41,7 @@ pub mod encoder {
         }
     }
 
-    impl<'a> CancelReplaceEncoder<'a> {
+    impl<'a> NewOrderEncoder<'a> {
         pub fn wrap(mut self, buf: WriteBuf<'a>, offset: usize) -> Self {
             let limit = offset + SBE_BLOCK_LENGTH as usize;
             self.buf = buf;
@@ -84,33 +84,17 @@ pub mod encoder {
 
         /// primitive field 'accountId'
         /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
+        /// - max value: 4294967294
+        /// - null value: 0xffffffff_u32
         /// - characterEncoding: null
         /// - semanticType: null
         /// - encodedOffset: 8
-        /// - encodedLength: 8
+        /// - encodedLength: 4
         /// - version: 0
         #[inline]
-        pub fn account_id(&mut self, value: u64) -> &mut Self {
+        pub fn account_id(&mut self, value: u32) -> &mut Self {
             let offset = self.offset + 8;
-            self.get_buf_mut().put_u64_at(offset, value);
-            self
-        }
-
-        /// primitive field 'origClientOrderId'
-        /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
-        /// - characterEncoding: null
-        /// - semanticType: null
-        /// - encodedOffset: 16
-        /// - encodedLength: 8
-        /// - version: 0
-        #[inline]
-        pub fn orig_client_order_id(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 16;
-            self.get_buf_mut().put_u64_at(offset, value);
+            self.get_buf_mut().put_u32_at(offset, value);
             self
         }
 
@@ -120,29 +104,53 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 24
+        /// - encodedOffset: 12
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn client_ts(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 24;
+            let offset = self.offset + 12;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
 
+        /// REQUIRED enum
+        #[inline]
+        pub fn side(&mut self, value: side::Side) -> &mut Self {
+            let offset = self.offset + 20;
+            self.get_buf_mut().put_u8_at(offset, value as u8);
+            self
+        }
+
+        /// REQUIRED enum
+        #[inline]
+        pub fn order_type(&mut self, value: order_type::OrderType) -> &mut Self {
+            let offset = self.offset + 21;
+            self.get_buf_mut().put_u8_at(offset, value as u8);
+            self
+        }
+
+        /// REQUIRED enum
+        #[inline]
+        pub fn time_in_force(&mut self, value: time_in_force::TimeInForce) -> &mut Self {
+            let offset = self.offset + 22;
+            self.get_buf_mut().put_u8_at(offset, value as u8);
+            self
+        }
+
         /// primitive field 'price'
-        /// - min value: -9223372036854775807
-        /// - max value: 9223372036854775807
-        /// - null value: -9223372036854775808_i64
+        /// - min value: 0
+        /// - max value: -2
+        /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 32
+        /// - encodedOffset: 23
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
-        pub fn price(&mut self, value: i64) -> &mut Self {
-            let offset = self.offset + 32;
-            self.get_buf_mut().put_i64_at(offset, value);
+        pub fn price(&mut self, value: u64) -> &mut Self {
+            let offset = self.offset + 23;
+            self.get_buf_mut().put_u64_at(offset, value);
             self
         }
 
@@ -152,12 +160,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 40
+        /// - encodedOffset: 31
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn qty(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 40;
+            let offset = self.offset + 31;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -169,7 +177,7 @@ pub mod decoder {
     use message_header_codec::*;
 
     #[derive(Clone, Copy, Debug, Default)]
-    pub struct CancelReplaceDecoder<'a> {
+    pub struct NewOrderDecoder<'a> {
         buf: ReadBuf<'a>,
         initial_offset: usize,
         offset: usize,
@@ -178,21 +186,21 @@ pub mod decoder {
         pub acting_version: u16,
     }
 
-    impl ActingVersion for CancelReplaceDecoder<'_> {
+    impl ActingVersion for NewOrderDecoder<'_> {
         #[inline]
         fn acting_version(&self) -> u16 {
             self.acting_version
         }
     }
 
-    impl<'a> Reader<'a> for CancelReplaceDecoder<'a> {
+    impl<'a> Reader<'a> for NewOrderDecoder<'a> {
         #[inline]
         fn get_buf(&self) -> &ReadBuf<'a> {
             &self.buf
         }
     }
 
-    impl<'a> Decoder<'a> for CancelReplaceDecoder<'a> {
+    impl<'a> Decoder<'a> for NewOrderDecoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -204,7 +212,7 @@ pub mod decoder {
         }
     }
 
-    impl<'a> CancelReplaceDecoder<'a> {
+    impl<'a> NewOrderDecoder<'a> {
         pub fn wrap(
             mut self,
             buf: ReadBuf<'a>,
@@ -249,32 +257,44 @@ pub mod decoder {
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn account_id(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 8)
-        }
-
-        /// primitive field - 'REQUIRED'
-        #[inline]
-        pub fn orig_client_order_id(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 16)
+        pub fn account_id(&self) -> u32 {
+            self.get_buf().get_u32_at(self.offset + 8)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
         pub fn client_ts(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 24)
+            self.get_buf().get_u64_at(self.offset + 12)
+        }
+
+        /// REQUIRED enum
+        #[inline]
+        pub fn side(&self) -> side::Side {
+            self.get_buf().get_u8_at(self.offset + 20).into()
+        }
+
+        /// REQUIRED enum
+        #[inline]
+        pub fn order_type(&self) -> order_type::OrderType {
+            self.get_buf().get_u8_at(self.offset + 21).into()
+        }
+
+        /// REQUIRED enum
+        #[inline]
+        pub fn time_in_force(&self) -> time_in_force::TimeInForce {
+            self.get_buf().get_u8_at(self.offset + 22).into()
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn price(&self) -> i64 {
-            self.get_buf().get_i64_at(self.offset + 32)
+        pub fn price(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 23)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
         pub fn qty(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 40)
+            self.get_buf().get_u64_at(self.offset + 31)
         }
     }
 } // end decoder

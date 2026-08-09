@@ -1,35 +1,35 @@
 use crate::*;
 
-pub use decoder::SnapshotDecoder;
-pub use encoder::SnapshotEncoder;
+pub use decoder::BookUpdateDecoder;
+pub use encoder::BookUpdateEncoder;
 
 pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 16;
-pub const SBE_TEMPLATE_ID: u16 = 11;
+pub const SBE_BLOCK_LENGTH: u16 = 56;
+pub const SBE_TEMPLATE_ID: u16 = 201;
 
 pub mod encoder {
     use super::*;
     use message_header_codec::*;
 
     #[derive(Debug, Default)]
-    pub struct SnapshotEncoder<'a> {
+    pub struct BookUpdateEncoder<'a> {
         buf: WriteBuf<'a>,
         initial_offset: usize,
         offset: usize,
         limit: usize,
     }
 
-    impl<'a> Writer<'a> for SnapshotEncoder<'a> {
+    impl<'a> Writer<'a> for BookUpdateEncoder<'a> {
         #[inline]
         fn get_buf_mut(&mut self) -> &mut WriteBuf<'a> {
             &mut self.buf
         }
     }
 
-    impl<'a> Encoder<'a> for SnapshotEncoder<'a> {
+    impl<'a> Encoder<'a> for BookUpdateEncoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -41,7 +41,7 @@ pub mod encoder {
         }
     }
 
-    impl<'a> SnapshotEncoder<'a> {
+    impl<'a> BookUpdateEncoder<'a> {
         pub fn wrap(mut self, buf: WriteBuf<'a>, offset: usize) -> Self {
             let limit = offset + SBE_BLOCK_LENGTH as usize;
             self.buf = buf;
@@ -66,7 +66,7 @@ pub mod encoder {
             header
         }
 
-        /// primitive field 'requestId'
+        /// primitive field 'mdSeq'
         /// - min value: 0
         /// - max value: -2
         /// - null value: 0xffffffffffffffff_u64
@@ -76,13 +76,13 @@ pub mod encoder {
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
-        pub fn request_id(&mut self, value: u64) -> &mut Self {
+        pub fn md_seq(&mut self, value: u64) -> &mut Self {
             let offset = self.offset;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
 
-        /// primitive field 'clientTs'
+        /// primitive field 'prevMdSeq'
         /// - min value: 0
         /// - max value: -2
         /// - null value: 0xffffffffffffffff_u64
@@ -92,8 +92,88 @@ pub mod encoder {
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
-        pub fn client_ts(&mut self, value: u64) -> &mut Self {
+        pub fn prev_md_seq(&mut self, value: u64) -> &mut Self {
             let offset = self.offset + 8;
+            self.get_buf_mut().put_u64_at(offset, value);
+            self
+        }
+
+        /// primitive field 'bidPrice'
+        /// - min value: 0
+        /// - max value: -2
+        /// - null value: 0xffffffffffffffff_u64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 16
+        /// - encodedLength: 8
+        /// - version: 0
+        #[inline]
+        pub fn bid_price(&mut self, value: u64) -> &mut Self {
+            let offset = self.offset + 16;
+            self.get_buf_mut().put_u64_at(offset, value);
+            self
+        }
+
+        /// primitive field 'bidQty'
+        /// - min value: 0
+        /// - max value: -2
+        /// - null value: 0xffffffffffffffff_u64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 24
+        /// - encodedLength: 8
+        /// - version: 0
+        #[inline]
+        pub fn bid_qty(&mut self, value: u64) -> &mut Self {
+            let offset = self.offset + 24;
+            self.get_buf_mut().put_u64_at(offset, value);
+            self
+        }
+
+        /// primitive field 'askPrice'
+        /// - min value: 0
+        /// - max value: -2
+        /// - null value: 0xffffffffffffffff_u64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 32
+        /// - encodedLength: 8
+        /// - version: 0
+        #[inline]
+        pub fn ask_price(&mut self, value: u64) -> &mut Self {
+            let offset = self.offset + 32;
+            self.get_buf_mut().put_u64_at(offset, value);
+            self
+        }
+
+        /// primitive field 'askQty'
+        /// - min value: 0
+        /// - max value: -2
+        /// - null value: 0xffffffffffffffff_u64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 40
+        /// - encodedLength: 8
+        /// - version: 0
+        #[inline]
+        pub fn ask_qty(&mut self, value: u64) -> &mut Self {
+            let offset = self.offset + 40;
+            self.get_buf_mut().put_u64_at(offset, value);
+            self
+        }
+
+        /// primitive field 'recvTs'
+        /// - min value: 0
+        /// - max value: -2
+        /// - null value: 0xffffffffffffffff_u64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 48
+        /// - encodedLength: 8
+        /// - version: 0
+        #[inline]
+        pub fn recv_ts(&mut self, value: u64) -> &mut Self {
+            let offset = self.offset + 48;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -105,7 +185,7 @@ pub mod decoder {
     use message_header_codec::*;
 
     #[derive(Clone, Copy, Debug, Default)]
-    pub struct SnapshotDecoder<'a> {
+    pub struct BookUpdateDecoder<'a> {
         buf: ReadBuf<'a>,
         initial_offset: usize,
         offset: usize,
@@ -114,21 +194,21 @@ pub mod decoder {
         pub acting_version: u16,
     }
 
-    impl ActingVersion for SnapshotDecoder<'_> {
+    impl ActingVersion for BookUpdateDecoder<'_> {
         #[inline]
         fn acting_version(&self) -> u16 {
             self.acting_version
         }
     }
 
-    impl<'a> Reader<'a> for SnapshotDecoder<'a> {
+    impl<'a> Reader<'a> for BookUpdateDecoder<'a> {
         #[inline]
         fn get_buf(&self) -> &ReadBuf<'a> {
             &self.buf
         }
     }
 
-    impl<'a> Decoder<'a> for SnapshotDecoder<'a> {
+    impl<'a> Decoder<'a> for BookUpdateDecoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -140,7 +220,7 @@ pub mod decoder {
         }
     }
 
-    impl<'a> SnapshotDecoder<'a> {
+    impl<'a> BookUpdateDecoder<'a> {
         pub fn wrap(
             mut self,
             buf: ReadBuf<'a>,
@@ -179,14 +259,44 @@ pub mod decoder {
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn request_id(&self) -> u64 {
+        pub fn md_seq(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn client_ts(&self) -> u64 {
+        pub fn prev_md_seq(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset + 8)
+        }
+
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn bid_price(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 16)
+        }
+
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn bid_qty(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 24)
+        }
+
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn ask_price(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 32)
+        }
+
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn ask_qty(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 40)
+        }
+
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn recv_ts(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 48)
         }
     }
 } // end decoder

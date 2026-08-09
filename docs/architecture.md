@@ -11,31 +11,54 @@ in behavior without changing ownership.
 
 - Owns the SBE schema integration, generated codecs, and handwritten Rust facade.
 - `protocol/ignition.xml` is the source of truth for wire messages.
-- `src/protocol/generated/` contains committed generated Rust and is not edited
+- `protocol/generated/` contains committed generated Rust and is not edited
   by hand.
-- `src/protocol/` exposes stable encode/decode helpers to the rest of the crate.
+- `src/protocol/frame.rs` owns SBE header/template handling.
+- `src/protocol/wire/` exposes endpoint-specific encode/decode helpers:
+  control request/response paths and trading entry/event paths.
 - Does not own business logic, matching decisions, risk checks, IO, or runtime
   orchestration.
 
+### `domain`
+
+- Owns protocol-agnostic types consumed by control, risk, matching, market data,
+  replay, and benchmarking.
+- `domain::rd` owns single-instrument reference data and integer-scaled
+  `Price`, `Qty`, and raw notional types.
+- `domain::control` owns `ControlRequest` and `ControlEvent`.
+- `domain::trading::order` owns `OrderEntry` and execution reports.
+- `domain::trading::md` owns trade prints, book updates, and market-data
+  sequencing.
+- Shared deterministic values such as `RecvTs`, `EngineSeq`, reject reasons,
+  and protocol-error events live at the domain root.
+
 ### `gateway`
 
-- Owns frame/session ingress and egress.
-- Decodes complete input frames and forwards typed commands to the runtime.
-- Encodes outbound events into protocol frames.
+- Owns frame/session ingress and egress for two endpoint families:
+  control and trading.
+- Control ingress decodes only control requests: kill switch, snapshot, and
+  heartbeat.
+- Trading ingress decodes only order-entry messages: new, cancel,
+  cancel-replace, and mass cancel.
+- Control egress encodes control responses, heartbeat status, and protocol
+  errors for the control endpoint.
+- Trading egress encodes execution reports, trade prints, book updates, and
+  protocol errors for the trading endpoint.
 - Does not own matching, risk, market-data sequencing, or control-plane policy.
 
 ### `runtime`
 
 - Owns the future poll-driven orchestration loop.
-- Connects gateway input, control state, risk checks, engine execution,
-  market-data output, and protocol egress in explicit phases.
+- Connects the separate control and trading queues to control state, risk
+  checks, engine execution, market-data output, and protocol egress in explicit
+  phases.
 - Does not parse wire bytes directly and does not own order-book internals.
 
 ### `engine`
 
 - Owns future order-book state, order lifecycle mutations, and price-time
   priority matching.
-- Accepts internal typed commands, not raw protocol buffers.
+- Accepts internal typed order entries, not raw protocol buffers.
 - Emits internal execution/book events for market-data and protocol conversion.
 - Does not read wall-clock time, parse protocol bytes, or perform transport IO.
 
@@ -72,13 +95,15 @@ in behavior without changing ownership.
 
 The intended flow is:
 
-1. gateway receives bytes and decodes protocol frames,
-2. runtime translates frames into internal commands,
-3. control state and risk gates are observed before matching,
-4. engine mutates book state and emits internal events,
-5. market-data and execution outputs are sequenced,
-6. gateway encodes outbound protocol frames.
+1. gateway receives bytes on the control or trading endpoint,
+2. protocol wire adapters decode into `ControlRequest` or `OrderEntry`,
+3. runtime drains control and trading queues in deterministic order,
+4. control state and risk gates are observed before matching,
+5. engine mutates book state and emits internal execution/book effects,
+6. market-data and execution outputs are sequenced,
+7. gateway encodes control or trading egress frames.
 
-Milestone 1 defines this ownership contract and module shell only. Matching,
-risk behavior, real transport IO, clients, replay, and benchmarking are later
+Milestones 1 and 2 define this ownership contract, protocol/domain boundary,
+single-symbol reference data, and deterministic core model. Matching, risk
+behavior, real transport IO, clients, replay, and benchmarking are later
 milestones.

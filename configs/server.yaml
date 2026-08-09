@@ -1,0 +1,9 @@
+reference_data:
+  instrument:
+    instrument_id: 1001 # BTC-USD
+    base_asset_id: 1 # BTC
+    quote_asset_id: 2 # USD
+    price_decimals: 2 # price integer has 2 quote decimals per 1 base asset
+    qty_decimals: 8 # quantity integer has 8 base decimals
+    price_tick: 1 # minimum price increment in price integer units
+    qty_lot: 1 # minimum quantity increment in quantity integer units

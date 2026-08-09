@@ -1,4 +1,4 @@
-//! Thin protocol facade around generated SBE codecs.
+//! Thin protocol frame/header facade around generated SBE codecs.
 //!
 //! The facade stays buffer-oriented and side-effect-free. Runtime, gateway,
 //! replay, and client tooling should depend on this module rather than on the
@@ -10,7 +10,7 @@ use crate::protocol::error::{ProtocolError, ProtocolResult};
 pub const SCHEMA_ID: u16 = 7001;
 
 /// Current Ignition protocol schema version.
-pub const SCHEMA_VERSION: u16 = 1;
+pub const SCHEMA_VERSION: u16 = 7;
 
 /// Length of the standard SBE message header.
 pub const SBE_HEADER_LEN: usize = 8;
@@ -18,19 +18,19 @@ pub const SBE_HEADER_LEN: usize = 8;
 /// Known protocol message families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
-    /// Order-entry NewOrder command.
+    /// Order-entry NewOrder request.
     NewOrder,
-    /// Order-entry CancelOrder command.
+    /// Order-entry CancelOrder request.
     CancelOrder,
-    /// Order-entry CancelReplace command.
+    /// Order-entry CancelReplace request.
     CancelReplace,
-    /// Per-account mass-cancel command.
+    /// Per-account mass-cancel request.
     MassCancel,
-    /// Kill-switch control command.
+    /// Kill-switch control request.
     KillSwitch,
-    /// Snapshot control command.
+    /// Snapshot control request.
     Snapshot,
-    /// Control-plane heartbeat command.
+    /// Control-plane heartbeat request.
     Heartbeat,
     /// Outbound execution report.
     ExecutionReport,
@@ -50,40 +50,53 @@ impl MessageKind {
     /// Return the stable SBE template ID for this message kind.
     pub const fn template_id(self) -> u16 {
         match self {
-            Self::NewOrder => 1,
-            Self::CancelOrder => 2,
-            Self::CancelReplace => 3,
-            Self::MassCancel => 4,
-            Self::KillSwitch => 10,
-            Self::Snapshot => 11,
-            Self::Heartbeat => 12,
-            Self::ExecutionReport => 100,
-            Self::TradePrint => 101,
-            Self::BookUpdate => 102,
-            Self::ControlResponse => 110,
-            Self::HeartbeatStatus => 111,
-            Self::ProtocolError => 112,
+            Self::KillSwitch => 1,
+            Self::Snapshot => 2,
+            Self::Heartbeat => 3,
+            Self::ControlResponse => 50,
+            Self::HeartbeatStatus => 51,
+            Self::ProtocolError => 99,
+            Self::NewOrder => 100,
+            Self::CancelOrder => 101,
+            Self::CancelReplace => 102,
+            Self::MassCancel => 103,
+            Self::ExecutionReport => 150,
+            Self::TradePrint => 200,
+            Self::BookUpdate => 201,
         }
     }
 
     /// Decode a stable SBE template ID.
     pub const fn from_template_id(template_id: u16) -> ProtocolResult<Self> {
         match template_id {
-            1 => Ok(Self::NewOrder),
-            2 => Ok(Self::CancelOrder),
-            3 => Ok(Self::CancelReplace),
-            4 => Ok(Self::MassCancel),
-            10 => Ok(Self::KillSwitch),
-            11 => Ok(Self::Snapshot),
-            12 => Ok(Self::Heartbeat),
-            100 => Ok(Self::ExecutionReport),
-            101 => Ok(Self::TradePrint),
-            102 => Ok(Self::BookUpdate),
-            110 => Ok(Self::ControlResponse),
-            111 => Ok(Self::HeartbeatStatus),
-            112 => Ok(Self::ProtocolError),
+            1 => Ok(Self::KillSwitch),
+            2 => Ok(Self::Snapshot),
+            3 => Ok(Self::Heartbeat),
+            50 => Ok(Self::ControlResponse),
+            51 => Ok(Self::HeartbeatStatus),
+            99 => Ok(Self::ProtocolError),
+            100 => Ok(Self::NewOrder),
+            101 => Ok(Self::CancelOrder),
+            102 => Ok(Self::CancelReplace),
+            103 => Ok(Self::MassCancel),
+            150 => Ok(Self::ExecutionReport),
+            200 => Ok(Self::TradePrint),
+            201 => Ok(Self::BookUpdate),
             _ => Err(ProtocolError::UnknownTemplate { template_id }),
         }
+    }
+
+    /// True when this template is accepted on the control ingress endpoint.
+    pub const fn is_control_request(self) -> bool {
+        matches!(self, Self::KillSwitch | Self::Snapshot | Self::Heartbeat)
+    }
+
+    /// True when this template is accepted on the trading ingress endpoint.
+    pub const fn is_order_entry(self) -> bool {
+        matches!(
+            self,
+            Self::NewOrder | Self::CancelOrder | Self::CancelReplace | Self::MassCancel
+        )
     }
 }
 
@@ -144,8 +157,10 @@ pub fn decode_header(input: &[u8]) -> ProtocolResult<ProtocolFrame> {
 mod tests {
     use super::*;
     use crate::protocol::generated::codecs::{
-        ReadBuf, WriteBuf, execution_report_codec, kill_switch_codec, message_header_codec,
-        new_order_codec, order_type, side, time_in_force,
+        ReadBuf, WriteBuf, book_update_codec, cancel_order_codec, cancel_replace_codec,
+        control_response_codec, execution_report_codec, heartbeat_codec, heartbeat_status_codec,
+        kill_switch_codec, mass_cancel_codec, message_header_codec, new_order_codec, order_type,
+        protocol_error_codec, side, snapshot_codec, time_in_force, trade_print_codec,
     };
 
     #[test]
@@ -184,18 +199,47 @@ mod tests {
 
     #[test]
     fn facade_template_ids_match_generated_sbe_codecs() {
-        assert_eq!(
-            MessageKind::NewOrder.template_id(),
-            new_order_codec::SBE_TEMPLATE_ID
-        );
-        assert_eq!(
-            MessageKind::ExecutionReport.template_id(),
-            execution_report_codec::SBE_TEMPLATE_ID
-        );
-        assert_eq!(
-            MessageKind::KillSwitch.template_id(),
-            kill_switch_codec::SBE_TEMPLATE_ID
-        );
+        let cases = [
+            (MessageKind::KillSwitch, kill_switch_codec::SBE_TEMPLATE_ID),
+            (MessageKind::Snapshot, snapshot_codec::SBE_TEMPLATE_ID),
+            (MessageKind::Heartbeat, heartbeat_codec::SBE_TEMPLATE_ID),
+            (
+                MessageKind::ControlResponse,
+                control_response_codec::SBE_TEMPLATE_ID,
+            ),
+            (
+                MessageKind::HeartbeatStatus,
+                heartbeat_status_codec::SBE_TEMPLATE_ID,
+            ),
+            (
+                MessageKind::ProtocolError,
+                protocol_error_codec::SBE_TEMPLATE_ID,
+            ),
+            (MessageKind::NewOrder, new_order_codec::SBE_TEMPLATE_ID),
+            (
+                MessageKind::CancelOrder,
+                cancel_order_codec::SBE_TEMPLATE_ID,
+            ),
+            (
+                MessageKind::CancelReplace,
+                cancel_replace_codec::SBE_TEMPLATE_ID,
+            ),
+            (MessageKind::MassCancel, mass_cancel_codec::SBE_TEMPLATE_ID),
+            (
+                MessageKind::ExecutionReport,
+                execution_report_codec::SBE_TEMPLATE_ID,
+            ),
+            (MessageKind::TradePrint, trade_print_codec::SBE_TEMPLATE_ID),
+            (MessageKind::BookUpdate, book_update_codec::SBE_TEMPLATE_ID),
+        ];
+
+        for (kind, template_id) in cases {
+            assert_eq!(kind.template_id(), template_id);
+            assert_eq!(
+                MessageKind::from_template_id(template_id).expect("template ID should decode"),
+                kind
+            );
+        }
     }
 
     #[test]

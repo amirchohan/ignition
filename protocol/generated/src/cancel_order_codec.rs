@@ -1,35 +1,35 @@
 use crate::*;
 
-pub use decoder::ExecutionReportDecoder;
-pub use encoder::ExecutionReportEncoder;
+pub use decoder::CancelOrderDecoder;
+pub use encoder::CancelOrderEncoder;
 
 pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 58;
-pub const SBE_TEMPLATE_ID: u16 = 100;
+pub const SBE_BLOCK_LENGTH: u16 = 28;
+pub const SBE_TEMPLATE_ID: u16 = 101;
 
 pub mod encoder {
     use super::*;
     use message_header_codec::*;
 
     #[derive(Debug, Default)]
-    pub struct ExecutionReportEncoder<'a> {
+    pub struct CancelOrderEncoder<'a> {
         buf: WriteBuf<'a>,
         initial_offset: usize,
         offset: usize,
         limit: usize,
     }
 
-    impl<'a> Writer<'a> for ExecutionReportEncoder<'a> {
+    impl<'a> Writer<'a> for CancelOrderEncoder<'a> {
         #[inline]
         fn get_buf_mut(&mut self) -> &mut WriteBuf<'a> {
             &mut self.buf
         }
     }
 
-    impl<'a> Encoder<'a> for ExecutionReportEncoder<'a> {
+    impl<'a> Encoder<'a> for CancelOrderEncoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -41,7 +41,7 @@ pub mod encoder {
         }
     }
 
-    impl<'a> ExecutionReportEncoder<'a> {
+    impl<'a> CancelOrderEncoder<'a> {
         pub fn wrap(mut self, buf: WriteBuf<'a>, offset: usize) -> Self {
             let limit = offset + SBE_BLOCK_LENGTH as usize;
             self.buf = buf;
@@ -66,7 +66,7 @@ pub mod encoder {
             header
         }
 
-        /// primitive field 'engineSeq'
+        /// primitive field 'clientOrderId'
         /// - min value: 0
         /// - max value: -2
         /// - null value: 0xffffffffffffffff_u64
@@ -76,120 +76,56 @@ pub mod encoder {
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
-        pub fn engine_seq(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset;
-            self.get_buf_mut().put_u64_at(offset, value);
-            self
-        }
-
-        /// primitive field 'clientOrderId'
-        /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
-        /// - characterEncoding: null
-        /// - semanticType: null
-        /// - encodedOffset: 8
-        /// - encodedLength: 8
-        /// - version: 0
-        #[inline]
         pub fn client_order_id(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 8;
+            let offset = self.offset;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
 
         /// primitive field 'accountId'
         /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
+        /// - max value: 4294967294
+        /// - null value: 0xffffffff_u32
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 16
-        /// - encodedLength: 8
+        /// - encodedOffset: 8
+        /// - encodedLength: 4
         /// - version: 0
         #[inline]
-        pub fn account_id(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 16;
-            self.get_buf_mut().put_u64_at(offset, value);
+        pub fn account_id(&mut self, value: u32) -> &mut Self {
+            let offset = self.offset + 8;
+            self.get_buf_mut().put_u32_at(offset, value);
             self
         }
 
-        /// primitive field 'recvTs'
+        /// primitive field 'origClientOrderId'
         /// - min value: 0
         /// - max value: -2
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 24
+        /// - encodedOffset: 12
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
-        pub fn recv_ts(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 24;
+        pub fn orig_client_order_id(&mut self, value: u64) -> &mut Self {
+            let offset = self.offset + 12;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
 
-        /// REQUIRED enum
-        #[inline]
-        pub fn state(&mut self, value: exec_state::ExecState) -> &mut Self {
-            let offset = self.offset + 32;
-            self.get_buf_mut().put_u8_at(offset, value as u8);
-            self
-        }
-
-        /// REQUIRED enum
-        #[inline]
-        pub fn reject_reason(&mut self, value: reject_reason::RejectReason) -> &mut Self {
-            let offset = self.offset + 33;
-            self.get_buf_mut().put_u8_at(offset, value as u8);
-            self
-        }
-
-        /// primitive field 'fillPrice'
-        /// - min value: -9223372036854775807
-        /// - max value: 9223372036854775807
-        /// - null value: -9223372036854775808_i64
-        /// - characterEncoding: null
-        /// - semanticType: null
-        /// - encodedOffset: 34
-        /// - encodedLength: 8
-        /// - version: 0
-        #[inline]
-        pub fn fill_price(&mut self, value: i64) -> &mut Self {
-            let offset = self.offset + 34;
-            self.get_buf_mut().put_i64_at(offset, value);
-            self
-        }
-
-        /// primitive field 'fillQty'
+        /// primitive field 'clientTs'
         /// - min value: 0
         /// - max value: -2
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 42
+        /// - encodedOffset: 20
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
-        pub fn fill_qty(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 42;
-            self.get_buf_mut().put_u64_at(offset, value);
-            self
-        }
-
-        /// primitive field 'remainingQty'
-        /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
-        /// - characterEncoding: null
-        /// - semanticType: null
-        /// - encodedOffset: 50
-        /// - encodedLength: 8
-        /// - version: 0
-        #[inline]
-        pub fn remaining_qty(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 50;
+        pub fn client_ts(&mut self, value: u64) -> &mut Self {
+            let offset = self.offset + 20;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -201,7 +137,7 @@ pub mod decoder {
     use message_header_codec::*;
 
     #[derive(Clone, Copy, Debug, Default)]
-    pub struct ExecutionReportDecoder<'a> {
+    pub struct CancelOrderDecoder<'a> {
         buf: ReadBuf<'a>,
         initial_offset: usize,
         offset: usize,
@@ -210,21 +146,21 @@ pub mod decoder {
         pub acting_version: u16,
     }
 
-    impl ActingVersion for ExecutionReportDecoder<'_> {
+    impl ActingVersion for CancelOrderDecoder<'_> {
         #[inline]
         fn acting_version(&self) -> u16 {
             self.acting_version
         }
     }
 
-    impl<'a> Reader<'a> for ExecutionReportDecoder<'a> {
+    impl<'a> Reader<'a> for CancelOrderDecoder<'a> {
         #[inline]
         fn get_buf(&self) -> &ReadBuf<'a> {
             &self.buf
         }
     }
 
-    impl<'a> Decoder<'a> for ExecutionReportDecoder<'a> {
+    impl<'a> Decoder<'a> for CancelOrderDecoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -236,7 +172,7 @@ pub mod decoder {
         }
     }
 
-    impl<'a> ExecutionReportDecoder<'a> {
+    impl<'a> CancelOrderDecoder<'a> {
         pub fn wrap(
             mut self,
             buf: ReadBuf<'a>,
@@ -275,56 +211,26 @@ pub mod decoder {
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn engine_seq(&self) -> u64 {
+        pub fn client_order_id(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn client_order_id(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 8)
+        pub fn account_id(&self) -> u32 {
+            self.get_buf().get_u32_at(self.offset + 8)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn account_id(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 16)
+        pub fn orig_client_order_id(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 12)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn recv_ts(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 24)
-        }
-
-        /// REQUIRED enum
-        #[inline]
-        pub fn state(&self) -> exec_state::ExecState {
-            self.get_buf().get_u8_at(self.offset + 32).into()
-        }
-
-        /// REQUIRED enum
-        #[inline]
-        pub fn reject_reason(&self) -> reject_reason::RejectReason {
-            self.get_buf().get_u8_at(self.offset + 33).into()
-        }
-
-        /// primitive field - 'REQUIRED'
-        #[inline]
-        pub fn fill_price(&self) -> i64 {
-            self.get_buf().get_i64_at(self.offset + 34)
-        }
-
-        /// primitive field - 'REQUIRED'
-        #[inline]
-        pub fn fill_qty(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 42)
-        }
-
-        /// primitive field - 'REQUIRED'
-        #[inline]
-        pub fn remaining_qty(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 50)
+        pub fn client_ts(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 20)
         }
     }
 } // end decoder
