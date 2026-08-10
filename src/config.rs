@@ -9,8 +9,9 @@ use std::{fs, path::Path};
 use serde::Deserialize;
 
 use crate::{
-    domain::{DomainError, DomainResult, rd::InstrumentSpec},
+    domain::{DomainError, DomainResult, Price, rd::InstrumentSpec},
     engine::EngineConfig,
+    risk::RiskConfig,
 };
 
 /// Server configuration loaded from `configs/server.yaml`.
@@ -19,6 +20,8 @@ pub struct ServerConfig {
     pub reference_data: ReferenceDataConfig,
     #[serde(default)]
     pub engine: EngineRuntimeConfig,
+    #[serde(default)]
+    pub risk: RiskRuntimeConfig,
 }
 
 impl ServerConfig {
@@ -39,6 +42,12 @@ impl ServerConfig {
     pub fn validate_engine(&self) -> DomainResult<EngineConfig> {
         let instrument = self.validate()?;
         self.engine.validate(&instrument)
+    }
+
+    /// Validate risk settings against the configured instrument scale.
+    pub fn validate_risk(&self) -> DomainResult<RiskConfig> {
+        let instrument = self.validate()?;
+        self.risk.validate(&instrument)
     }
 }
 
@@ -106,6 +115,37 @@ impl EngineRuntimeConfig {
             self.max_resting_orders,
             self.max_account_id,
             self.max_active_pages,
+        )
+    }
+}
+
+/// Risk policy configuration loaded from YAML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct RiskRuntimeConfig {
+    pub max_open_orders_per_account: u32,
+    pub max_open_notional_per_account: u128,
+    pub startup_reference_price: u64,
+    pub price_band_bps: u32,
+}
+
+impl Default for RiskRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_open_orders_per_account: 1_000,
+            max_open_notional_per_account: 10_000_000_000_000_000,
+            startup_reference_price: 10_000_000,
+            price_band_bps: 1_000,
+        }
+    }
+}
+
+impl RiskRuntimeConfig {
+    pub fn validate(self, instrument: &InstrumentSpec) -> DomainResult<RiskConfig> {
+        RiskConfig::new(
+            self.max_open_orders_per_account,
+            self.max_open_notional_per_account,
+            Price::new(self.startup_reference_price, instrument)?,
+            self.price_band_bps,
         )
     }
 }

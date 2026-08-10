@@ -15,8 +15,8 @@ use crate::{
 };
 
 use super::{
-    EngineConfig, accounts::AccountTable, ladder::SideLadder, orders::OrderArena,
-    orders::OrderHandle, orders::RestingOrder, structural_reject_reason,
+    EngineConfig, OrderProjection, RestingOrderView, accounts::AccountTable, ladder::SideLadder,
+    orders::OrderArena, orders::OrderHandle, orders::RestingOrder, structural_reject_reason,
 };
 
 /// Single-symbol order book with side ladders and resting-order indexes.
@@ -92,6 +92,103 @@ impl OrderBook {
     /// Return the number of active resting orders.
     pub(crate) fn resting_order_count(&self) -> usize {
         self.orders.active()
+    }
+
+    /// Return whether an account ID can be addressed by this book.
+    pub(crate) fn account_exists(&self, account_id: AccountId) -> bool {
+        self.accounts.contains(account_id)
+    }
+
+    /// Return the account's current open resting order count.
+    pub(crate) fn account_open_order_count(&self, account_id: AccountId) -> Option<u32> {
+        self.accounts
+            .get(account_id)
+            .map(|account| account.open_order_count)
+    }
+
+    /// Return the account's current raw open resting notional.
+    pub(crate) fn account_open_notional(&self, account_id: AccountId) -> Option<u128> {
+        self.accounts
+            .get(account_id)
+            .map(|account| account.open_notional)
+    }
+
+    /// Return a read-only view of one resting order if it belongs to the account.
+    pub(crate) fn resting_order(
+        &self,
+        account_id: AccountId,
+        order_id: OrderId,
+    ) -> Option<RestingOrderView> {
+        let handle = self.order_index.get(&order_id).copied()?;
+        let order = self.orders.get(handle).copied()?;
+        (order.account_id == account_id).then_some(RestingOrderView {
+            order_id: order.order_id,
+            account_id: order.account_id,
+            side: order.side,
+            price: order.price,
+            remaining_qty: order.remaining_qty,
+        })
+    }
+
+    /// Project an incoming order against visible opposite liquidity without mutation.
+    pub(crate) fn project_order(
+        &self,
+        account_id: AccountId,
+        side: Side,
+        limit_price: Option<Price>,
+        qty: u64,
+    ) -> OrderProjection {
+        let mut remaining_qty = qty;
+        let mut executable_qty = 0;
+        let mut low_execution_price = None;
+        let mut high_execution_price = None;
+        let mut self_trade = false;
+        let opposite_side = best_side(side);
+        let mut cursor = self.side(opposite_side).best_level().map(|(key, _)| key);
+
+        while remaining_qty > 0 {
+            let Some(key) = cursor else {
+                break;
+            };
+            if !Self::is_executable(side, limit_price, key.price) {
+                break;
+            }
+
+            if let Some(level) = self.side(opposite_side).get_level(key) {
+                let mut current = level.head;
+                while remaining_qty > 0 {
+                    let Some(handle) = current else {
+                        break;
+                    };
+                    let Some(order) = self.orders.get(handle).copied() else {
+                        break;
+                    };
+                    let fill_qty = remaining_qty.min(order.remaining_qty);
+                    remaining_qty -= fill_qty;
+                    executable_qty += fill_qty;
+                    low_execution_price = Some(
+                        low_execution_price
+                            .map_or(order.price, |price: Price| price.min(order.price)),
+                    );
+                    high_execution_price = Some(
+                        high_execution_price
+                            .map_or(order.price, |price: Price| price.max(order.price)),
+                    );
+                    self_trade |= order.account_id == account_id;
+                    current = order.level_next;
+                }
+            }
+
+            cursor = self.next_occupied_key(opposite_side, key);
+        }
+
+        OrderProjection {
+            executable_qty,
+            residual_qty: remaining_qty,
+            low_execution_price,
+            high_execution_price,
+            self_trade,
+        }
     }
 
     /// Handle a new order, including matching and optional resting.
@@ -553,6 +650,10 @@ impl OrderBook {
         key: super::ladder::LevelKey,
         fill_qty: u64,
     ) {
+        let filled_notional = self
+            .orders
+            .get(maker_handle)
+            .map_or(0, |order| raw_notional(order.price, fill_qty));
         if let Some(order) = self.orders.get_mut(maker_handle) {
             order.remaining_qty -= fill_qty;
         }
@@ -560,6 +661,11 @@ impl OrderBook {
             .orders
             .get(maker_handle)
             .map_or(Side::Sell, |order| order.side);
+        if let Some(order) = self.orders.get(maker_handle).copied()
+            && let Some(account) = self.accounts.get_mut(order.account_id)
+        {
+            account.open_notional -= filled_notional;
+        }
         let level = self
             .side_mut(side)
             .get_level_mut_or_activate(key)
@@ -637,11 +743,26 @@ impl OrderBook {
         account_id: AccountId,
         handle: OrderHandle,
     ) -> DomainResult<()> {
-        let account = self
-            .accounts
-            .get_mut(account_id)
+        let order_notional = self
+            .orders
+            .get(handle)
+            .map(|order| raw_notional(order.price, order.remaining_qty))
             .ok_or(DomainError::Malformed)?;
-        let tail = account.tail;
+        let tail = {
+            let account = self
+                .accounts
+                .get_mut(account_id)
+                .ok_or(DomainError::Malformed)?;
+            let tail = account.tail;
+            if account.head.is_none() {
+                account.head = Some(handle);
+            }
+            account.tail = Some(handle);
+            account.open_order_count += 1;
+            account.open_notional += order_notional;
+            tail
+        };
+
         // Keep a second intrusive list so mass cancel never scans unrelated accounts.
         if let Some(tail) = tail {
             self.orders
@@ -650,11 +771,6 @@ impl OrderBook {
                 .account_next = Some(handle);
             self.orders.get_mut(handle).expect("order").account_prev = Some(tail);
         }
-        if account.head.is_none() {
-            account.head = Some(handle);
-        }
-        account.tail = Some(handle);
-        account.open_order_count += 1;
         Ok(())
     }
 
@@ -680,6 +796,9 @@ impl OrderBook {
 
         let level = self.side_mut(current.side).get_level_mut_or_activate(key)?;
         level.total_qty -= old_qty - replace.qty.raw();
+        if let Some(account) = self.accounts.get_mut(current.account_id) {
+            account.open_notional -= raw_notional(current.price, old_qty - replace.qty.raw());
+        }
         Ok(())
     }
 
@@ -754,6 +873,19 @@ impl OrderBook {
                 account.tail = order.account_prev;
             }
             account.open_order_count -= 1;
+            account.open_notional -= raw_notional(order.price, order.remaining_qty);
+        }
+    }
+
+    /// Return the next occupied price key behind `current` on one side of the book.
+    fn next_occupied_key(
+        &self,
+        side: Side,
+        current: super::ladder::LevelKey,
+    ) -> Option<super::ladder::LevelKey> {
+        match side {
+            Side::Buy => self.side(side).occupied_before(current),
+            Side::Sell => self.side(side).occupied_after(current),
         }
     }
 
@@ -949,6 +1081,10 @@ const fn best_side(taker_side: Side) -> Side {
         Side::Buy => Side::Sell,
         Side::Sell => Side::Buy,
     }
+}
+
+fn raw_notional(price: Price, qty: u64) -> u128 {
+    u128::from(price.raw()) * u128::from(qty)
 }
 
 #[allow(dead_code)]

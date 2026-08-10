@@ -12,7 +12,10 @@ mod orders;
 use crate::domain::{
     DomainError, DomainResult, EngineSequencer, Price, RejectReason,
     rd::InstrumentSpec,
-    trading::{TradingEvent, order::OrderEntry},
+    trading::{
+        TradingEvent,
+        order::{AccountId, OrderEntry, OrderId, Side},
+    },
 };
 use crate::market_data::MarketDataRuntime;
 
@@ -120,8 +123,6 @@ pub enum EngineError {
 pub struct Engine {
     /// In-memory book state and matching indexes.
     book: OrderBook,
-    /// Deterministic sequence allocator for execution reports.
-    sequencer: EngineSequencer,
 }
 
 impl Engine {
@@ -129,7 +130,6 @@ impl Engine {
     pub fn new(config: EngineConfig) -> Result<Self, EngineError> {
         Ok(Self {
             book: OrderBook::new(config).map_err(|_| EngineError::InvalidConfig)?,
-            sequencer: EngineSequencer::default(),
         })
     }
 
@@ -137,12 +137,13 @@ impl Engine {
     pub fn execute(
         &mut self,
         entry: OrderEntry,
+        sequencer: &mut EngineSequencer,
         market_data: &mut MarketDataRuntime,
         events: &mut Vec<TradingEvent>,
     ) -> Result<(), EngineError> {
         events.clear();
         self.book
-            .execute(entry, &mut self.sequencer, market_data, events)
+            .execute(entry, sequencer, market_data, events)
             .map_err(|error| match error {
                 DomainError::SequenceOverflow => EngineError::SequenceOverflow,
                 _ => EngineError::InvalidConfig,
@@ -163,6 +164,61 @@ impl Engine {
     pub fn resting_order_count(&self) -> usize {
         self.book.resting_order_count()
     }
+
+    /// Return whether this dense account ID is valid for this engine instance.
+    pub fn account_exists(&self, account_id: AccountId) -> bool {
+        self.book.account_exists(account_id)
+    }
+
+    /// Return the number of currently resting orders for one account.
+    pub fn account_open_order_count(&self, account_id: AccountId) -> Option<u32> {
+        self.book.account_open_order_count(account_id)
+    }
+
+    /// Return raw open resting notional for one account.
+    pub fn account_open_notional(&self, account_id: AccountId) -> Option<u128> {
+        self.book.account_open_notional(account_id)
+    }
+
+    /// Return a read-only view of one resting order for risk projection.
+    pub fn resting_order(
+        &self,
+        account_id: AccountId,
+        order_id: OrderId,
+    ) -> Option<RestingOrderView> {
+        self.book.resting_order(account_id, order_id)
+    }
+
+    /// Project how much of an incoming order would execute or rest without mutation.
+    pub fn project_order(
+        &self,
+        account_id: AccountId,
+        side: Side,
+        limit_price: Option<Price>,
+        qty: u64,
+    ) -> OrderProjection {
+        self.book.project_order(account_id, side, limit_price, qty)
+    }
+}
+
+/// Read-only resting-order view exposed across the engine boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestingOrderView {
+    pub order_id: OrderId,
+    pub account_id: AccountId,
+    pub side: Side,
+    pub price: Price,
+    pub remaining_qty: u64,
+}
+
+/// Read-only no-mutation projection of an incoming order against visible book liquidity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderProjection {
+    pub executable_qty: u64,
+    pub residual_qty: u64,
+    pub low_execution_price: Option<Price>,
+    pub high_execution_price: Option<Price>,
+    pub self_trade: bool,
 }
 
 pub(crate) fn structural_reject_reason(error: DomainError) -> RejectReason {
@@ -341,6 +397,7 @@ mod tests {
 
     struct TestEngine {
         engine: Engine,
+        sequencer: EngineSequencer,
         market_data: MarketDataRuntime,
     }
 
@@ -348,6 +405,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 engine: Engine::new(config()).expect("engine"),
+                sequencer: EngineSequencer::default(),
                 market_data: MarketDataRuntime::default(),
             }
         }
@@ -364,9 +422,19 @@ mod tests {
             self.engine.resting_order_count()
         }
 
+        fn account_open_order_count(&self, account: u32) -> Option<u32> {
+            self.engine
+                .account_open_order_count(AccountId::new(account).expect("account"))
+        }
+
+        fn account_open_notional(&self, account: u32) -> Option<u128> {
+            self.engine
+                .account_open_notional(AccountId::new(account).expect("account"))
+        }
+
         fn execute(&mut self, entry: OrderEntry, events: &mut Vec<TradingEvent>, label: &str) {
             self.engine
-                .execute(entry, &mut self.market_data, events)
+                .execute(entry, &mut self.sequencer, &mut self.market_data, events)
                 .expect(label);
         }
     }
@@ -426,6 +494,8 @@ mod tests {
         assert_eq!(engine.best_bid(), Some((price(1000), 10)));
         assert_eq!(engine.best_ask(), None);
         assert_eq!(engine.resting_order_count(), 1);
+        assert_eq!(engine.account_open_order_count(1), Some(1));
+        assert_eq!(engine.account_open_notional(1), Some(10_000));
     }
 
     #[test]
@@ -782,6 +852,8 @@ mod tests {
         );
 
         assert_eq!(md_seqs(&events), vec![3, 4, 5]);
+        assert_eq!(engine.account_open_order_count(1), Some(0));
+        assert_eq!(engine.account_open_notional(1), Some(0));
         let l2 = l2_updates(&events);
         let l1 = l1_updates(&events);
         assert_eq!(l2.len(), 1);
@@ -836,6 +908,45 @@ mod tests {
 
         assert_eq!(trade_makers(&events), vec![3]);
         assert_eq!(engine.resting_order_count(), 0);
+    }
+
+    #[test]
+    fn partial_fill_reduces_account_open_notional() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                1,
+                Side::Sell,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "rest",
+        );
+        execute(
+            &mut engine,
+            new_order(
+                2,
+                2,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Ioc,
+                Some(1000),
+                4,
+                2,
+            ),
+            &mut events,
+            "partial fill",
+        );
+
+        assert_eq!(engine.account_open_order_count(1), Some(1));
+        assert_eq!(engine.account_open_notional(1), Some(6_000));
     }
 
     #[test]
@@ -1088,6 +1199,8 @@ mod tests {
 
         assert_eq!(trade_makers(&events), vec![11]);
         assert_eq!(engine.best_ask(), Some((price(1000), 10)));
+        assert_eq!(engine.account_open_order_count(1), Some(0));
+        assert_eq!(engine.account_open_notional(1), Some(0));
     }
 
     #[test]

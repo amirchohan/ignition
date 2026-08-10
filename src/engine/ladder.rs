@@ -297,6 +297,46 @@ impl SideLadder {
         Some((key.price, level.total_qty))
     }
 
+    /// Return the next occupied key at a lower price than `current`.
+    pub(crate) fn occupied_before(&self, current: LevelKey) -> Option<LevelKey> {
+        if current.offset > 0
+            && let Some(page_handle) = self.page_slots[current.page_index]
+            && let Some(offset) = self.page_pool.pages[page_handle]
+                .occupied
+                .prev_set_from(current.offset - 1)
+        {
+            return self.key_from_page_offset(current.page_index, offset);
+        }
+
+        let page_index = current.page_index.checked_sub(1)?;
+        let page_index = self.occupied_pages.prev_set_from(page_index)?;
+        let page_handle = self.page_slots[page_index]?;
+        let offset = self.page_pool.pages[page_handle]
+            .occupied
+            .prev_set_from(self.page_size - 1)?;
+        self.key_from_page_offset(page_index, offset)
+    }
+
+    /// Return the next occupied key at a higher price than `current`.
+    pub(crate) fn occupied_after(&self, current: LevelKey) -> Option<LevelKey> {
+        if current.offset + 1 < self.page_size
+            && let Some(page_handle) = self.page_slots[current.page_index]
+            && let Some(offset) = self.page_pool.pages[page_handle]
+                .occupied
+                .next_set_from(current.offset + 1)
+        {
+            return self.key_from_page_offset(current.page_index, offset);
+        }
+
+        let page_index = current.page_index.checked_add(1)?;
+        let page_index = self.occupied_pages.next_set_from(page_index)?;
+        let page_handle = self.page_slots[page_index]?;
+        let offset = self.page_pool.pages[page_handle]
+            .occupied
+            .next_set_from(0)?;
+        self.key_from_page_offset(page_index, offset)
+    }
+
     /// Update best price after adding visible quantity at `key`.
     fn refresh_best_after_occupy(&mut self, key: LevelKey) {
         self.best = match (self.side, self.best) {

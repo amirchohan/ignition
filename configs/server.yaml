@@ -14,3 +14,8 @@ engine:
   max_resting_orders: 100000
   max_account_id: 100000
   max_active_pages: 4096
+risk:
+  max_open_orders_per_account: 1000
+  max_open_notional_per_account: 100000000000000000
+  startup_reference_price: 10000000 # $100,000.00 with price_decimals=2
+  price_band_bps: 1000 # +/-10%

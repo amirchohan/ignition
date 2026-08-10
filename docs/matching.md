@@ -31,6 +31,27 @@ trades immediately and any remainder expires instead of resting.
 Post-only limit orders are accepted only if they do not cross the opposite best
 price. A would-cross post-only order is canceled without execution.
 
+## Risk Checks
+
+The runtime applies risk before matching. Risk rejects emit execution reports
+with `ExecType::Rejected` / `OrdStatus::Rejected` and do not mutate the book.
+
+Per-account open-order and notional limits are based on live resting book state,
+not account balances. Open notional is tracked as `price_integer * qty_integer`
+for resting quantity. GTC limit orders are checked using their projected
+post-match residual. Market and IOC orders never rest, so they do not add open
+order count or open notional.
+
+Price-band checks use a configured startup reference price until the first
+trade, then the latest trade price. The band is inclusive. Limit orders are
+checked against their submitted limit price; projected executable prices are
+also checked so market orders cannot sweep outside the band.
+
+Self-trade prevention uses a cancel-aggressive policy. If an incoming matching
+order would execute against resting liquidity from the same account, the
+incoming command is rejected with `SelfTradePrevention` before any trade or book
+mutation occurs. Resting orders are preserved.
+
 ## Cancels
 
 `CancelOrder` removes the original resting order when it is active for the same

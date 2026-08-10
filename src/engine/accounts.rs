@@ -11,6 +11,8 @@ pub(crate) struct AccountBookState {
     pub(crate) tail: Option<OrderHandle>,
     /// Number of currently resting orders for this account.
     pub(crate) open_order_count: u32,
+    /// Raw open resting notional for this account.
+    pub(crate) open_notional: u128,
 }
 
 /// Dense account table keyed directly by bounded account ID.
