@@ -14,6 +14,7 @@ use crate::domain::{
     rd::InstrumentSpec,
     trading::{TradingEvent, order::OrderEntry},
 };
+use crate::market_data::MarketDataRuntime;
 
 use book::OrderBook;
 
@@ -136,11 +137,12 @@ impl Engine {
     pub fn execute(
         &mut self,
         entry: OrderEntry,
+        market_data: &mut MarketDataRuntime,
         events: &mut Vec<TradingEvent>,
     ) -> Result<(), EngineError> {
         events.clear();
         self.book
-            .execute(entry, &mut self.sequencer, events)
+            .execute(entry, &mut self.sequencer, market_data, events)
             .map_err(|error| match error {
                 DomainError::SequenceOverflow => EngineError::SequenceOverflow,
                 _ => EngineError::InvalidConfig,
@@ -179,12 +181,14 @@ mod tests {
         rd::InstrumentSpec,
         trading::{
             TradingEvent,
+            md::{L1Update, L2Update, MdSeq},
             order::{
                 AccountId, ClientTs, ExecType, NewOrder, OrdStatus, OrderId, OrderType, Side,
                 TimeInForce,
             },
         },
     };
+    use crate::market_data::MarketDataRuntime;
 
     fn instrument() -> InstrumentSpec {
         InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 1).expect("instrument")
@@ -279,6 +283,52 @@ mod tests {
             .collect()
     }
 
+    fn l1_updates(events: &[TradingEvent]) -> Vec<L1Update> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TradingEvent::L1Update(update) => Some(*update),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn l2_updates(events: &[TradingEvent]) -> Vec<L2Update> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TradingEvent::L2Update(update) => Some(*update),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn md_seqs(events: &[TradingEvent]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TradingEvent::TradePrint(trade) => Some(trade.md_seq.raw()),
+                TradingEvent::L1Update(update) => Some(update.md_seq.raw()),
+                TradingEvent::L2Update(update) => Some(update.md_seq.raw()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn market_event_count(events: &[TradingEvent]) -> usize {
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    TradingEvent::TradePrint(_)
+                        | TradingEvent::L1Update(_)
+                        | TradingEvent::L2Update(_)
+                )
+            })
+            .count()
+    }
+
     fn reports_for_order(
         events: &[TradingEvent],
         order_id: u64,
@@ -289,18 +339,73 @@ mod tests {
             .collect()
     }
 
+    struct TestEngine {
+        engine: Engine,
+        market_data: MarketDataRuntime,
+    }
+
+    impl TestEngine {
+        fn new() -> Self {
+            Self {
+                engine: Engine::new(config()).expect("engine"),
+                market_data: MarketDataRuntime::default(),
+            }
+        }
+
+        fn best_bid(&self) -> Option<(Price, u64)> {
+            self.engine.best_bid()
+        }
+
+        fn best_ask(&self) -> Option<(Price, u64)> {
+            self.engine.best_ask()
+        }
+
+        fn resting_order_count(&self) -> usize {
+            self.engine.resting_order_count()
+        }
+
+        fn execute(&mut self, entry: OrderEntry, events: &mut Vec<TradingEvent>, label: &str) {
+            self.engine
+                .execute(entry, &mut self.market_data, events)
+                .expect(label);
+        }
+    }
+
     fn execute(
-        engine: &mut Engine,
+        engine: &mut TestEngine,
         entry: OrderEntry,
         events: &mut Vec<TradingEvent>,
         label: &str,
     ) {
-        engine.execute(entry, events).expect(label);
+        engine.execute(entry, events, label);
+    }
+
+    fn assert_prev_links(events: &[TradingEvent]) {
+        let mut previous = MdSeq::new(0);
+        for event in events {
+            match event {
+                TradingEvent::TradePrint(trade) => {
+                    assert_eq!(trade.md_seq.raw(), previous.raw() + 1);
+                    previous = trade.md_seq;
+                }
+                TradingEvent::L2Update(update) => {
+                    assert_eq!(update.prev_md_seq, previous);
+                    assert_eq!(update.md_seq.raw(), previous.raw() + 1);
+                    previous = update.md_seq;
+                }
+                TradingEvent::L1Update(update) => {
+                    assert_eq!(update.prev_md_seq, previous);
+                    assert_eq!(update.md_seq.raw(), previous.raw() + 1);
+                    previous = update.md_seq;
+                }
+                TradingEvent::ExecutionReport(_) | TradingEvent::ProtocolError(_) => {}
+            }
+        }
     }
 
     #[test]
     fn passive_orders_rest_and_update_top_of_book() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = Vec::new();
         execute(
             &mut engine,
@@ -324,14 +429,238 @@ mod tests {
     }
 
     #[test]
+    fn passive_add_emits_l2_then_l1_update() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                1,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "execute",
+        );
+
+        let l2 = l2_updates(&events);
+        let l1 = l1_updates(&events);
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0].md_seq.raw(), 1);
+        assert_eq!(l2[0].prev_md_seq.raw(), 0);
+        assert_eq!(l2[0].side, Side::Buy);
+        assert_eq!(l2[0].price, price(1000));
+        assert_eq!(l2[0].qty, 10);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].md_seq.raw(), 2);
+        assert_eq!(l1[0].prev_md_seq.raw(), 1);
+        assert_eq!(l1[0].bid_price, Some(price(1000)));
+        assert_eq!(l1[0].bid_qty, 10);
+        assert_eq!(l1[0].ask_price, None);
+        assert_eq!(l1[0].ask_qty, 0);
+        assert_prev_links(&events);
+    }
+
+    #[test]
+    fn behind_best_add_emits_l2_without_l1() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                1,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "best",
+        );
+        execute(
+            &mut engine,
+            new_order(
+                2,
+                2,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(999),
+                20,
+                2,
+            ),
+            &mut events,
+            "behind",
+        );
+
+        let l2 = l2_updates(&events);
+        let l1 = l1_updates(&events);
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0].md_seq.raw(), 3);
+        assert_eq!(l2[0].side, Side::Buy);
+        assert_eq!(l2[0].price, price(999));
+        assert_eq!(l2[0].qty, 20);
+        assert_eq!(l1.len(), 0);
+    }
+
+    #[test]
+    fn improving_best_add_emits_l2_and_l1() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                1,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "best",
+        );
+        execute(
+            &mut engine,
+            new_order(
+                2,
+                2,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1001),
+                20,
+                2,
+            ),
+            &mut events,
+            "improve",
+        );
+
+        let l2 = l2_updates(&events);
+        let l1 = l1_updates(&events);
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0].md_seq.raw(), 3);
+        assert_eq!(l2[0].side, Side::Buy);
+        assert_eq!(l2[0].price, price(1001));
+        assert_eq!(l2[0].qty, 20);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].md_seq.raw(), 4);
+        assert_eq!(l1[0].prev_md_seq.raw(), 3);
+        assert_eq!(l1[0].bid_price, Some(price(1001)));
+        assert_eq!(l1[0].bid_qty, 20);
+    }
+
+    #[test]
+    fn best_level_qty_increase_emits_l1() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                1,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "best",
+        );
+        execute(
+            &mut engine,
+            new_order(
+                2,
+                2,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                5,
+                2,
+            ),
+            &mut events,
+            "same best",
+        );
+
+        let l2 = l2_updates(&events);
+        let l1 = l1_updates(&events);
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0].md_seq.raw(), 3);
+        assert_eq!(l2[0].price, price(1000));
+        assert_eq!(l2[0].qty, 15);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].md_seq.raw(), 4);
+        assert_eq!(l1[0].bid_price, Some(price(1000)));
+        assert_eq!(l1[0].bid_qty, 15);
+    }
+
+    #[test]
+    fn behind_best_cancel_emits_l2_without_l1() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                1,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "best",
+        );
+        execute(
+            &mut engine,
+            new_order(
+                2,
+                2,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(999),
+                20,
+                2,
+            ),
+            &mut events,
+            "behind",
+        );
+
+        execute(&mut engine, cancel(20, 2, 2), &mut events, "cancel behind");
+
+        let l2 = l2_updates(&events);
+        let l1 = l1_updates(&events);
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0].md_seq.raw(), 4);
+        assert_eq!(l2[0].price, price(999));
+        assert_eq!(l2[0].qty, 0);
+        assert_eq!(l1.len(), 0);
+    }
+
+    #[test]
     fn execute_clears_caller_owned_event_buffer() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = vec![TradingEvent::ExecutionReport(
             crate::domain::trading::order::ExecutionReport {
                 engine_seq: EngineSeq::new(99),
                 client_order_id: OrderId::new(99).expect("order"),
                 account_id: AccountId::new(99).expect("account"),
-                recv_ts: RecvTs::new(99),
                 exec_type: ExecType::Rejected,
                 ord_status: OrdStatus::Rejected,
                 reject_reason: RejectReason::Malformed,
@@ -364,7 +693,7 @@ mod tests {
 
     #[test]
     fn matching_preserves_fifo_at_price_level() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = Vec::new();
         for id in [1, 2] {
             execute(
@@ -417,8 +746,57 @@ mod tests {
     }
 
     #[test]
+    fn fill_emits_trade_l2_delete_and_l1_after_unlink() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                1,
+                Side::Sell,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "rest",
+        );
+
+        execute(
+            &mut engine,
+            new_order(
+                2,
+                2,
+                Side::Buy,
+                OrderType::Market,
+                TimeInForce::Ioc,
+                None,
+                10,
+                2,
+            ),
+            &mut events,
+            "match",
+        );
+
+        assert_eq!(md_seqs(&events), vec![3, 4, 5]);
+        let l2 = l2_updates(&events);
+        let l1 = l1_updates(&events);
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0].side, Side::Sell);
+        assert_eq!(l2[0].price, price(1000));
+        assert_eq!(l2[0].qty, 0);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].ask_price, None);
+        assert_eq!(l1[0].ask_qty, 0);
+        assert_eq!(engine.best_ask(), None);
+    }
+
+    #[test]
     fn cancel_unlinks_head_middle_and_tail_without_scanning() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = Vec::new();
         for id in [1, 2, 3] {
             execute(
@@ -461,8 +839,56 @@ mod tests {
     }
 
     #[test]
+    fn cancel_at_shared_price_emits_remaining_l2_qty() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                1,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "rest first",
+        );
+        execute(
+            &mut engine,
+            new_order(
+                2,
+                2,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                5,
+                2,
+            ),
+            &mut events,
+            "rest second",
+        );
+
+        execute(&mut engine, cancel(20, 1, 1), &mut events, "cancel first");
+
+        let l2 = l2_updates(&events);
+        let l1 = l1_updates(&events);
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0].side, Side::Buy);
+        assert_eq!(l2[0].price, price(1000));
+        assert_eq!(l2[0].qty, 5);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].bid_price, Some(price(1000)));
+        assert_eq!(l1[0].bid_qty, 5);
+    }
+
+    #[test]
     fn mass_cancel_only_removes_target_account_orders() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = Vec::new();
         execute(
             &mut engine,
@@ -502,8 +928,110 @@ mod tests {
     }
 
     #[test]
+    fn mass_cancel_at_shared_price_emits_remaining_l2_qty() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                7,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "target account",
+        );
+        execute(
+            &mut engine,
+            new_order(
+                2,
+                8,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                5,
+                2,
+            ),
+            &mut events,
+            "other account",
+        );
+
+        execute(&mut engine, mass_cancel(50, 7), &mut events, "mass cancel");
+
+        let l2 = l2_updates(&events);
+        let l1 = l1_updates(&events);
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0].side, Side::Buy);
+        assert_eq!(l2[0].price, price(1000));
+        assert_eq!(l2[0].qty, 5);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].bid_price, Some(price(1000)));
+        assert_eq!(l1[0].bid_qty, 5);
+    }
+
+    #[test]
+    fn mass_cancel_emits_l1_only_when_top_changes() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                7,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "rest best",
+        );
+        execute(
+            &mut engine,
+            new_order(
+                2,
+                7,
+                Side::Buy,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(999),
+                20,
+                2,
+            ),
+            &mut events,
+            "rest behind",
+        );
+
+        execute(&mut engine, mass_cancel(50, 7), &mut events, "mass cancel");
+
+        let l2 = l2_updates(&events);
+        let l1 = l1_updates(&events);
+        assert_eq!(l2.len(), 2);
+        assert_eq!(l1.len(), 2);
+        assert_eq!(l2[0].side, Side::Buy);
+        assert_eq!(l2[0].price, price(1000));
+        assert_eq!(l2[0].qty, 0);
+        assert_eq!(l1[0].bid_price, Some(price(999)));
+        assert_eq!(l1[0].bid_qty, 20);
+        assert_eq!(l2[1].side, Side::Buy);
+        assert_eq!(l2[1].price, price(999));
+        assert_eq!(l2[1].qty, 0);
+        assert_eq!(l1[1].bid_price, None);
+        assert_eq!(l1[1].bid_qty, 0);
+        assert_eq!(md_seqs(&events), vec![4, 5, 6, 7]);
+    }
+
+    #[test]
     fn same_price_qty_reduction_replace_preserves_priority() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = Vec::new();
         execute(
             &mut engine,
@@ -563,8 +1091,79 @@ mod tests {
     }
 
     #[test]
+    fn same_price_qty_reduction_replace_emits_l2_and_l1() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                1,
+                Side::Sell,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "rest",
+        );
+
+        execute(
+            &mut engine,
+            replace(11, 1, 1, 1000, 5),
+            &mut events,
+            "replace",
+        );
+
+        let l2 = l2_updates(&events);
+        let l1 = l1_updates(&events);
+        assert_eq!(l2.len(), 1);
+        assert_eq!(l2[0].md_seq.raw(), 3);
+        assert_eq!(l2[0].side, Side::Sell);
+        assert_eq!(l2[0].price, price(1000));
+        assert_eq!(l2[0].qty, 5);
+        assert_eq!(l1.len(), 1);
+        assert_eq!(l1[0].md_seq.raw(), 4);
+        assert_eq!(l1[0].ask_price, Some(price(1000)));
+        assert_eq!(l1[0].ask_qty, 5);
+    }
+
+    #[test]
+    fn same_price_same_qty_replace_does_not_emit_market_data() {
+        let mut engine = TestEngine::new();
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(
+                1,
+                1,
+                Side::Sell,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+                Some(1000),
+                10,
+                1,
+            ),
+            &mut events,
+            "rest",
+        );
+
+        execute(
+            &mut engine,
+            replace(11, 1, 1, 1000, 10),
+            &mut events,
+            "replace",
+        );
+
+        assert_eq!(market_event_count(&events), 0);
+        assert_eq!(exec_reports(&events).len(), 1);
+    }
+
+    #[test]
     fn price_change_replace_loses_priority() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = Vec::new();
         execute(
             &mut engine,
@@ -624,7 +1223,7 @@ mod tests {
 
     #[test]
     fn storage_envelope_rejects_unrepresentable_prices() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = Vec::new();
         execute(
             &mut engine,
@@ -647,11 +1246,12 @@ mod tests {
         assert_eq!(reports[0].ord_status, OrdStatus::Rejected);
         assert_eq!(reports[0].reject_reason, RejectReason::InvalidPrice);
         assert_eq!(engine.resting_order_count(), 0);
+        assert_eq!(market_event_count(&events), 0);
     }
 
     #[test]
     fn post_only_crossing_order_cancels_without_resting() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = Vec::new();
         execute(
             &mut engine,
@@ -692,7 +1292,7 @@ mod tests {
 
     #[test]
     fn market_no_fill_expires_without_fill_price() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = Vec::new();
         execute(
             &mut engine,
@@ -721,7 +1321,7 @@ mod tests {
 
     #[test]
     fn market_partial_fill_expires_residual_on_final_trade_report() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = Vec::new();
         execute(
             &mut engine,
@@ -766,7 +1366,7 @@ mod tests {
 
     #[test]
     fn gtc_partial_fill_keeps_live_remaining_qty_on_trade_report() {
-        let mut engine = Engine::new(config()).expect("engine");
+        let mut engine = TestEngine::new();
         let mut events = Vec::new();
         execute(
             &mut engine,

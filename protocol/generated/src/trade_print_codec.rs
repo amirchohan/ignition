@@ -7,7 +7,7 @@ pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 56;
+pub const SBE_BLOCK_LENGTH: u16 = 48;
 pub const SBE_TEMPLATE_ID: u16 = 200;
 
 pub mod encoder {
@@ -161,22 +161,6 @@ pub mod encoder {
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
-
-        /// primitive field 'recvTs'
-        /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
-        /// - characterEncoding: null
-        /// - semanticType: null
-        /// - encodedOffset: 48
-        /// - encodedLength: 8
-        /// - version: 0
-        #[inline]
-        pub fn recv_ts(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 48;
-            self.get_buf_mut().put_u64_at(offset, value);
-            self
-        }
     }
 } // end encoder
 
@@ -291,12 +275,6 @@ pub mod decoder {
         #[inline]
         pub fn qty(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset + 40)
-        }
-
-        /// primitive field - 'REQUIRED'
-        #[inline]
-        pub fn recv_ts(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 48)
         }
     }
 } // end decoder

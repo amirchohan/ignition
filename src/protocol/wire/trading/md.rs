@@ -1,11 +1,16 @@
 use crate::{
     domain::{
         Price,
-        trading::md::{BookUpdate, TradePrint},
+        trading::{
+            md::{L1Update, L2Update, TradePrint},
+            order::Side,
+        },
     },
     protocol::{
         MessageKind, ProtocolResult, SBE_HEADER_LEN, encode_header,
-        generated::codecs::{WriteBuf, book_update_codec, trade_print_codec},
+        generated::codecs::{
+            WriteBuf, book_side, l1_update_codec, l2_update_codec, trade_print_codec,
+        },
     },
 };
 
@@ -25,58 +30,72 @@ pub fn encode_trade_print(event: TradePrint, out: &mut [u8]) -> ProtocolResult<u
         .maker_order_id(event.maker_order_id.raw())
         .taker_order_id(event.taker_order_id.raw())
         .price(event.price.raw())
-        .qty(event.qty.raw())
-        .recv_ts(event.recv_ts.raw());
+        .qty(event.qty.raw());
     Ok(SBE_HEADER_LEN + trade_print_codec::SBE_BLOCK_LENGTH as usize)
 }
 
-pub fn encode_book_update(event: BookUpdate, out: &mut [u8]) -> ProtocolResult<usize> {
-    let block_len = book_update_codec::SBE_BLOCK_LENGTH;
+pub fn encode_l1_update(event: L1Update, out: &mut [u8]) -> ProtocolResult<usize> {
+    let block_len = l1_update_codec::SBE_BLOCK_LENGTH;
     ensure_out(out, block_len)?;
-    encode_header(out, block_len, MessageKind::BookUpdate)?;
+    encode_header(out, block_len, MessageKind::L1Update)?;
 
     let write_buf = WriteBuf::new(out);
-    let mut encoder =
-        book_update_codec::BookUpdateEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    let mut encoder = l1_update_codec::L1UpdateEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
     encoder
         .md_seq(event.md_seq.raw())
         .prev_md_seq(event.prev_md_seq.raw())
         .bid_price(event.bid_price.map_or(0, Price::raw))
         .bid_qty(event.bid_qty)
         .ask_price(event.ask_price.map_or(0, Price::raw))
-        .ask_qty(event.ask_qty)
-        .recv_ts(event.recv_ts.raw());
-    Ok(SBE_HEADER_LEN + book_update_codec::SBE_BLOCK_LENGTH as usize)
+        .ask_qty(event.ask_qty);
+    Ok(SBE_HEADER_LEN + l1_update_codec::SBE_BLOCK_LENGTH as usize)
+}
+
+pub fn encode_l2_update(event: L2Update, out: &mut [u8]) -> ProtocolResult<usize> {
+    let block_len = l2_update_codec::SBE_BLOCK_LENGTH;
+    ensure_out(out, block_len)?;
+    encode_header(out, block_len, MessageKind::L2Update)?;
+
+    let write_buf = WriteBuf::new(out);
+    let mut encoder = l2_update_codec::L2UpdateEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    encoder
+        .md_seq(event.md_seq.raw())
+        .prev_md_seq(event.prev_md_seq.raw())
+        .side(match event.side {
+            Side::Buy => book_side::BookSide::Bid,
+            Side::Sell => book_side::BookSide::Ask,
+        })
+        .price(event.price.raw())
+        .qty(event.qty);
+    Ok(SBE_HEADER_LEN + l2_update_codec::SBE_BLOCK_LENGTH as usize)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{
-        RecvTs,
         trading::md::{MdSeq, TradeId},
         trading::order::OrderId,
     };
 
     #[test]
-    fn book_update_encodes_empty_top_of_book_as_zero() {
-        let event = BookUpdate {
+    fn l1_update_encodes_empty_top_of_book_as_zero() {
+        let event = L1Update {
             md_seq: MdSeq::new(10),
             prev_md_seq: MdSeq::new(9),
             bid_price: None,
             bid_qty: 0,
             ask_price: None,
             ask_qty: 0,
-            recv_ts: RecvTs::new(1000),
         };
 
-        let mut bytes = [0_u8; SBE_HEADER_LEN + book_update_codec::SBE_BLOCK_LENGTH as usize];
-        encode_book_update(event, &mut bytes).expect("encode");
+        let mut bytes = [0_u8; SBE_HEADER_LEN + l1_update_codec::SBE_BLOCK_LENGTH as usize];
+        encode_l1_update(event, &mut bytes).expect("encode");
 
-        let decoder = book_update_codec::BookUpdateDecoder::default().wrap(
+        let decoder = l1_update_codec::L1UpdateDecoder::default().wrap(
             crate::protocol::generated::codecs::ReadBuf::new(&bytes),
             SBE_HEADER_LEN,
-            book_update_codec::SBE_BLOCK_LENGTH,
+            l1_update_codec::SBE_BLOCK_LENGTH,
             crate::protocol::SCHEMA_VERSION,
         );
         assert_eq!(decoder.md_seq(), 10);
@@ -98,7 +117,6 @@ mod tests {
             taker_order_id: OrderId::new(15).expect("taker"),
             price: crate::domain::Price::new(100, &instrument).expect("price"),
             qty: crate::domain::Qty::new(10, &instrument).expect("qty"),
-            recv_ts: RecvTs::new(1000),
         };
 
         let mut bytes = [0_u8; SBE_HEADER_LEN + trade_print_codec::SBE_BLOCK_LENGTH as usize];
@@ -108,5 +126,33 @@ mod tests {
             crate::protocol::decode_header(&bytes).expect("header").kind,
             MessageKind::TradePrint
         );
+    }
+
+    #[test]
+    fn l2_update_encodes_absolute_level() {
+        let instrument =
+            crate::domain::rd::InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 1).expect("instrument");
+        let event = L2Update {
+            md_seq: MdSeq::new(20),
+            prev_md_seq: MdSeq::new(19),
+            side: Side::Buy,
+            price: crate::domain::Price::new(100, &instrument).expect("price"),
+            qty: 30,
+        };
+
+        let mut bytes = [0_u8; SBE_HEADER_LEN + l2_update_codec::SBE_BLOCK_LENGTH as usize];
+        encode_l2_update(event, &mut bytes).expect("encode");
+
+        let decoder = l2_update_codec::L2UpdateDecoder::default().wrap(
+            crate::protocol::generated::codecs::ReadBuf::new(&bytes),
+            SBE_HEADER_LEN,
+            l2_update_codec::SBE_BLOCK_LENGTH,
+            crate::protocol::SCHEMA_VERSION,
+        );
+        assert_eq!(decoder.md_seq(), 20);
+        assert_eq!(decoder.prev_md_seq(), 19);
+        assert_eq!(decoder.side(), book_side::BookSide::Bid);
+        assert_eq!(decoder.price(), 100);
+        assert_eq!(decoder.qty(), 30);
     }
 }

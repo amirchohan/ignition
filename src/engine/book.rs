@@ -1,15 +1,17 @@
 use std::collections::HashMap;
 
-use crate::domain::{
-    DomainError, DomainResult, EngineSequencer, Price, Qty, RejectReason,
-    trading::{
-        TradingEvent,
-        md::{MarketDataSequencer, TradePrint},
-        order::{
-            AccountId, CancelOrder, CancelReplace, ExecType, ExecutionReport, MassCancel, NewOrder,
-            OrdStatus, OrderEntry, OrderId, OrderType, Side, TimeInForce,
+use crate::{
+    domain::{
+        DomainError, DomainResult, EngineSequencer, Price, RejectReason,
+        trading::{
+            TradingEvent,
+            order::{
+                AccountId, CancelOrder, CancelReplace, ExecType, ExecutionReport, MassCancel,
+                NewOrder, OrdStatus, OrderEntry, OrderId, OrderType, Side, TimeInForce,
+            },
         },
     },
+    market_data::MarketDataRuntime,
 };
 
 use super::{
@@ -32,8 +34,6 @@ pub(crate) struct OrderBook {
     order_index: HashMap<OrderId, OrderHandle>,
     /// Dense account table for active-order chains.
     accounts: AccountTable,
-    /// Deterministic sequencer for trade-print market data.
-    md_sequencer: MarketDataSequencer,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +54,6 @@ impl OrderBook {
             orders: OrderArena::with_capacity(config.max_resting_orders()),
             order_index: HashMap::with_capacity(config.max_resting_orders() as usize),
             accounts: AccountTable::new(config.max_account_id()),
-            md_sequencer: MarketDataSequencer::default(),
         })
     }
 
@@ -63,15 +62,20 @@ impl OrderBook {
         &mut self,
         entry: OrderEntry,
         sequencer: &mut EngineSequencer,
+        market_data: &mut MarketDataRuntime,
         events: &mut Vec<TradingEvent>,
     ) -> DomainResult<()> {
         match entry {
-            OrderEntry::NewOrder(order) => self.on_new_order(order, sequencer, events),
-            OrderEntry::CancelOrder(cancel) => self.on_cancel_order(cancel, sequencer, events),
-            OrderEntry::CancelReplace(replace) => {
-                self.on_cancel_replace(replace, sequencer, events)
+            OrderEntry::NewOrder(order) => self.on_new_order(order, sequencer, market_data, events),
+            OrderEntry::CancelOrder(cancel) => {
+                self.on_cancel_order(cancel, sequencer, market_data, events)
             }
-            OrderEntry::MassCancel(cancel) => self.on_mass_cancel(cancel, sequencer, events),
+            OrderEntry::CancelReplace(replace) => {
+                self.on_cancel_replace(replace, sequencer, market_data, events)
+            }
+            OrderEntry::MassCancel(cancel) => {
+                self.on_mass_cancel(cancel, sequencer, market_data, events)
+            }
         }
     }
 
@@ -95,6 +99,7 @@ impl OrderBook {
         &mut self,
         order: NewOrder,
         sequencer: &mut EngineSequencer,
+        market_data: &mut MarketDataRuntime,
         events: &mut Vec<TradingEvent>,
     ) -> DomainResult<()> {
         if !self.accounts.contains(order.account_id) {
@@ -125,7 +130,6 @@ impl OrderBook {
                 ReportSpec {
                     client_order_id: order.client_order_id,
                     account_id: order.account_id,
-                    recv_ts: order.recv_ts,
                     exec_type: ExecType::Canceled,
                     ord_status: OrdStatus::Canceled,
                     reject_reason: RejectReason::None,
@@ -142,11 +146,11 @@ impl OrderBook {
         let match_outcome = self.match_incoming(
             order.client_order_id,
             order.account_id,
-            order.recv_ts,
             order.side,
             order.price,
             &mut remaining_qty,
             sequencer,
+            market_data,
             events,
         )?;
 
@@ -170,7 +174,6 @@ impl OrderBook {
                     ReportSpec {
                         client_order_id: order.client_order_id,
                         account_id: order.account_id,
-                        recv_ts: order.recv_ts,
                         exec_type: ExecType::Expired,
                         ord_status: OrdStatus::Expired,
                         reject_reason: RejectReason::None,
@@ -183,13 +186,14 @@ impl OrderBook {
             (OrderType::Limit, TimeInForce::Gtc | TimeInForce::PostOnly) => {
                 // rest any unfilled passive quantity after the aggressive walk.
                 let price = order.price.ok_or(DomainError::InvalidPrice)?;
-                self.rest_order(
+                let level_qty = self.rest_order(
                     order.client_order_id,
                     order.account_id,
                     order.side,
                     price,
                     remaining_qty,
                 )?;
+                self.publish_book_update(order.side, price, level_qty, market_data, events)?;
                 // distinguish a pure add from an order that traded before resting.
                 if match_outcome.filled_qty == 0 {
                     self.push_report(
@@ -198,7 +202,6 @@ impl OrderBook {
                         ReportSpec {
                             client_order_id: order.client_order_id,
                             account_id: order.account_id,
-                            recv_ts: order.recv_ts,
                             exec_type: ExecType::New,
                             ord_status: OrdStatus::New,
                             reject_reason: RejectReason::None,
@@ -219,6 +222,7 @@ impl OrderBook {
         &mut self,
         cancel: CancelOrder,
         sequencer: &mut EngineSequencer,
+        market_data: &mut MarketDataRuntime,
         events: &mut Vec<TradingEvent>,
     ) -> DomainResult<()> {
         let Some(handle) = self.order_index.get(&cancel.orig_client_order_id).copied() else {
@@ -229,13 +233,16 @@ impl OrderBook {
         }
 
         let removed = self.unlink_and_free(handle);
+        if let Some(order) = removed {
+            let level_qty = self.current_level_qty(order.side, order.price);
+            self.publish_book_update(order.side, order.price, level_qty, market_data, events)?;
+        }
         self.push_report(
             sequencer,
             events,
             ReportSpec {
                 client_order_id: cancel.orig_client_order_id,
                 account_id: cancel.account_id,
-                recv_ts: cancel.recv_ts,
                 exec_type: ExecType::Canceled,
                 ord_status: OrdStatus::Canceled,
                 reject_reason: RejectReason::None,
@@ -251,6 +258,7 @@ impl OrderBook {
         &mut self,
         replace: CancelReplace,
         sequencer: &mut EngineSequencer,
+        market_data: &mut MarketDataRuntime,
         events: &mut Vec<TradingEvent>,
     ) -> DomainResult<()> {
         if !self.price_in_storage(replace.price) {
@@ -275,13 +283,21 @@ impl OrderBook {
         if current.price == replace.price && replace.qty.raw() <= current.remaining_qty {
             // Same-price reductions stay in the existing FIFO position.
             self.preserve_priority_replace(handle, replace, current.remaining_qty)?;
+            if replace.qty.raw() != current.remaining_qty {
+                self.publish_book_update(
+                    current.side,
+                    current.price,
+                    replace.qty.raw(),
+                    market_data,
+                    events,
+                )?;
+            }
             self.push_report(
                 sequencer,
                 events,
                 ReportSpec {
                     client_order_id: replace.client_order_id,
                     account_id: replace.account_id,
-                    recv_ts: replace.recv_ts,
                     exec_type: ExecType::Replaced,
                     ord_status: OrdStatus::Replaced,
                     reject_reason: RejectReason::None,
@@ -294,14 +310,16 @@ impl OrderBook {
         }
 
         // Price changes and quantity increases lose priority and re-enter as new.
-        self.unlink_and_free(handle);
+        if let Some(removed) = self.unlink_and_free(handle) {
+            let level_qty = self.current_level_qty(removed.side, removed.price);
+            self.publish_book_update(removed.side, removed.price, level_qty, market_data, events)?;
+        }
         self.push_report(
             sequencer,
             events,
             ReportSpec {
                 client_order_id: replace.orig_client_order_id,
                 account_id: replace.account_id,
-                recv_ts: replace.recv_ts,
                 exec_type: ExecType::Canceled,
                 ord_status: OrdStatus::Canceled,
                 reject_reason: RejectReason::None,
@@ -324,6 +342,7 @@ impl OrderBook {
                 qty: replace.qty,
             },
             sequencer,
+            market_data,
             events,
         )
     }
@@ -333,6 +352,7 @@ impl OrderBook {
         &mut self,
         cancel: MassCancel,
         sequencer: &mut EngineSequencer,
+        market_data: &mut MarketDataRuntime,
         events: &mut Vec<TradingEvent>,
     ) -> DomainResult<()> {
         if !self.accounts.contains(cancel.account_id) {
@@ -342,7 +362,6 @@ impl OrderBook {
                 ReportSpec {
                     client_order_id: cancel.client_order_id,
                     account_id: cancel.account_id,
-                    recv_ts: cancel.recv_ts,
                     exec_type: ExecType::Rejected,
                     ord_status: OrdStatus::Rejected,
                     reject_reason: RejectReason::Malformed,
@@ -361,13 +380,20 @@ impl OrderBook {
             // Capture the next account link before unlinking frees this slot.
             current = self.orders.get(handle).and_then(|order| order.account_next);
             if let Some(removed) = self.unlink_and_free(handle) {
+                let level_qty = self.current_level_qty(removed.side, removed.price);
+                self.publish_book_update(
+                    removed.side,
+                    removed.price,
+                    level_qty,
+                    market_data,
+                    events,
+                )?;
                 self.push_report(
                     sequencer,
                     events,
                     ReportSpec {
                         client_order_id: removed.order_id,
                         account_id: removed.account_id,
-                        recv_ts: cancel.recv_ts,
                         exec_type: ExecType::Canceled,
                         ord_status: OrdStatus::Canceled,
                         reject_reason: RejectReason::None,
@@ -385,7 +411,6 @@ impl OrderBook {
             ReportSpec {
                 client_order_id: cancel.client_order_id,
                 account_id: cancel.account_id,
-                recv_ts: cancel.recv_ts,
                 exec_type: ExecType::Canceled,
                 ord_status: OrdStatus::Canceled,
                 reject_reason: RejectReason::None,
@@ -402,11 +427,11 @@ impl OrderBook {
         &mut self,
         taker_order_id: OrderId,
         taker_account_id: AccountId,
-        recv_ts: crate::domain::RecvTs,
         side: Side,
         limit_price: Option<Price>,
         remaining_qty: &mut u64,
         sequencer: &mut EngineSequencer,
+        market_data: &mut MarketDataRuntime,
         events: &mut Vec<TradingEvent>,
     ) -> DomainResult<MatchOutcome> {
         let mut outcome = MatchOutcome::default();
@@ -436,32 +461,39 @@ impl OrderBook {
             outcome.filled_qty += fill_qty;
             // apply book state first so all following events describe post-fill state.
             self.apply_fill(maker_handle, best_key, fill_qty);
-
-            // trade prints are sequenced immediately after the deterministic state change.
-            let qty = Qty::new(fill_qty, &self.config.instrument())
-                .map_err(|_| DomainError::InvalidQuantity)?;
-            events.push(TradingEvent::TradePrint(TradePrint {
-                md_seq: self.md_sequencer.next_md_seq()?,
-                trade_id: self.md_sequencer.next_trade_id()?,
-                maker_order_id: maker.order_id,
-                taker_order_id,
-                price: maker.price,
-                qty,
-                recv_ts,
-            }));
-
-            // maker report reflects this fill and the maker's remaining book quantity.
             let maker_remaining = self
                 .orders
                 .get(maker_handle)
                 .map_or(0, |order| order.remaining_qty);
+            if maker_remaining == 0 {
+                // fully filled makers leave both intrusive lists and the ID index now.
+                self.unlink_and_free(maker_handle);
+            }
+
+            // market-data output is sequenced immediately after the deterministic state change.
+            market_data.publish_trade(
+                maker.order_id,
+                taker_order_id,
+                maker.price,
+                fill_qty,
+                &self.config.instrument(),
+                events,
+            )?;
+            self.publish_book_update(
+                maker.side,
+                maker.price,
+                maker_remaining,
+                market_data,
+                events,
+            )?;
+
+            // maker report reflects this fill and the maker's remaining book quantity.
             self.push_report(
                 sequencer,
                 events,
                 ReportSpec {
                     client_order_id: maker.order_id,
                     account_id: maker.account_id,
-                    recv_ts,
                     exec_type: ExecType::Trade,
                     ord_status: if maker_remaining == 0 {
                         OrdStatus::Filled
@@ -483,7 +515,6 @@ impl OrderBook {
                 ReportSpec {
                     client_order_id: taker_order_id,
                     account_id: taker_account_id,
-                    recv_ts,
                     exec_type: ExecType::Trade,
                     ord_status: if *remaining_qty == 0 {
                         OrdStatus::Filled
@@ -498,11 +529,6 @@ impl OrderBook {
             )?;
             // keep the last taker report address so IOC/market expiry can mark it terminal.
             outcome.last_taker_report_index = Some(taker_report_index);
-
-            if maker_remaining == 0 {
-                // fully filled makers leave both intrusive lists and the ID index now.
-                self.unlink_and_free(maker_handle);
-            }
         }
 
         Ok(outcome)
@@ -549,7 +575,7 @@ impl OrderBook {
         side: Side,
         price: Price,
         remaining_qty: u64,
-    ) -> DomainResult<()> {
+    ) -> DomainResult<u64> {
         let key = self.side(side).key_for_price(price)?;
         let order = RestingOrder {
             order_id,
@@ -568,10 +594,10 @@ impl OrderBook {
             .ok_or(DomainError::InvalidInstrumentSpec)?;
 
         // a resting order is visible through price, account, and client-order indexes.
-        self.append_to_level(side, key, handle)?;
+        let level_qty = self.append_to_level(side, key, handle)?;
         self.append_to_account(account_id, handle)?;
         self.order_index.insert(order_id, handle);
-        Ok(())
+        Ok(level_qty)
     }
 
     /// Append an order to the FIFO chain at a price level.
@@ -580,7 +606,7 @@ impl OrderBook {
         side: Side,
         key: super::ladder::LevelKey,
         handle: OrderHandle,
-    ) -> DomainResult<()> {
+    ) -> DomainResult<u64> {
         let tail = {
             let level = self.side_mut(side).get_level_mut_or_activate(key)?;
             level.tail
@@ -599,9 +625,10 @@ impl OrderBook {
         }
         level.tail = Some(handle);
         level.total_qty += remaining_qty;
+        let level_qty = level.total_qty;
         level.order_count += 1;
         self.side_mut(side).mark_occupied(key);
-        Ok(())
+        Ok(level_qty)
     }
 
     /// Append an order to its account's active-order chain.
@@ -761,6 +788,31 @@ impl OrderBook {
         price >= self.config.storage_min_price() && price <= self.config.storage_max_price()
     }
 
+    /// Emit market data for a visible book-level mutation.
+    fn publish_book_update(
+        &mut self,
+        side: Side,
+        price: Price,
+        level_qty: u64,
+        market_data: &mut MarketDataRuntime,
+        events: &mut Vec<TradingEvent>,
+    ) -> DomainResult<()> {
+        let best_bid = self.best_bid();
+        let best_ask = self.best_ask();
+        market_data.publish_l2_update(side, price, level_qty, events)?;
+        market_data.publish_l1_update_if_changed(best_bid, best_ask, events)
+    }
+
+    /// Return the aggregate quantity currently visible at a level after mutation.
+    fn current_level_qty(&self, side: Side, price: Price) -> u64 {
+        let Ok(key) = self.side(side).key_for_price(price) else {
+            return 0;
+        };
+        self.side(side)
+            .get_level(key)
+            .map_or(0, |level| level.total_qty)
+    }
+
     /// Return immutable state for one side of the book.
     fn side(&self, side: Side) -> &SideLadder {
         match side {
@@ -791,7 +843,6 @@ impl OrderBook {
             ReportSpec {
                 client_order_id: order.client_order_id,
                 account_id: order.account_id,
-                recv_ts: order.recv_ts,
                 exec_type: ExecType::Rejected,
                 ord_status: OrdStatus::Rejected,
                 reject_reason: reason,
@@ -816,7 +867,6 @@ impl OrderBook {
             ReportSpec {
                 client_order_id: cancel.client_order_id,
                 account_id: cancel.account_id,
-                recv_ts: cancel.recv_ts,
                 exec_type: ExecType::Rejected,
                 ord_status: OrdStatus::Rejected,
                 reject_reason: reason,
@@ -841,7 +891,6 @@ impl OrderBook {
             ReportSpec {
                 client_order_id: replace.client_order_id,
                 account_id: replace.account_id,
-                recv_ts: replace.recv_ts,
                 exec_type: ExecType::Rejected,
                 ord_status: OrdStatus::Rejected,
                 reject_reason: reason,
@@ -863,7 +912,6 @@ impl OrderBook {
             engine_seq: sequencer.next_engine_seq()?,
             client_order_id: spec.client_order_id,
             account_id: spec.account_id,
-            recv_ts: spec.recv_ts,
             exec_type: spec.exec_type,
             ord_status: spec.ord_status,
             reject_reason: spec.reject_reason,
@@ -881,8 +929,6 @@ struct ReportSpec {
     client_order_id: OrderId,
     /// Account ID carried on the report.
     account_id: AccountId,
-    /// Deterministic receive timestamp for this report.
-    recv_ts: crate::domain::RecvTs,
     /// Event type that caused this execution report.
     exec_type: ExecType,
     /// Order status after applying this report.

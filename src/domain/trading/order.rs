@@ -139,7 +139,6 @@ pub struct ExecutionReport {
     pub engine_seq: EngineSeq,
     pub client_order_id: OrderId,
     pub account_id: AccountId,
-    pub recv_ts: RecvTs,
     pub exec_type: ExecType,
     pub ord_status: OrdStatus,
     pub reject_reason: RejectReason,

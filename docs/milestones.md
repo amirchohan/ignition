@@ -50,17 +50,15 @@ boundaries, measurable latency, and honest documentation.
 - Emit deterministic execution reports and trade events from the same output
   path used by replay and clients.
 
-## Milestone 4: Market Data Output, L2-Ready
+## Milestone 4: Market Data Output
 
-- Emit a top-of-book update on every book change.
+- Emit an L1 top-of-book update whenever the best bid or best ask tuple changes.
+- Emit an absolute L2 level update on every visible price-level mutation.
 - Emit a trade print on every execution.
 - Include monotonic market-data sequence numbers and gap-detection fields.
 - Centralize book mutation eventing so add, cancel, replace, fill, and mass
   cancel operations all pass through consistent market-data output logic.
-- Design the event model so L2 incremental updates can be added later without
-  rewriting the matching engine.
-- Keep full L2 snapshot and delta recovery as stretch unless the required slice
-  is already complete.
+- Keep full L2 snapshot and delta recovery as stretch.
 
 ## Milestone 5: Risk And Control Plane
 
@@ -132,7 +130,7 @@ boundaries, measurable latency, and honest documentation.
 
 ## Stretch Items To Design In Early
 
-- L2-ready market-data eventing, even if v1 emits only top-of-book.
+- L2 incremental market-data eventing, with snapshot/recovery left separable.
 - SBE-like bespoke framing, even if the protocol stays small.
 - Noop metrics/event hooks, even if Prometheus export comes later.
 - Pure protocol decoders, so a future conformance fuzzer is straightforward.

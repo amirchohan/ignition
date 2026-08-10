@@ -1,4 +1,7 @@
-use crate::domain::{DomainError, DomainResult, Price, Qty, RecvTs, trading::order::OrderId};
+use crate::domain::{
+    DomainError, DomainResult, Price, Qty,
+    trading::order::{OrderId, Side},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MdSeq(u64);
@@ -34,18 +37,25 @@ pub struct TradePrint {
     pub taker_order_id: OrderId,
     pub price: Price,
     pub qty: Qty,
-    pub recv_ts: RecvTs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BookUpdate {
+pub struct L1Update {
     pub md_seq: MdSeq,
     pub prev_md_seq: MdSeq,
     pub bid_price: Option<Price>,
     pub bid_qty: u64,
     pub ask_price: Option<Price>,
     pub ask_qty: u64,
-    pub recv_ts: RecvTs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct L2Update {
+    pub md_seq: MdSeq,
+    pub prev_md_seq: MdSeq,
+    pub side: Side,
+    pub price: Price,
+    pub qty: u64,
 }
 
 /// Deterministic sequence allocator for market-data streams.

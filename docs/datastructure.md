@@ -36,9 +36,10 @@ not use lazy cancellation as the default because lazy cleanup pushes
 cancellation work into later aggressive matching and can create tail-latency
 spikes.
 
-The public engine boundary accepts a caller-owned event buffer:
-`Engine::execute(entry, events)`. The engine clears and reuses that buffer
-instead of allocating a fresh result vector for every command.
+The public engine boundary accepts caller-owned market-data state and an event
+buffer: `Engine::execute(entry, market_data, events)`. The engine clears and
+reuses that buffer instead of allocating a fresh result vector for every
+command.
 
 ## Why This Design
 

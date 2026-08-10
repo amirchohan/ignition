@@ -5,7 +5,11 @@ use crate::{
     domain::{
         ProtocolErrorEvent, RecvTs,
         rd::InstrumentSpec,
-        trading::{TradingEvent, md::BookUpdate, order::ExecutionReport},
+        trading::{
+            TradingEvent,
+            md::{L1Update, L2Update},
+            order::ExecutionReport,
+        },
     },
     protocol::{ProtocolResult, SBE_HEADER_LEN, generated::codecs::protocol_error_codec},
 };
@@ -24,7 +28,8 @@ pub fn encode_trading_event(event: TradingEvent, out: &mut [u8]) -> ProtocolResu
     match event {
         TradingEvent::ExecutionReport(event) => order::encode_execution_report(event, out),
         TradingEvent::TradePrint(event) => md::encode_trade_print(event, out),
-        TradingEvent::BookUpdate(event) => md::encode_book_update(event, out),
+        TradingEvent::L1Update(event) => md::encode_l1_update(event, out),
+        TradingEvent::L2Update(event) => md::encode_l2_update(event, out),
         TradingEvent::ProtocolError(event) => encode_protocol_error(event, out),
     }
 }
@@ -32,7 +37,9 @@ pub fn encode_trading_event(event: TradingEvent, out: &mut [u8]) -> ProtocolResu
 #[allow(dead_code)]
 const _: fn(ExecutionReport, &mut [u8]) -> ProtocolResult<usize> = order::encode_execution_report;
 #[allow(dead_code)]
-const _: fn(BookUpdate, &mut [u8]) -> ProtocolResult<usize> = md::encode_book_update;
+const _: fn(L1Update, &mut [u8]) -> ProtocolResult<usize> = md::encode_l1_update;
+#[allow(dead_code)]
+const _: fn(L2Update, &mut [u8]) -> ProtocolResult<usize> = md::encode_l2_update;
 #[allow(dead_code)]
 const _: fn(ProtocolErrorEvent, &mut [u8]) -> ProtocolResult<usize> = encode_protocol_error;
 #[allow(dead_code)]
@@ -46,7 +53,7 @@ mod tests {
             EngineSeq, ErrorCode, Price, ProtocolErrorEvent, Qty, RecvTs, RejectReason,
             rd::InstrumentSpec,
             trading::{
-                md::{BookUpdate, MdSeq, TradeId, TradePrint},
+                md::{L1Update, L2Update, MdSeq, TradeId, TradePrint},
                 order::{AccountId, ExecType, ExecutionReport, OrdStatus, OrderId},
             },
         },
@@ -69,7 +76,6 @@ mod tests {
                     engine_seq: EngineSeq::new(1),
                     client_order_id: OrderId::new(11).expect("order"),
                     account_id: AccountId::new(22).expect("account"),
-                    recv_ts: RecvTs::new(100),
                     exec_type: ExecType::New,
                     ord_status: OrdStatus::New,
                     reject_reason: RejectReason::None,
@@ -87,27 +93,35 @@ mod tests {
                     taker_order_id: OrderId::new(13).expect("taker"),
                     price,
                     qty,
-                    recv_ts: RecvTs::new(101),
                 }),
                 MessageKind::TradePrint,
             ),
             (
-                TradingEvent::BookUpdate(BookUpdate {
+                TradingEvent::L1Update(L1Update {
                     md_seq: MdSeq::new(4),
                     prev_md_seq: MdSeq::new(3),
                     bid_price: None,
                     bid_qty: 0,
                     ask_price: None,
                     ask_qty: 0,
-                    recv_ts: RecvTs::new(102),
                 }),
-                MessageKind::BookUpdate,
+                MessageKind::L1Update,
+            ),
+            (
+                TradingEvent::L2Update(L2Update {
+                    md_seq: MdSeq::new(5),
+                    prev_md_seq: MdSeq::new(4),
+                    side: crate::domain::trading::order::Side::Buy,
+                    price,
+                    qty: 20,
+                }),
+                MessageKind::L2Update,
             ),
             (
                 TradingEvent::ProtocolError(ProtocolErrorEvent {
-                    engine_seq: EngineSeq::new(5),
+                    engine_seq: EngineSeq::new(6),
                     template_id: 222,
-                    recv_ts: RecvTs::new(103),
+                    recv_ts: RecvTs::new(104),
                     error_code: ErrorCode::UnsupportedTemplate,
                 }),
                 MessageKind::ProtocolError,

@@ -213,7 +213,6 @@ pub fn encode_execution_report(event: ExecutionReport, out: &mut [u8]) -> Protoc
         .engine_seq(event.engine_seq.raw())
         .client_order_id(event.client_order_id.raw())
         .account_id(event.account_id.raw())
-        .recv_ts(event.recv_ts.raw())
         .exec_type(to_wire_exec_type(event.exec_type))
         .ord_status(to_wire_ord_status(event.ord_status))
         .reject_reason(to_wire_reject_reason(event.reject_reason))
@@ -360,7 +359,6 @@ mod tests {
             engine_seq: EngineSeq::new(7),
             client_order_id: OrderId::new(11).expect("order id"),
             account_id: AccountId::new(22).expect("account id"),
-            recv_ts: RecvTs::new(900),
             exec_type: ExecType::Rejected,
             ord_status: OrdStatus::Rejected,
             reject_reason: RejectReason::InvalidPrice,

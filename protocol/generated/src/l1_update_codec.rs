@@ -1,13 +1,13 @@
 use crate::*;
 
-pub use decoder::BookUpdateDecoder;
-pub use encoder::BookUpdateEncoder;
+pub use decoder::L1UpdateDecoder;
+pub use encoder::L1UpdateEncoder;
 
 pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 56;
+pub const SBE_BLOCK_LENGTH: u16 = 48;
 pub const SBE_TEMPLATE_ID: u16 = 201;
 
 pub mod encoder {
@@ -15,21 +15,21 @@ pub mod encoder {
     use message_header_codec::*;
 
     #[derive(Debug, Default)]
-    pub struct BookUpdateEncoder<'a> {
+    pub struct L1UpdateEncoder<'a> {
         buf: WriteBuf<'a>,
         initial_offset: usize,
         offset: usize,
         limit: usize,
     }
 
-    impl<'a> Writer<'a> for BookUpdateEncoder<'a> {
+    impl<'a> Writer<'a> for L1UpdateEncoder<'a> {
         #[inline]
         fn get_buf_mut(&mut self) -> &mut WriteBuf<'a> {
             &mut self.buf
         }
     }
 
-    impl<'a> Encoder<'a> for BookUpdateEncoder<'a> {
+    impl<'a> Encoder<'a> for L1UpdateEncoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -41,7 +41,7 @@ pub mod encoder {
         }
     }
 
-    impl<'a> BookUpdateEncoder<'a> {
+    impl<'a> L1UpdateEncoder<'a> {
         pub fn wrap(mut self, buf: WriteBuf<'a>, offset: usize) -> Self {
             let limit = offset + SBE_BLOCK_LENGTH as usize;
             self.buf = buf;
@@ -161,22 +161,6 @@ pub mod encoder {
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
-
-        /// primitive field 'recvTs'
-        /// - min value: 0
-        /// - max value: -2
-        /// - null value: 0xffffffffffffffff_u64
-        /// - characterEncoding: null
-        /// - semanticType: null
-        /// - encodedOffset: 48
-        /// - encodedLength: 8
-        /// - version: 0
-        #[inline]
-        pub fn recv_ts(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 48;
-            self.get_buf_mut().put_u64_at(offset, value);
-            self
-        }
     }
 } // end encoder
 
@@ -185,7 +169,7 @@ pub mod decoder {
     use message_header_codec::*;
 
     #[derive(Clone, Copy, Debug, Default)]
-    pub struct BookUpdateDecoder<'a> {
+    pub struct L1UpdateDecoder<'a> {
         buf: ReadBuf<'a>,
         initial_offset: usize,
         offset: usize,
@@ -194,21 +178,21 @@ pub mod decoder {
         pub acting_version: u16,
     }
 
-    impl ActingVersion for BookUpdateDecoder<'_> {
+    impl ActingVersion for L1UpdateDecoder<'_> {
         #[inline]
         fn acting_version(&self) -> u16 {
             self.acting_version
         }
     }
 
-    impl<'a> Reader<'a> for BookUpdateDecoder<'a> {
+    impl<'a> Reader<'a> for L1UpdateDecoder<'a> {
         #[inline]
         fn get_buf(&self) -> &ReadBuf<'a> {
             &self.buf
         }
     }
 
-    impl<'a> Decoder<'a> for BookUpdateDecoder<'a> {
+    impl<'a> Decoder<'a> for L1UpdateDecoder<'a> {
         #[inline]
         fn get_limit(&self) -> usize {
             self.limit
@@ -220,7 +204,7 @@ pub mod decoder {
         }
     }
 
-    impl<'a> BookUpdateDecoder<'a> {
+    impl<'a> L1UpdateDecoder<'a> {
         pub fn wrap(
             mut self,
             buf: ReadBuf<'a>,
@@ -291,12 +275,6 @@ pub mod decoder {
         #[inline]
         pub fn ask_qty(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset + 40)
-        }
-
-        /// primitive field - 'REQUIRED'
-        #[inline]
-        pub fn recv_ts(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 48)
         }
     }
 } // end decoder

@@ -65,8 +65,28 @@ template. Unknown template IDs are still rejected as unknown templates.
 - Control requests: `KillSwitch`, `Snapshot`, `Heartbeat`
 - Control events: `ControlResponse`, `HeartbeatStatus`, `ProtocolError`
 - Order entry: `NewOrder`, `CancelOrder`, `CancelReplace`, `MassCancel`
-- Trading events: `ExecutionReport`, `TradePrint`, `BookUpdate`,
+- Trading events: `ExecutionReport`, `TradePrint`, `L1Update`, `L2Update`,
   `ProtocolError`
+
+## Market Data
+
+`TradePrint` reports each execution with a market-data sequence, trade ID,
+maker order ID, taker order ID, price, and quantity.
+
+`L1Update` is the top-of-book change stream. It carries the current best bid
+price and aggregate quantity plus the current best ask price and aggregate
+quantity only when that top-of-book tuple changes. Empty sides encode price and
+quantity as zero.
+
+`L2Update` is an absolute aggregate price-level update. It carries one
+`side + price` level and the current visible aggregate `qty` at that level after
+every visible level mutation. `qty = 0` means the level is deleted. Snapshot and
+gap-recovery streams are deferred to later milestones.
+
+Outbound trading events do not currently carry timestamps. `mdSeq` is strictly
+monotonic across `TradePrint`, `L1Update`, and `L2Update`. `prevMdSeq` on
+`L1Update` and `L2Update` carries the previous market-data sequence for simple
+gap detection.
 
 ## Execution Reports
 

@@ -10,7 +10,7 @@ use crate::protocol::error::{ProtocolError, ProtocolResult};
 pub const SCHEMA_ID: u16 = 7001;
 
 /// Current Ignition protocol schema version.
-pub const SCHEMA_VERSION: u16 = 8;
+pub const SCHEMA_VERSION: u16 = 11;
 
 /// Length of the standard SBE message header.
 pub const SBE_HEADER_LEN: usize = 8;
@@ -36,8 +36,10 @@ pub enum MessageKind {
     ExecutionReport,
     /// Outbound trade print.
     TradePrint,
-    /// Outbound book update.
-    BookUpdate,
+    /// Outbound top-of-book update.
+    L1Update,
+    /// Outbound absolute L2 price-level update.
+    L2Update,
     /// Outbound control response.
     ControlResponse,
     /// Outbound heartbeat status.
@@ -62,7 +64,8 @@ impl MessageKind {
             Self::MassCancel => 103,
             Self::ExecutionReport => 150,
             Self::TradePrint => 200,
-            Self::BookUpdate => 201,
+            Self::L1Update => 201,
+            Self::L2Update => 202,
         }
     }
 
@@ -81,7 +84,8 @@ impl MessageKind {
             103 => Ok(Self::MassCancel),
             150 => Ok(Self::ExecutionReport),
             200 => Ok(Self::TradePrint),
-            201 => Ok(Self::BookUpdate),
+            201 => Ok(Self::L1Update),
+            202 => Ok(Self::L2Update),
             _ => Err(ProtocolError::UnknownTemplate { template_id }),
         }
     }
@@ -157,10 +161,10 @@ pub fn decode_header(input: &[u8]) -> ProtocolResult<ProtocolFrame> {
 mod tests {
     use super::*;
     use crate::protocol::generated::codecs::{
-        ReadBuf, WriteBuf, book_update_codec, cancel_order_codec, cancel_replace_codec,
-        control_response_codec, execution_report_codec, heartbeat_codec, heartbeat_status_codec,
-        kill_switch_codec, mass_cancel_codec, message_header_codec, new_order_codec, order_type,
-        protocol_error_codec, side, snapshot_codec, time_in_force, trade_print_codec,
+        ReadBuf, WriteBuf, cancel_order_codec, cancel_replace_codec, control_response_codec,
+        execution_report_codec, heartbeat_codec, heartbeat_status_codec, kill_switch_codec,
+        l1_update_codec, l2_update_codec, mass_cancel_codec, message_header_codec, new_order_codec,
+        order_type, protocol_error_codec, side, snapshot_codec, time_in_force, trade_print_codec,
     };
 
     #[test]
@@ -168,7 +172,8 @@ mod tests {
         let cases = [
             MessageKind::NewOrder,
             MessageKind::ExecutionReport,
-            MessageKind::BookUpdate,
+            MessageKind::L1Update,
+            MessageKind::L2Update,
             MessageKind::Heartbeat,
         ];
 
@@ -230,7 +235,8 @@ mod tests {
                 execution_report_codec::SBE_TEMPLATE_ID,
             ),
             (MessageKind::TradePrint, trade_print_codec::SBE_TEMPLATE_ID),
-            (MessageKind::BookUpdate, book_update_codec::SBE_TEMPLATE_ID),
+            (MessageKind::L1Update, l1_update_codec::SBE_TEMPLATE_ID),
+            (MessageKind::L2Update, l2_update_codec::SBE_TEMPLATE_ID),
         ];
 
         for (kind, template_id) in cases {

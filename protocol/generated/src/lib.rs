@@ -5,7 +5,7 @@
 
 use ::core::convert::TryInto;
 
-pub mod book_update_codec;
+pub mod book_side;
 pub mod cancel_order_codec;
 pub mod cancel_replace_codec;
 pub mod control_response_codec;
@@ -17,6 +17,8 @@ pub mod heartbeat_codec;
 pub mod heartbeat_status_codec;
 pub mod kill_switch_action;
 pub mod kill_switch_codec;
+pub mod l1_update_codec;
+pub mod l2_update_codec;
 pub mod mass_cancel_codec;
 pub mod message_header_codec;
 pub mod new_order_codec;
@@ -30,8 +32,8 @@ pub mod time_in_force;
 pub mod trade_print_codec;
 
 pub const SBE_SCHEMA_ID: u16 = 7001;
-pub const SBE_SCHEMA_VERSION: u16 = 8;
-pub const SBE_SEMANTIC_VERSION: &str = "8.0.0";
+pub const SBE_SCHEMA_VERSION: u16 = 11;
+pub const SBE_SEMANTIC_VERSION: &str = "11.0.0";
 
 pub type SbeResult<T> = core::result::Result<T, SbeErr>;
 

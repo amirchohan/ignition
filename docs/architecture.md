@@ -27,7 +27,7 @@ ownership boundary.
 - `domain::rd` owns single-instrument reference data.
 - `domain::control` owns `ControlRequest` and `ControlEvent`.
 - `domain::trading::order` owns `OrderEntry` and execution reports.
-- `domain::trading::md` owns trade prints, book updates, and market-data
+- `domain::trading::md` owns trade prints, L1/L2 updates, and market-data
   sequencing.
 - Shared deterministic values such as `RecvTs`, `EngineSeq`, reject reasons,
   and protocol-error events live at the domain root.
@@ -42,13 +42,14 @@ ownership boundary.
   cancel-replace, and mass cancel.
 - Control egress encodes control responses, heartbeat status, and protocol
   errors for the control endpoint.
-- Trading egress encodes execution reports, trade prints, book updates, and
+- Trading egress encodes execution reports, trade prints, L1/L2 updates, and
   protocol errors for the trading endpoint.
 - Does not own matching, risk, market-data sequencing, or control-plane policy.
 
 ### `runtime`
 
-- Owns the future poll-driven orchestration loop.
+- Owns orchestration state, including the matching engine and market-data
+  runtime.
 - Connects the separate control and trading queues to control state, risk
   checks, engine execution, market-data output, and protocol egress in explicit
   phases.
@@ -59,15 +60,15 @@ ownership boundary.
 - Owns order-book state, order lifecycle mutations, and price-time priority
   matching.
 - Accepts internal typed `OrderEntry` values, not raw protocol buffers.
-- Exposes `Engine::execute(entry, events)`, where the caller owns the reusable
-  output buffer for trading events.
+- Exposes `Engine::execute(entry, market_data, events)`, where the caller owns
+  market-data state and the reusable output buffer for trading events.
 - Stores the book as two `SideLadder` values, one shared resting-order arena, a
   `client_order_id -> handle` lookup, and a dense account table.
 - Uses a fixed storage envelope from `configs/server.yaml` for direct price
   addressing; dynamic risk price bands are enforced outside the matching data
   structure.
-- Emits deterministic execution reports and trade prints from the same ordered
-  event buffer used by replay, clients, and later market-data shaping.
+- Emits deterministic execution reports and delegates trade-print/L1/L2 shaping
+  to the caller-owned market-data runtime.
 - Does not read wall-clock time, parse protocol bytes, perform transport IO, or
   make risk-policy decisions.
 
@@ -80,9 +81,11 @@ ownership boundary.
 
 ### `market_data`
 
-- Owns future outbound trade-print and book-update shaping.
-- Centralizes top-of-book output and keeps the event model ready for later L2
-  incrementals.
+- Owns outbound trade-print, L1, and L2 market-data shaping.
+- Owns market-data sequencing separately from the matching engine's execution
+  report sequencing.
+- Centralizes top-of-book change output and absolute level-update output.
+- Tracks only last-published L1 state; the matching book remains the source of truth.
 - Does not make matching or risk decisions.
 
 ### `control`
