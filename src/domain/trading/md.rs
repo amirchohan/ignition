@@ -1,8 +1,4 @@
-use crate::domain::{
-    DomainError, DomainResult, RecvTs,
-    rd::{Price, Qty},
-    trading::order::OrderId,
-};
+use crate::domain::{DomainError, DomainResult, Price, Qty, RecvTs, trading::order::OrderId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MdSeq(u64);

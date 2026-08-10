@@ -1,0 +1,408 @@
+use crate::domain::{DomainError, DomainResult, Price, trading::order::Side};
+
+use super::{EngineConfig, orders::OrderHandle};
+
+/// FIFO metadata and aggregate quantity for one price level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PriceLevel {
+    /// Oldest resting order at this price.
+    pub(crate) head: Option<OrderHandle>,
+    /// Newest resting order at this price.
+    pub(crate) tail: Option<OrderHandle>,
+    /// Aggregate visible quantity at this price.
+    pub(crate) total_qty: u64,
+    /// Number of resting orders at this price.
+    pub(crate) order_count: u32,
+}
+
+impl PriceLevel {
+    /// Return whether this level has no visible resting orders.
+    pub(crate) const fn is_empty(self) -> bool {
+        self.order_count == 0
+    }
+}
+
+/// Address of one price level inside the paged ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LevelKey {
+    /// Absolute page index inside this side's storage envelope.
+    pub(crate) page_index: usize,
+    /// Price-level offset inside the page.
+    pub(crate) offset: usize,
+    /// Integer price represented by the page and offset.
+    pub(crate) price: Price,
+}
+
+/// Compact occupancy set used for levels and pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Bitmap {
+    /// Packed 64-bit occupancy words.
+    words: Vec<u64>,
+}
+
+impl Bitmap {
+    /// Create an empty bitmap with enough words for `bits` entries.
+    fn new(bits: usize) -> Self {
+        Self {
+            words: vec![0; bits.div_ceil(64)],
+        }
+    }
+
+    /// Mark one bit as occupied.
+    fn set(&mut self, bit: usize) {
+        self.words[bit / 64] |= 1_u64 << (bit % 64);
+    }
+
+    /// Mark one bit as empty.
+    fn clear(&mut self, bit: usize) {
+        self.words[bit / 64] &= !(1_u64 << (bit % 64));
+    }
+
+    /// Return whether any bit is occupied.
+    fn any(&self) -> bool {
+        self.words.iter().any(|word| *word != 0)
+    }
+
+    /// Find the lowest set bit at or after `bit`.
+    fn next_set_from(&self, bit: usize) -> Option<usize> {
+        let mut word_index = bit / 64;
+        let mut word = *self.words.get(word_index)?;
+        // Ignore occupied bits before the requested start point in the first word.
+        word &= !0_u64 << (bit % 64);
+
+        loop {
+            if word != 0 {
+                return Some(word_index * 64 + word.trailing_zeros() as usize);
+            }
+            word_index += 1;
+            word = *self.words.get(word_index)?;
+        }
+    }
+
+    /// Find the highest set bit at or before `bit`.
+    fn prev_set_from(&self, bit: usize) -> Option<usize> {
+        let mut word_index = bit / 64;
+        let mut word = *self.words.get(word_index)?;
+        let keep_bits = bit % 64;
+        // Ignore occupied bits after the requested start point in the first word.
+        word &= u64::MAX >> (63 - keep_bits);
+
+        loop {
+            if word != 0 {
+                return Some(word_index * 64 + (63 - word.leading_zeros() as usize));
+            }
+            if word_index == 0 {
+                return None;
+            }
+            word_index -= 1;
+            word = self.words[word_index];
+        }
+    }
+}
+
+/// Fixed-size dense mini-ladder activated from the page pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Page {
+    /// Fixed-size price levels for this page.
+    levels: Box<[PriceLevel]>,
+    /// Occupancy bitmap for non-empty levels in this page.
+    occupied: Bitmap,
+}
+
+impl Page {
+    /// Allocate one page with `page_size` empty price levels.
+    fn new(page_size: usize) -> Self {
+        Self {
+            levels: vec![PriceLevel::default(); page_size].into_boxed_slice(),
+            occupied: Bitmap::new(page_size),
+        }
+    }
+
+    /// Clear all levels and occupancy before returning a page to the pool.
+    fn reset(&mut self) {
+        for level in &mut self.levels {
+            *level = PriceLevel::default();
+        }
+        for word in &mut self.occupied.words {
+            *word = 0;
+        }
+    }
+}
+
+/// Preallocated pool for active ladder pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PagePool {
+    /// Preallocated pages available to this side.
+    pages: Vec<Page>,
+    /// Handles of pages that are currently inactive.
+    free: Vec<usize>,
+}
+
+impl PagePool {
+    /// Preallocate all page storage used by this side.
+    fn new(max_active_pages: usize, page_size: usize) -> Self {
+        let mut pages = Vec::with_capacity(max_active_pages);
+        let mut free = Vec::with_capacity(max_active_pages);
+        for index in 0..max_active_pages {
+            pages.push(Page::new(page_size));
+            free.push(max_active_pages - 1 - index);
+        }
+
+        Self { pages, free }
+    }
+
+    /// Reserve a page for an occupied price range.
+    fn activate(&mut self) -> Option<usize> {
+        self.free.pop()
+    }
+
+    /// Return a page to the reusable pool.
+    fn release(&mut self, handle: usize) {
+        self.pages[handle].reset();
+        self.free.push(handle);
+    }
+}
+
+/// One side of the book, backed by a bounded paged price ladder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SideLadder {
+    /// Side represented by this ladder.
+    side: Side,
+    /// Lowest price representable by this side.
+    storage_min_price: Price,
+    /// Highest price representable by this side.
+    storage_max_price: Price,
+    /// Tick size in integer price units.
+    tick_size: u64,
+    /// Number of price levels in each page.
+    page_size: usize,
+    /// Mapping from logical page index to active page-pool handle.
+    page_slots: Vec<Option<usize>>,
+    /// Occupancy bitmap for logical pages with visible quantity.
+    occupied_pages: Bitmap,
+    /// Reusable storage for active pages.
+    page_pool: PagePool,
+    /// Cached best price-level key for this side.
+    best: Option<LevelKey>,
+}
+
+impl SideLadder {
+    /// Create an empty side ladder from validated engine config.
+    pub(crate) fn new(side: Side, config: EngineConfig) -> DomainResult<Self> {
+        let tick_span = (config.storage_max_price().raw() - config.storage_min_price().raw())
+            / config.instrument().price_tick;
+        let page_count = (tick_span as usize + 1).div_ceil(config.page_size() as usize);
+
+        if page_count == 0 {
+            return Err(DomainError::InvalidInstrumentSpec);
+        }
+
+        Ok(Self {
+            side,
+            storage_min_price: config.storage_min_price(),
+            storage_max_price: config.storage_max_price(),
+            tick_size: config.instrument().price_tick,
+            page_size: config.page_size() as usize,
+            page_slots: vec![None; page_count],
+            occupied_pages: Bitmap::new(page_count),
+            page_pool: PagePool::new(
+                config.max_active_pages() as usize,
+                config.page_size() as usize,
+            ),
+            best: None,
+        })
+    }
+
+    /// Convert an in-envelope price to its page and offset address.
+    pub(crate) fn key_for_price(&self, price: Price) -> DomainResult<LevelKey> {
+        if price < self.storage_min_price || price > self.storage_max_price {
+            return Err(DomainError::InvalidPrice);
+        }
+
+        let tick = (price.raw() - self.storage_min_price.raw()) / self.tick_size;
+        let page_index = tick as usize / self.page_size;
+        let offset = tick as usize % self.page_size;
+        Ok(LevelKey {
+            page_index,
+            offset,
+            price,
+        })
+    }
+
+    /// Return a level only if its page is currently active.
+    pub(crate) fn get_level(&self, key: LevelKey) -> Option<&PriceLevel> {
+        let page_handle = self.page_slots.get(key.page_index).and_then(|slot| *slot)?;
+        self.page_pool.pages[page_handle].levels.get(key.offset)
+    }
+
+    /// Return a mutable level, activating its page from the pool if needed.
+    pub(crate) fn get_level_mut_or_activate(
+        &mut self,
+        key: LevelKey,
+    ) -> DomainResult<&mut PriceLevel> {
+        if self.page_slots[key.page_index].is_none() {
+            // Page activation is bounded by the preallocated active-page pool.
+            let page_handle = self
+                .page_pool
+                .activate()
+                .ok_or(DomainError::InvalidInstrumentSpec)?;
+            self.page_slots[key.page_index] = Some(page_handle);
+        }
+
+        let page_handle = self.page_slots[key.page_index].expect("page activated");
+        Ok(&mut self.page_pool.pages[page_handle].levels[key.offset])
+    }
+
+    /// Mark a level as visible in the side's occupancy indexes.
+    pub(crate) fn mark_occupied(&mut self, key: LevelKey) {
+        if let Some(page_handle) = self.page_slots[key.page_index] {
+            self.page_pool.pages[page_handle].occupied.set(key.offset);
+            self.occupied_pages.set(key.page_index);
+            self.refresh_best_after_occupy(key);
+        }
+    }
+
+    /// Mark a level empty and release its page when no levels remain active.
+    pub(crate) fn mark_empty(&mut self, key: LevelKey) {
+        let Some(page_handle) = self.page_slots[key.page_index] else {
+            return;
+        };
+
+        self.page_pool.pages[page_handle].occupied.clear(key.offset);
+        if !self.page_pool.pages[page_handle].occupied.any() {
+            self.occupied_pages.clear(key.page_index);
+            self.page_slots[key.page_index] = None;
+            self.page_pool.release(page_handle);
+        }
+
+        if self.best == Some(key) {
+            self.best = self.find_best();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn best_key(&self) -> Option<LevelKey> {
+        self.best
+    }
+
+    /// Return the best level key and metadata for this side.
+    pub(crate) fn best_level(&self) -> Option<(LevelKey, &PriceLevel)> {
+        let key = self.best?;
+        Some((key, self.get_level(key)?))
+    }
+
+    /// Return the top price and aggregate quantity for this side.
+    pub(crate) fn top(&self) -> Option<(Price, u64)> {
+        let (key, level) = self.best_level()?;
+        Some((key.price, level.total_qty))
+    }
+
+    /// Update best price after adding visible quantity at `key`.
+    fn refresh_best_after_occupy(&mut self, key: LevelKey) {
+        self.best = match (self.side, self.best) {
+            (_, None) => Some(key),
+            (Side::Buy, Some(best)) if key.price > best.price => Some(key),
+            (Side::Sell, Some(best)) if key.price < best.price => Some(key),
+            (_, best) => best,
+        };
+    }
+
+    /// Find the current best level by consulting page and level bitmaps.
+    fn find_best(&self) -> Option<LevelKey> {
+        match self.side {
+            Side::Buy => {
+                // Bids choose the highest occupied page and highest occupied offset.
+                let start = self.page_slots.len().checked_sub(1)?;
+                let page_index = self.occupied_pages.prev_set_from(start)?;
+                let page_handle = self.page_slots[page_index]?;
+                let offset = self.page_pool.pages[page_handle]
+                    .occupied
+                    .prev_set_from(self.page_size - 1)?;
+                self.key_from_page_offset(page_index, offset)
+            }
+            Side::Sell => {
+                // Asks choose the lowest occupied page and lowest occupied offset.
+                let page_index = self.occupied_pages.next_set_from(0)?;
+                let page_handle = self.page_slots[page_index]?;
+                let offset = self.page_pool.pages[page_handle]
+                    .occupied
+                    .next_set_from(0)?;
+                self.key_from_page_offset(page_index, offset)
+            }
+        }
+    }
+
+    /// Convert a page and offset back into an absolute price-level key.
+    fn key_from_page_offset(&self, page_index: usize, offset: usize) -> Option<LevelKey> {
+        let tick = page_index
+            .checked_mul(self.page_size)?
+            .checked_add(offset)? as u64;
+        let raw = self
+            .storage_min_price
+            .raw()
+            .checked_add(tick.checked_mul(self.tick_size)?)?;
+        if raw > self.storage_max_price.raw() {
+            return None;
+        }
+        Some(LevelKey {
+            page_index,
+            offset,
+            price: Price::new_unchecked(raw),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{domain::rd::InstrumentSpec, engine::EngineConfig};
+
+    fn config() -> EngineConfig {
+        let instrument = InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 1).expect("instrument");
+        EngineConfig::new(instrument, 100, 1200, 1024, 100, 10, 4).expect("config")
+    }
+
+    #[test]
+    fn ladder_maps_prices_to_page_and_offset() {
+        let side = SideLadder::new(Side::Sell, config()).expect("side");
+        let key = side
+            .key_for_price(Price::new(1124, &config().instrument()).expect("price"))
+            .expect("key");
+        assert_eq!(key.page_index, 1);
+        assert_eq!(key.offset, 0);
+    }
+
+    #[test]
+    fn ladder_tracks_best_bid_and_ask_with_bitmaps() {
+        let instrument = config().instrument();
+        let mut bids = SideLadder::new(Side::Buy, config()).expect("bids");
+        let bid_100 = bids
+            .key_for_price(Price::new(100, &instrument).expect("price"))
+            .expect("key");
+        let bid_1200 = bids
+            .key_for_price(Price::new(1200, &instrument).expect("price"))
+            .expect("key");
+        bids.get_level_mut_or_activate(bid_100)
+            .expect("level")
+            .order_count = 1;
+        bids.mark_occupied(bid_100);
+        bids.get_level_mut_or_activate(bid_1200)
+            .expect("level")
+            .order_count = 1;
+        bids.mark_occupied(bid_1200);
+        assert_eq!(bids.best_key().expect("best").price.raw(), 1200);
+        bids.mark_empty(bid_1200);
+        assert_eq!(bids.best_key().expect("best").price.raw(), 100);
+
+        let mut asks = SideLadder::new(Side::Sell, config()).expect("asks");
+        asks.get_level_mut_or_activate(bid_1200)
+            .expect("level")
+            .order_count = 1;
+        asks.mark_occupied(bid_1200);
+        asks.get_level_mut_or_activate(bid_100)
+            .expect("level")
+            .order_count = 1;
+        asks.mark_occupied(bid_100);
+        assert_eq!(asks.best_key().expect("best").price.raw(), 100);
+    }
+}

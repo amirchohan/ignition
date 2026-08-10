@@ -11,13 +11,13 @@ use crate::{
     domain::{
         DomainError, DomainResult, ErrorCode, ProtocolErrorEvent, RejectReason,
         control::ControlResult,
-        trading::order::{ExecState, OrderType, Side, TimeInForce},
+        trading::order::{ExecType, OrdStatus, OrderType, Side, TimeInForce},
     },
     protocol::{
         MessageKind, ProtocolError, ProtocolFrame, ProtocolResult, SBE_HEADER_LEN, encode_header,
         generated::codecs::{
-            WriteBuf, control_result, error_code, exec_state, protocol_error_codec, reject_reason,
-            side, time_in_force,
+            WriteBuf, control_result, error_code, exec_type, ord_status, protocol_error_codec,
+            reject_reason, side, time_in_force,
         },
     },
 };
@@ -100,14 +100,26 @@ pub(crate) fn normalize_tif(value: time_in_force::TimeInForce) -> DomainResult<T
     }
 }
 
-pub(crate) fn to_wire_exec_state(value: ExecState) -> exec_state::ExecState {
+pub(crate) fn to_wire_exec_type(value: ExecType) -> exec_type::ExecType {
     match value {
-        ExecState::Accepted => exec_state::ExecState::Accepted,
-        ExecState::Rejected => exec_state::ExecState::Rejected,
-        ExecState::PartiallyFilled => exec_state::ExecState::PartiallyFilled,
-        ExecState::Filled => exec_state::ExecState::Filled,
-        ExecState::Cancelled => exec_state::ExecState::Cancelled,
-        ExecState::Replaced => exec_state::ExecState::Replaced,
+        ExecType::New => exec_type::ExecType::New,
+        ExecType::Trade => exec_type::ExecType::Trade,
+        ExecType::Canceled => exec_type::ExecType::Canceled,
+        ExecType::Replaced => exec_type::ExecType::Replaced,
+        ExecType::Rejected => exec_type::ExecType::Rejected,
+        ExecType::Expired => exec_type::ExecType::Expired,
+    }
+}
+
+pub(crate) fn to_wire_ord_status(value: OrdStatus) -> ord_status::OrdStatus {
+    match value {
+        OrdStatus::New => ord_status::OrdStatus::New,
+        OrdStatus::PartiallyFilled => ord_status::OrdStatus::PartiallyFilled,
+        OrdStatus::Filled => ord_status::OrdStatus::Filled,
+        OrdStatus::Canceled => ord_status::OrdStatus::Canceled,
+        OrdStatus::Replaced => ord_status::OrdStatus::Replaced,
+        OrdStatus::Rejected => ord_status::OrdStatus::Rejected,
+        OrdStatus::Expired => ord_status::OrdStatus::Expired,
     }
 }
 

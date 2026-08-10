@@ -3,8 +3,8 @@
     xmlns:sbe="http://fixprotocol.io/2016/sbe"
     package="ignition_protocol_generated"
     id="7001"
-    version="7"
-    semanticVersion="7.0.0"
+    version="8"
+    semanticVersion="8.0.0"
     description="Ignition single-symbol CLOB protocol"
     byteOrder="littleEndian">
 
@@ -32,13 +32,23 @@
             <validValue name="PostOnly">3</validValue>
         </enum>
 
-        <enum name="ExecState" encodingType="uint8">
-            <validValue name="Accepted">1</validValue>
-            <validValue name="Rejected">2</validValue>
-            <validValue name="PartiallyFilled">3</validValue>
-            <validValue name="Filled">4</validValue>
-            <validValue name="Cancelled">5</validValue>
-            <validValue name="Replaced">6</validValue>
+        <enum name="ExecType" encodingType="uint8">
+            <validValue name="New">1</validValue>
+            <validValue name="Trade">2</validValue>
+            <validValue name="Canceled">3</validValue>
+            <validValue name="Replaced">4</validValue>
+            <validValue name="Rejected">5</validValue>
+            <validValue name="Expired">6</validValue>
+        </enum>
+
+        <enum name="OrdStatus" encodingType="uint8">
+            <validValue name="New">1</validValue>
+            <validValue name="PartiallyFilled">2</validValue>
+            <validValue name="Filled">3</validValue>
+            <validValue name="Canceled">4</validValue>
+            <validValue name="Replaced">5</validValue>
+            <validValue name="Rejected">6</validValue>
+            <validValue name="Expired">7</validValue>
         </enum>
 
         <enum name="RejectReason" encodingType="uint8">
@@ -152,11 +162,12 @@
         <field name="clientOrderId" id="2" type="uint64"/>
         <field name="accountId" id="3" type="uint32"/>
         <field name="recvTs" id="4" type="uint64"/>
-        <field name="state" id="5" type="ExecState"/>
-        <field name="rejectReason" id="6" type="RejectReason"/>
-        <field name="fillPrice" id="7" type="uint64"/>
-        <field name="fillQty" id="8" type="uint64"/>
-        <field name="remainingQty" id="9" type="uint64"/>
+        <field name="execType" id="5" type="ExecType"/>
+        <field name="ordStatus" id="6" type="OrdStatus"/>
+        <field name="rejectReason" id="7" type="RejectReason"/>
+        <field name="fillPrice" id="8" type="uint64"/>
+        <field name="fillQty" id="9" type="uint64"/>
+        <field name="remainingQty" id="10" type="uint64"/>
     </message>
 
     <message name="TradePrint" id="200" description="Market-data trade print">

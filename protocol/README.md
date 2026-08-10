@@ -68,6 +68,33 @@ template. Unknown template IDs are still rejected as unknown templates.
 - Trading events: `ExecutionReport`, `TradePrint`, `BookUpdate`,
   `ProtocolError`
 
+## Execution Reports
+
+`ExecutionReport` uses separate `execType` and `ordStatus` fields. `execType`
+describes what this report represents, while `ordStatus` describes the order's
+state after applying the report.
+
+Current `execType` values are:
+
+- `New`: passive order accepted onto the book.
+- `Trade`: execution occurred.
+- `Canceled`: order canceled or a post-only order canceled before resting.
+- `Replaced`: cancel-replace preserved priority and updated the resting order.
+- `Rejected`: command rejected.
+- `Expired`: market or IOC order did not execute and cannot rest.
+
+Current `ordStatus` values are `New`, `PartiallyFilled`, `Filled`, `Canceled`,
+`Replaced`, `Rejected`, and `Expired`.
+
+Every fill carries the concrete execution price and fill quantity. Reports that
+do not represent an execution encode no fill price with wire value `0` and
+carry zero fill quantity.
+
+Market and IOC residual quantity never rests. If such an order partially fills
+and then expires, the final taker trade report has `execType = Trade`,
+`ordStatus = Expired`, the final fill price and quantity, and zero remaining
+quantity. If no quantity fills, the report is `Expired` / `Expired`.
+
 ## Template ID Ranges
 
 - `1-49`: control requests

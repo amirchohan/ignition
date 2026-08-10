@@ -1,3 +1,5 @@
+pub use super::{Price, Qty, RawNotional};
+
 use super::{DomainError, DomainResult};
 
 /// Numeric instrument reference data consumed by core logic.
@@ -78,56 +80,6 @@ macro_rules! id_type {
 
 id_type!(InstrumentId);
 id_type!(AssetId);
-
-/// Positive, tick-aligned integer price.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Price(u64);
-
-impl Price {
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-
-    pub fn new(value: u64, instrument: &InstrumentSpec) -> DomainResult<Self> {
-        if value == 0 || !value.is_multiple_of(instrument.price_tick) {
-            return Err(DomainError::InvalidPrice);
-        }
-
-        Ok(Self(value))
-    }
-}
-
-/// Positive, lot-aligned integer quantity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Qty(u64);
-
-impl Qty {
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-
-    pub fn new(value: u64, instrument: &InstrumentSpec) -> DomainResult<Self> {
-        if value == 0 || !value.is_multiple_of(instrument.qty_lot) {
-            return Err(DomainError::InvalidQuantity);
-        }
-
-        Ok(Self(value))
-    }
-}
-
-/// Raw notional in `price_integer * qty_integer` units.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RawNotional(u128);
-
-impl RawNotional {
-    pub fn from_price_qty(price: Price, qty: Qty) -> Self {
-        Self(u128::from(price.raw()) * u128::from(qty.raw()))
-    }
-
-    pub const fn raw(self) -> u128 {
-        self.0
-    }
-}
 
 #[cfg(test)]
 mod tests {

@@ -7,7 +7,7 @@ pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 54;
+pub const SBE_BLOCK_LENGTH: u16 = 55;
 pub const SBE_TEMPLATE_ID: u16 = 150;
 
 pub mod encoder {
@@ -132,7 +132,7 @@ pub mod encoder {
 
         /// REQUIRED enum
         #[inline]
-        pub fn state(&mut self, value: exec_state::ExecState) -> &mut Self {
+        pub fn exec_type(&mut self, value: exec_type::ExecType) -> &mut Self {
             let offset = self.offset + 28;
             self.get_buf_mut().put_u8_at(offset, value as u8);
             self
@@ -140,8 +140,16 @@ pub mod encoder {
 
         /// REQUIRED enum
         #[inline]
-        pub fn reject_reason(&mut self, value: reject_reason::RejectReason) -> &mut Self {
+        pub fn ord_status(&mut self, value: ord_status::OrdStatus) -> &mut Self {
             let offset = self.offset + 29;
+            self.get_buf_mut().put_u8_at(offset, value as u8);
+            self
+        }
+
+        /// REQUIRED enum
+        #[inline]
+        pub fn reject_reason(&mut self, value: reject_reason::RejectReason) -> &mut Self {
+            let offset = self.offset + 30;
             self.get_buf_mut().put_u8_at(offset, value as u8);
             self
         }
@@ -152,12 +160,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 30
+        /// - encodedOffset: 31
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn fill_price(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 30;
+            let offset = self.offset + 31;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -168,12 +176,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 38
+        /// - encodedOffset: 39
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn fill_qty(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 38;
+            let offset = self.offset + 39;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -184,12 +192,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 46
+        /// - encodedOffset: 47
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn remaining_qty(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 46;
+            let offset = self.offset + 47;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -299,32 +307,38 @@ pub mod decoder {
 
         /// REQUIRED enum
         #[inline]
-        pub fn state(&self) -> exec_state::ExecState {
+        pub fn exec_type(&self) -> exec_type::ExecType {
             self.get_buf().get_u8_at(self.offset + 28).into()
         }
 
         /// REQUIRED enum
         #[inline]
-        pub fn reject_reason(&self) -> reject_reason::RejectReason {
+        pub fn ord_status(&self) -> ord_status::OrdStatus {
             self.get_buf().get_u8_at(self.offset + 29).into()
+        }
+
+        /// REQUIRED enum
+        #[inline]
+        pub fn reject_reason(&self) -> reject_reason::RejectReason {
+            self.get_buf().get_u8_at(self.offset + 30).into()
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
         pub fn fill_price(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 30)
+            self.get_buf().get_u64_at(self.offset + 31)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
         pub fn fill_qty(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 38)
+            self.get_buf().get_u64_at(self.offset + 39)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
         pub fn remaining_qty(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 46)
+            self.get_buf().get_u64_at(self.offset + 47)
         }
     }
 } // end decoder

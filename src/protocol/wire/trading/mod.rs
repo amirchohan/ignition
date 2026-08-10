@@ -43,11 +43,11 @@ mod tests {
     use super::*;
     use crate::{
         domain::{
-            EngineSeq, ErrorCode, ProtocolErrorEvent, RecvTs, RejectReason,
-            rd::{InstrumentSpec, Price, Qty},
+            EngineSeq, ErrorCode, Price, ProtocolErrorEvent, Qty, RecvTs, RejectReason,
+            rd::InstrumentSpec,
             trading::{
                 md::{BookUpdate, MdSeq, TradeId, TradePrint},
-                order::{AccountId, ExecState, ExecutionReport, OrderId},
+                order::{AccountId, ExecType, ExecutionReport, OrdStatus, OrderId},
             },
         },
         protocol::{MessageKind, decode_header},
@@ -70,7 +70,8 @@ mod tests {
                     client_order_id: OrderId::new(11).expect("order"),
                     account_id: AccountId::new(22).expect("account"),
                     recv_ts: RecvTs::new(100),
-                    state: ExecState::Accepted,
+                    exec_type: ExecType::New,
+                    ord_status: OrdStatus::New,
                     reject_reason: RejectReason::None,
                     fill_price: None,
                     fill_qty: 0,

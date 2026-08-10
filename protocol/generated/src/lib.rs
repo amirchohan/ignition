@@ -11,7 +11,7 @@ pub mod cancel_replace_codec;
 pub mod control_response_codec;
 pub mod control_result;
 pub mod error_code;
-pub mod exec_state;
+pub mod exec_type;
 pub mod execution_report_codec;
 pub mod heartbeat_codec;
 pub mod heartbeat_status_codec;
@@ -20,6 +20,7 @@ pub mod kill_switch_codec;
 pub mod mass_cancel_codec;
 pub mod message_header_codec;
 pub mod new_order_codec;
+pub mod ord_status;
 pub mod order_type;
 pub mod protocol_error_codec;
 pub mod reject_reason;
@@ -29,8 +30,8 @@ pub mod time_in_force;
 pub mod trade_print_codec;
 
 pub const SBE_SCHEMA_ID: u16 = 7001;
-pub const SBE_SCHEMA_VERSION: u16 = 7;
-pub const SBE_SEMANTIC_VERSION: &str = "7.0.0";
+pub const SBE_SCHEMA_VERSION: u16 = 8;
+pub const SBE_SEMANTIC_VERSION: &str = "8.0.0";
 
 pub type SbeResult<T> = core::result::Result<T, SbeErr>;
 

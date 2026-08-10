@@ -1,6 +1,6 @@
 use crate::{
     domain::{
-        rd::Price,
+        Price,
         trading::md::{BookUpdate, TradePrint},
     },
     protocol::{
@@ -96,8 +96,8 @@ mod tests {
             trade_id: TradeId::new(13),
             maker_order_id: OrderId::new(14).expect("maker"),
             taker_order_id: OrderId::new(15).expect("taker"),
-            price: crate::domain::rd::Price::new(100, &instrument).expect("price"),
-            qty: crate::domain::rd::Qty::new(10, &instrument).expect("qty"),
+            price: crate::domain::Price::new(100, &instrument).expect("price"),
+            qty: crate::domain::Qty::new(10, &instrument).expect("qty"),
             recv_ts: RecvTs::new(1000),
         };
 

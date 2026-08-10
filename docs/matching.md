@@ -1,0 +1,81 @@
+# Matching Behavior
+
+Milestone 3 implements the single-symbol matching core. The engine consumes one
+normalized `OrderEntry` at a time and writes deterministic `TradingEvent` values
+into the caller-provided event buffer.
+
+## Priority
+
+Matching uses price-time priority. The best opposite price executes first, and
+orders at the same price execute in FIFO order. Resting orders are physically
+unlinked when canceled, replaced with lost priority, mass-canceled, or fully
+filled.
+
+## New Orders
+
+Limit orders may match immediately if they cross the opposite best price. Any
+remaining GTC quantity rests at its limit price. If a GTC order partially fills
+and then rests, the final taker trade report remains `PartiallyFilled` with the
+live remaining quantity; the engine does not emit a separate accepted report for
+the residual.
+
+Market orders walk available opposite liquidity until filled or until the book
+runs out. Market orders never rest. If a market order receives no fill, it
+expires with `ExecType::Expired` and `OrdStatus::Expired`. If it partially fills
+and the residual cannot execute, the final taker trade report is marked
+`OrdStatus::Expired` and its remaining quantity is set to zero.
+
+IOC orders use the same residual behavior as market orders: executable quantity
+trades immediately and any remainder expires instead of resting.
+
+Post-only limit orders are accepted only if they do not cross the opposite best
+price. A would-cross post-only order is canceled without execution.
+
+## Cancels
+
+`CancelOrder` removes the original resting order when it is active for the same
+account. Unknown orders, wrong-account cancels, and structurally invalid cancel
+requests are rejected.
+
+`MassCancel` walks the account's active-order chain and cancels each resting
+order for that account. It emits one cancel report per removed order, followed
+by a terminal cancel report for the mass-cancel command itself.
+
+## Cancel-Replace
+
+Cancel-replace follows exchange-style queue-priority rules:
+
+- Same price with equal or lower quantity preserves FIFO priority.
+- Price changes lose priority.
+- Quantity increases lose priority.
+
+When priority is preserved, the existing arena node is updated in place and the
+engine emits `ExecType::Replaced` with `OrdStatus::Replaced`. When priority is
+lost, the original order is canceled and the replacement re-enters as a new GTC
+limit order.
+
+## Reports
+
+Execution reports separate event type from order status:
+
+- `ExecType::New` / `OrdStatus::New` for passive accepted orders.
+- `ExecType::Trade` with `PartiallyFilled`, `Filled`, or terminal `Expired`
+  status for executions.
+- `ExecType::Canceled` / `OrdStatus::Canceled` for explicit cancels,
+  mass-cancel removals, and would-cross post-only orders.
+- `ExecType::Replaced` / `OrdStatus::Replaced` for priority-preserving
+  cancel-replace.
+- `ExecType::Rejected` / `OrdStatus::Rejected` for rejected commands.
+- `ExecType::Expired` / `OrdStatus::Expired` for market or IOC orders that do
+  not execute at all.
+
+Every fill emits a trade print plus maker and taker execution reports with the
+actual execution price and quantity. Reports without an execution have no fill
+price and zero fill quantity.
+
+## Complexity
+
+Matching cost is proportional to real work: filled maker orders, crossed
+non-empty price levels, and emitted events. The ladder avoids tree walks, price
+hashing, and scans across empty ticks. Storage details and operation complexity
+are documented in `docs/datastructure.md`.

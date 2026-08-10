@@ -1,7 +1,7 @@
 use crate::{
     domain::{
-        DomainResult, RecvTs,
-        rd::{InstrumentSpec, Price, Qty},
+        DomainResult, Price, Qty, RecvTs,
+        rd::InstrumentSpec,
         trading::order::{
             AccountId, CancelOrder, CancelReplace, ClientTs, ExecutionReport, MassCancel, NewOrder,
             OrderEntry, OrderId, OrderType,
@@ -18,7 +18,8 @@ use crate::{
 
 use super::super::{
     InboundDecodeError, ensure_complete, ensure_out, normalize_order_type, normalize_side,
-    normalize_tif, to_wire_exec_state, to_wire_reject_reason, unexpected_template,
+    normalize_tif, to_wire_exec_type, to_wire_ord_status, to_wire_reject_reason,
+    unexpected_template,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,7 +214,8 @@ pub fn encode_execution_report(event: ExecutionReport, out: &mut [u8]) -> Protoc
         .client_order_id(event.client_order_id.raw())
         .account_id(event.account_id.raw())
         .recv_ts(event.recv_ts.raw())
-        .state(to_wire_exec_state(event.state))
+        .exec_type(to_wire_exec_type(event.exec_type))
+        .ord_status(to_wire_ord_status(event.ord_status))
         .reject_reason(to_wire_reject_reason(event.reject_reason))
         .fill_price(event.fill_price.map_or(0, Price::raw))
         .fill_qty(event.fill_qty)
@@ -228,7 +230,7 @@ mod tests {
         domain::{
             DomainError, EngineSeq, RejectReason,
             rd::InstrumentSpec,
-            trading::order::{ExecState, Side, TimeInForce},
+            trading::order::{ExecType, OrdStatus, Side, TimeInForce},
         },
         protocol::{
             ProtocolError,
@@ -359,7 +361,8 @@ mod tests {
             client_order_id: OrderId::new(11).expect("order id"),
             account_id: AccountId::new(22).expect("account id"),
             recv_ts: RecvTs::new(900),
-            state: ExecState::Rejected,
+            exec_type: ExecType::Rejected,
+            ord_status: OrdStatus::Rejected,
             reject_reason: RejectReason::InvalidPrice,
             fill_price: None,
             fill_qty: 0,

@@ -2,8 +2,8 @@
 
 Ignition is a single-symbol, in-memory CLOB matching engine. The architecture
 keeps byte-level protocol handling, runtime orchestration, matching, risk,
-market-data, and control-plane concerns separated so later milestones can fill
-in behavior without changing ownership.
+market-data, and control-plane concerns separated so each layer has an explicit
+ownership boundary.
 
 ## Component Ownership
 
@@ -23,8 +23,8 @@ in behavior without changing ownership.
 
 - Owns protocol-agnostic types consumed by control, risk, matching, market data,
   replay, and benchmarking.
-- `domain::rd` owns single-instrument reference data and integer-scaled
-  `Price`, `Qty`, and raw notional types.
+- The domain root owns integer-scaled `Price`, `Qty`, and raw notional types.
+- `domain::rd` owns single-instrument reference data.
 - `domain::control` owns `ControlRequest` and `ControlEvent`.
 - `domain::trading::order` owns `OrderEntry` and execution reports.
 - `domain::trading::md` owns trade prints, book updates, and market-data
@@ -56,11 +56,20 @@ in behavior without changing ownership.
 
 ### `engine`
 
-- Owns future order-book state, order lifecycle mutations, and price-time
-  priority matching.
-- Accepts internal typed order entries, not raw protocol buffers.
-- Emits internal execution/book events for market-data and protocol conversion.
-- Does not read wall-clock time, parse protocol bytes, or perform transport IO.
+- Owns order-book state, order lifecycle mutations, and price-time priority
+  matching.
+- Accepts internal typed `OrderEntry` values, not raw protocol buffers.
+- Exposes `Engine::execute(entry, events)`, where the caller owns the reusable
+  output buffer for trading events.
+- Stores the book as two `SideLadder` values, one shared resting-order arena, a
+  `client_order_id -> handle` lookup, and a dense account table.
+- Uses a fixed storage envelope from `configs/server.yaml` for direct price
+  addressing; dynamic risk price bands are enforced outside the matching data
+  structure.
+- Emits deterministic execution reports and trade prints from the same ordered
+  event buffer used by replay, clients, and later market-data shaping.
+- Does not read wall-clock time, parse protocol bytes, perform transport IO, or
+  make risk-policy decisions.
 
 ### `risk`
 
@@ -103,7 +112,7 @@ The intended flow is:
 6. market-data and execution outputs are sequenced,
 7. gateway encodes control or trading egress frames.
 
-Milestones 1 and 2 define this ownership contract, protocol/domain boundary,
-single-symbol reference data, and deterministic core model. Matching, risk
-behavior, real transport IO, clients, replay, and benchmarking are later
+Milestones 1 through 3 define this ownership contract, protocol/domain boundary,
+single-symbol reference data, deterministic core model, and matching behavior.
+Risk behavior, real transport IO, clients, replay, and benchmarking remain later
 milestones.

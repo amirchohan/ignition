@@ -11,6 +11,61 @@ pub mod trading;
 /// Result type for validated domain construction and normalization.
 pub type DomainResult<T> = Result<T, DomainError>;
 
+/// Positive, tick-aligned integer price.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Price(u64);
+
+impl Price {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Construct a price from a value already proven positive and tick-aligned.
+    pub(crate) const fn new_unchecked(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn new(value: u64, instrument: &rd::InstrumentSpec) -> DomainResult<Self> {
+        if value == 0 || !value.is_multiple_of(instrument.price_tick) {
+            return Err(DomainError::InvalidPrice);
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// Positive, lot-aligned integer quantity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Qty(u64);
+
+impl Qty {
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    pub fn new(value: u64, instrument: &rd::InstrumentSpec) -> DomainResult<Self> {
+        if value == 0 || !value.is_multiple_of(instrument.qty_lot) {
+            return Err(DomainError::InvalidQuantity);
+        }
+
+        Ok(Self(value))
+    }
+}
+
+/// Raw notional in `price_integer * qty_integer` units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawNotional(u128);
+
+impl RawNotional {
+    pub fn from_price_qty(price: Price, qty: Qty) -> Self {
+        Self(u128::from(price.raw()) * u128::from(qty.raw()))
+    }
+
+    pub const fn raw(self) -> u128 {
+        self.0
+    }
+}
+
 /// Deterministic receive timestamp injected by runtime/replay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RecvTs(u64);

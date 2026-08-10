@@ -1,7 +1,4 @@
-use crate::domain::{
-    DomainResult, EngineSeq, RecvTs, RejectReason,
-    rd::{Price, Qty},
-};
+use crate::domain::{DomainResult, EngineSeq, Price, Qty, RecvTs, RejectReason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OrderId(u64);
@@ -65,15 +62,27 @@ pub enum TimeInForce {
     PostOnly,
 }
 
-/// Execution-report state.
+/// Execution-report event type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExecState {
-    Accepted,
+pub enum ExecType {
+    New,
+    Trade,
+    Canceled,
+    Replaced,
     Rejected,
+    Expired,
+}
+
+/// Current order status after applying an execution report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrdStatus {
+    New,
     PartiallyFilled,
     Filled,
-    Cancelled,
+    Canceled,
     Replaced,
+    Rejected,
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +140,8 @@ pub struct ExecutionReport {
     pub client_order_id: OrderId,
     pub account_id: AccountId,
     pub recv_ts: RecvTs,
-    pub state: ExecState,
+    pub exec_type: ExecType,
+    pub ord_status: OrdStatus,
     pub reject_reason: RejectReason,
     pub fill_price: Option<Price>,
     pub fill_qty: u64,

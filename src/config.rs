@@ -8,12 +8,17 @@ use std::{fs, path::Path};
 
 use serde::Deserialize;
 
-use crate::domain::{DomainError, DomainResult, rd::InstrumentSpec};
+use crate::{
+    domain::{DomainError, DomainResult, rd::InstrumentSpec},
+    engine::EngineConfig,
+};
 
 /// Server configuration loaded from `configs/server.yaml`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ServerConfig {
     pub reference_data: ReferenceDataConfig,
+    #[serde(default)]
+    pub engine: EngineRuntimeConfig,
 }
 
 impl ServerConfig {
@@ -28,6 +33,12 @@ impl ServerConfig {
     /// Validate this parsed config into core-ready reference data.
     pub fn validate(&self) -> DomainResult<InstrumentSpec> {
         self.reference_data.instrument.validate()
+    }
+
+    /// Validate matching-engine capacity and storage-envelope settings.
+    pub fn validate_engine(&self) -> DomainResult<EngineConfig> {
+        let instrument = self.validate()?;
+        self.engine.validate(&instrument)
     }
 }
 
@@ -57,6 +68,44 @@ impl InstrumentConfig {
             self.qty_decimals,
             self.price_tick,
             self.qty_lot,
+        )
+    }
+}
+
+/// Matching-engine storage and capacity configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct EngineRuntimeConfig {
+    pub storage_min_price: u64,
+    pub storage_max_price: u64,
+    pub page_size: u32,
+    pub max_resting_orders: u32,
+    pub max_account_id: u32,
+    pub max_active_pages: u32,
+}
+
+impl Default for EngineRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            storage_min_price: 1,
+            storage_max_price: 1_000_000,
+            page_size: 1024,
+            max_resting_orders: 16_384,
+            max_account_id: 65_535,
+            max_active_pages: 1024,
+        }
+    }
+}
+
+impl EngineRuntimeConfig {
+    pub fn validate(self, instrument: &InstrumentSpec) -> DomainResult<EngineConfig> {
+        EngineConfig::new(
+            *instrument,
+            self.storage_min_price,
+            self.storage_max_price,
+            self.page_size,
+            self.max_resting_orders,
+            self.max_account_id,
+            self.max_active_pages,
         )
     }
 }
@@ -101,6 +150,8 @@ reference_data:
         assert_eq!(instrument.qty_decimals, 8);
         assert_eq!(instrument.price_tick, 1);
         assert_eq!(instrument.qty_lot, 1);
+        let engine = config.validate_engine().expect("valid engine config");
+        assert_eq!(engine.page_size(), 1024);
     }
 
     #[test]
@@ -140,5 +191,35 @@ reference_data:
         .expect_err("instrument id should exceed u16");
 
         assert!(error.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn parses_and_validates_engine_config() {
+        let config = parse(
+            r#"
+reference_data:
+  instrument:
+    instrument_id: 1001
+    base_asset_id: 1
+    quote_asset_id: 2
+    price_decimals: 2
+    qty_decimals: 8
+    price_tick: 5
+    qty_lot: 1
+engine:
+  storage_min_price: 10
+  storage_max_price: 1000
+  page_size: 1024
+  max_resting_orders: 100
+  max_account_id: 1000
+  max_active_pages: 10
+"#,
+        );
+
+        let engine = config.validate_engine().expect("valid engine config");
+        assert_eq!(engine.storage_min_price().raw(), 10);
+        assert_eq!(engine.storage_max_price().raw(), 1000);
+        assert_eq!(engine.max_resting_orders(), 100);
+        assert_eq!(engine.max_account_id(), 1000);
     }
 }
