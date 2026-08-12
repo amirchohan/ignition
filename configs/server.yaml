@@ -19,3 +19,8 @@ risk:
   max_open_notional_per_account: 100000000000000000
   startup_reference_price: 10000000 # $100,000.00 with price_decimals=2
   price_band_bps: 1000 # +/-10%
+control:
+  bind_addr: "127.0.0.1:9001"
+  heartbeat_timeout_ns: 0 # disabled by default
+  max_frame_len: 4096
+  max_pending_write_bytes: 1048576

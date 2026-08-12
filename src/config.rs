@@ -9,6 +9,7 @@ use std::{fs, path::Path};
 use serde::Deserialize;
 
 use crate::{
+    control::ControlConfig,
     domain::{DomainError, DomainResult, Price, rd::InstrumentSpec},
     engine::EngineConfig,
     risk::RiskConfig,
@@ -22,6 +23,8 @@ pub struct ServerConfig {
     pub engine: EngineRuntimeConfig,
     #[serde(default)]
     pub risk: RiskRuntimeConfig,
+    #[serde(default)]
+    pub control: ControlRuntimeConfig,
 }
 
 impl ServerConfig {
@@ -48,6 +51,11 @@ impl ServerConfig {
     pub fn validate_risk(&self) -> DomainResult<RiskConfig> {
         let instrument = self.validate()?;
         self.risk.validate(&instrument)
+    }
+
+    /// Validate control-plane runtime settings.
+    pub fn validate_control(&self) -> ControlConfig {
+        self.control.validate()
     }
 }
 
@@ -148,6 +156,53 @@ impl RiskRuntimeConfig {
             self.price_band_bps,
         )
     }
+}
+
+/// Control-plane runtime configuration loaded from YAML.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ControlRuntimeConfig {
+    #[serde(default)]
+    pub heartbeat_timeout_ns: u64,
+    #[serde(default = "default_control_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default = "default_control_max_frame_len")]
+    pub max_frame_len: usize,
+    #[serde(default = "default_control_max_pending_write_bytes")]
+    pub max_pending_write_bytes: usize,
+}
+
+impl Default for ControlRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_timeout_ns: 0,
+            bind_addr: default_control_bind_addr(),
+            max_frame_len: default_control_max_frame_len(),
+            max_pending_write_bytes: default_control_max_pending_write_bytes(),
+        }
+    }
+}
+
+impl ControlRuntimeConfig {
+    pub fn validate(&self) -> ControlConfig {
+        ControlConfig {
+            heartbeat_timeout_ns: self.heartbeat_timeout_ns,
+            bind_addr: self.bind_addr.clone(),
+            max_frame_len: self.max_frame_len,
+            max_pending_write_bytes: self.max_pending_write_bytes,
+        }
+    }
+}
+
+fn default_control_bind_addr() -> String {
+    "127.0.0.1:9001".to_owned()
+}
+
+const fn default_control_max_frame_len() -> usize {
+    4096
+}
+
+const fn default_control_max_pending_write_bytes() -> usize {
+    1 << 20
 }
 
 /// Config load/parse/validation errors.
@@ -261,5 +316,33 @@ engine:
         assert_eq!(engine.storage_max_price().raw(), 1000);
         assert_eq!(engine.max_resting_orders(), 100);
         assert_eq!(engine.max_account_id(), 1000);
+    }
+
+    #[test]
+    fn parses_and_validates_control_config() {
+        let config = parse(
+            r#"
+reference_data:
+  instrument:
+    instrument_id: 1001
+    base_asset_id: 1
+    quote_asset_id: 2
+    price_decimals: 2
+    qty_decimals: 8
+    price_tick: 1
+    qty_lot: 1
+control:
+  bind_addr: "127.0.0.1:9011"
+  heartbeat_timeout_ns: 500
+  max_frame_len: 8192
+  max_pending_write_bytes: 16384
+"#,
+        );
+
+        let control = config.validate_control();
+        assert_eq!(control.heartbeat_timeout_ns, 500);
+        assert_eq!(control.bind_addr, "127.0.0.1:9011");
+        assert_eq!(control.max_frame_len, 8192);
+        assert_eq!(control.max_pending_write_bytes, 16384);
     }
 }

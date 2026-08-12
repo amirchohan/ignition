@@ -8,6 +8,7 @@ pub mod control;
 pub mod domain;
 pub mod engine;
 pub mod gateway;
+pub mod io;
 pub mod market_data;
 pub mod protocol;
 pub mod risk;

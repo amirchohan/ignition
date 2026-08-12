@@ -1,54 +1,74 @@
 use crate::{
     domain::{
-        DomainError, DomainResult, RecvTs,
+        ErrorCode, RecvTs,
         control::{
             ControlEvent, ControlRequest, ControlResponse, Heartbeat, HeartbeatSeq,
-            HeartbeatStatus, KillSwitch, KillSwitchAction, RequestId, Snapshot,
+            HeartbeatStatus, KillSwitch, KillSwitchAction, RequestId, Snapshot, SnapshotBegin,
+            SnapshotEnd, SnapshotOrder,
         },
     },
     protocol::{
-        MessageKind, ProtocolResult, SBE_HEADER_LEN, decode_header, encode_header,
+        MessageKind, ProtocolError, ProtocolResult, SBE_HEADER_LEN, decode_header, encode_header,
         generated::codecs::{
             ReadBuf, WriteBuf, control_response_codec, heartbeat_codec, heartbeat_status_codec,
-            kill_switch_action, kill_switch_codec, snapshot_codec,
+            kill_switch_action, kill_switch_codec, snapshot_begin_codec, snapshot_codec,
+            snapshot_end_codec, snapshot_order_codec,
         },
     },
 };
 
 use super::{
-    InboundDecodeError, encode_protocol_error, ensure_complete, ensure_out, to_wire_control_result,
-    to_wire_reject_reason, unexpected_template,
+    encode_protocol_error, ensure_complete, ensure_out, to_wire_control_result,
+    to_wire_reject_reason, to_wire_side, unexpected_template,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WireControlRequest {
-    KillSwitch(WireKillSwitch),
-    Snapshot(WireSnapshot),
-    Heartbeat(WireHeartbeat),
+pub struct WireDecodeError {
+    pub template_id: u16,
+    pub recv_ts: RecvTs,
+    pub error_code: ErrorCode,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WireKillSwitch {
-    pub request_id: u32,
-    pub action: kill_switch_action::KillSwitchAction,
+impl WireDecodeError {
+    fn protocol(error: ProtocolError, bytes: &[u8], recv_ts: RecvTs) -> Self {
+        let error_code = match error {
+            ProtocolError::UnexpectedTemplate { .. } | ProtocolError::UnknownTemplate { .. } => {
+                ErrorCode::UnsupportedTemplate
+            }
+            ProtocolError::UnsupportedVersion { .. } => ErrorCode::UnsupportedVersion,
+            _ => ErrorCode::DecodeError,
+        };
+        Self {
+            template_id: template_id(bytes),
+            recv_ts,
+            error_code,
+        }
+    }
+
+    fn domain(bytes: &[u8], recv_ts: RecvTs) -> Self {
+        Self {
+            template_id: template_id(bytes),
+            recv_ts,
+            error_code: ErrorCode::DecodeError,
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WireSnapshot {
-    pub request_id: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WireHeartbeat {
-    pub heartbeat_seq: u32,
-}
-
-pub fn decode_control_request(input: &[u8]) -> ProtocolResult<WireControlRequest> {
-    let frame = decode_header(input)?;
-    ensure_complete(input, frame)?;
+pub fn decode_control_request(
+    input: &[u8],
+    recv_ts: RecvTs,
+) -> Result<ControlRequest, WireDecodeError> {
+    let frame =
+        decode_header(input).map_err(|error| WireDecodeError::protocol(error, input, recv_ts))?;
+    ensure_complete(input, frame)
+        .map_err(|error| WireDecodeError::protocol(error, input, recv_ts))?;
 
     if !frame.kind.is_control_request() {
-        return Err(unexpected_template(frame.kind));
+        return Err(WireDecodeError::protocol(
+            unexpected_template(frame.kind),
+            input,
+            recv_ts,
+        ));
     }
 
     let read_buf = ReadBuf::new(input);
@@ -60,9 +80,22 @@ pub fn decode_control_request(input: &[u8]) -> ProtocolResult<WireControlRequest
                 frame.block_length,
                 frame.version,
             );
-            Ok(WireControlRequest::KillSwitch(WireKillSwitch {
-                request_id: decoder.request_id(),
-                action: decoder.action(),
+            Ok(ControlRequest::KillSwitch(KillSwitch {
+                request_id: RequestId::new(decoder.request_id())
+                    .map_err(|_| WireDecodeError::domain(input, recv_ts))?,
+                recv_ts,
+                action: match decoder.action() {
+                    kill_switch_action::KillSwitchAction::HaltTrading => {
+                        KillSwitchAction::HaltTrading
+                    }
+                    kill_switch_action::KillSwitchAction::Shutdown => KillSwitchAction::Shutdown,
+                    kill_switch_action::KillSwitchAction::ResumeTrading => {
+                        KillSwitchAction::ResumeTrading
+                    }
+                    kill_switch_action::KillSwitchAction::NullVal => {
+                        return Err(WireDecodeError::domain(input, recv_ts));
+                    }
+                },
             }))
         }
         MessageKind::Snapshot => {
@@ -72,8 +105,10 @@ pub fn decode_control_request(input: &[u8]) -> ProtocolResult<WireControlRequest
                 frame.block_length,
                 frame.version,
             );
-            Ok(WireControlRequest::Snapshot(WireSnapshot {
-                request_id: decoder.request_id(),
+            Ok(ControlRequest::Snapshot(Snapshot {
+                request_id: RequestId::new(decoder.request_id())
+                    .map_err(|_| WireDecodeError::domain(input, recv_ts))?,
+                recv_ts,
             }))
         }
         MessageKind::Heartbeat => {
@@ -83,47 +118,30 @@ pub fn decode_control_request(input: &[u8]) -> ProtocolResult<WireControlRequest
                 frame.block_length,
                 frame.version,
             );
-            Ok(WireControlRequest::Heartbeat(WireHeartbeat {
-                heartbeat_seq: decoder.heartbeat_seq(),
+            Ok(ControlRequest::Heartbeat(Heartbeat {
+                heartbeat_seq: HeartbeatSeq::new(decoder.heartbeat_seq())
+                    .map_err(|_| WireDecodeError::domain(input, recv_ts))?,
+                recv_ts,
             }))
         }
         _ => unreachable!("control request kind checked above"),
     }
 }
 
-pub fn normalize_control_request(
-    message: WireControlRequest,
-    recv_ts: RecvTs,
-) -> DomainResult<ControlRequest> {
-    match message {
-        WireControlRequest::KillSwitch(message) => Ok(ControlRequest::KillSwitch(KillSwitch {
-            request_id: RequestId::new(message.request_id)?,
-            recv_ts,
-            action: normalize_kill_switch_action(message.action)?,
-        })),
-        WireControlRequest::Snapshot(message) => Ok(ControlRequest::Snapshot(Snapshot {
-            request_id: RequestId::new(message.request_id)?,
-            recv_ts,
-        })),
-        WireControlRequest::Heartbeat(message) => Ok(ControlRequest::Heartbeat(Heartbeat {
-            heartbeat_seq: HeartbeatSeq::new(message.heartbeat_seq)?,
-            recv_ts,
-        })),
+fn template_id(bytes: &[u8]) -> u16 {
+    if bytes.len() < SBE_HEADER_LEN {
+        return 0;
     }
-}
-
-pub fn decode_and_normalize_control_request(
-    input: &[u8],
-    recv_ts: RecvTs,
-) -> Result<ControlRequest, InboundDecodeError> {
-    let message = decode_control_request(input).map_err(InboundDecodeError::Protocol)?;
-    normalize_control_request(message, recv_ts).map_err(InboundDecodeError::Domain)
+    u16::from_le_bytes([bytes[2], bytes[3]])
 }
 
 pub fn encode_control_event(event: ControlEvent, out: &mut [u8]) -> ProtocolResult<usize> {
     match event {
         ControlEvent::ControlResponse(event) => encode_control_response(event, out),
         ControlEvent::HeartbeatStatus(event) => encode_heartbeat_status(event, out),
+        ControlEvent::SnapshotBegin(event) => encode_snapshot_begin(event, out),
+        ControlEvent::SnapshotOrder(event) => encode_snapshot_order(event, out),
+        ControlEvent::SnapshotEnd(event) => encode_snapshot_end(event, out),
         ControlEvent::ProtocolError(event) => encode_protocol_error(event, out),
     }
 }
@@ -161,15 +179,65 @@ fn encode_heartbeat_status(event: HeartbeatStatus, out: &mut [u8]) -> ProtocolRe
     Ok(SBE_HEADER_LEN + heartbeat_status_codec::SBE_BLOCK_LENGTH as usize)
 }
 
-fn normalize_kill_switch_action(
-    value: kill_switch_action::KillSwitchAction,
-) -> DomainResult<KillSwitchAction> {
-    match value {
-        kill_switch_action::KillSwitchAction::HaltTrading => Ok(KillSwitchAction::HaltTrading),
-        kill_switch_action::KillSwitchAction::Shutdown => Ok(KillSwitchAction::Shutdown),
-        kill_switch_action::KillSwitchAction::ResumeTrading => Ok(KillSwitchAction::ResumeTrading),
-        kill_switch_action::KillSwitchAction::NullVal => Err(DomainError::Malformed),
-    }
+fn encode_snapshot_begin(event: SnapshotBegin, out: &mut [u8]) -> ProtocolResult<usize> {
+    let block_len = snapshot_begin_codec::SBE_BLOCK_LENGTH;
+    ensure_out(out, block_len)?;
+    encode_header(out, block_len, MessageKind::SnapshotBegin)?;
+
+    let write_buf = WriteBuf::new(out);
+    let mut encoder =
+        snapshot_begin_codec::SnapshotBeginEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    encoder
+        .engine_seq(event.engine_seq.raw())
+        .request_id(event.request_id.raw())
+        .recv_ts(event.recv_ts.raw())
+        .bid_price(event.bid_price.map_or(0, |price| price.raw()))
+        .bid_qty(event.bid_qty)
+        .ask_price(event.ask_price.map_or(0, |price| price.raw()))
+        .ask_qty(event.ask_qty)
+        .resting_order_count(event.resting_order_count)
+        .last_md_seq(event.last_md_seq)
+        .next_trade_id(event.next_trade_id)
+        .risk_reference_price(event.risk_reference_price.raw());
+    Ok(SBE_HEADER_LEN + snapshot_begin_codec::SBE_BLOCK_LENGTH as usize)
+}
+
+fn encode_snapshot_order(event: SnapshotOrder, out: &mut [u8]) -> ProtocolResult<usize> {
+    let block_len = snapshot_order_codec::SBE_BLOCK_LENGTH;
+    ensure_out(out, block_len)?;
+    encode_header(out, block_len, MessageKind::SnapshotOrder)?;
+
+    let write_buf = WriteBuf::new(out);
+    let mut encoder =
+        snapshot_order_codec::SnapshotOrderEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    encoder
+        .engine_seq(event.engine_seq.raw())
+        .request_id(event.request_id.raw())
+        .row_index(event.row_index)
+        .side(to_wire_side(event.side))
+        .client_order_id(event.client_order_id.raw())
+        .account_id(event.account_id.raw())
+        .price(event.price.raw())
+        .remaining_qty(event.remaining_qty);
+    Ok(SBE_HEADER_LEN + snapshot_order_codec::SBE_BLOCK_LENGTH as usize)
+}
+
+fn encode_snapshot_end(event: SnapshotEnd, out: &mut [u8]) -> ProtocolResult<usize> {
+    let block_len = snapshot_end_codec::SBE_BLOCK_LENGTH;
+    ensure_out(out, block_len)?;
+    encode_header(out, block_len, MessageKind::SnapshotEnd)?;
+
+    let write_buf = WriteBuf::new(out);
+    let mut encoder =
+        snapshot_end_codec::SnapshotEndEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    encoder
+        .engine_seq(event.engine_seq.raw())
+        .request_id(event.request_id.raw())
+        .recv_ts(event.recv_ts.raw())
+        .row_count(event.row_count)
+        .result(to_wire_control_result(event.result))
+        .reason(to_wire_reject_reason(event.reason));
+    Ok(SBE_HEADER_LEN + snapshot_end_codec::SBE_BLOCK_LENGTH as usize)
 }
 
 #[cfg(test)]
@@ -177,91 +245,29 @@ mod tests {
     use super::*;
     use crate::{
         domain::{
-            EngineSeq, ErrorCode, ProtocolErrorEvent,
-            control::{ControlResult, HeartbeatStatus},
+            EngineSeq, ErrorCode, Price, ProtocolErrorEvent, RecvTs, RejectReason,
+            control::{
+                ControlResult, HeartbeatSeq, HeartbeatStatus, RequestId, SnapshotBegin,
+                SnapshotEnd, SnapshotOrder,
+            },
+            rd::InstrumentSpec,
+            trading::order::{AccountId, OrderId, Side},
         },
         protocol::{
-            ProtocolError,
+            SCHEMA_VERSION, decode_header,
             generated::codecs::{
-                message_header_codec, new_order_codec, order_type as wire_order_type,
-                protocol_error_codec, side as wire_side, time_in_force as wire_tif,
+                ReadBuf, message_header_codec, protocol_error_codec, side as wire_side,
+                snapshot_begin_codec, snapshot_end_codec, snapshot_order_codec,
             },
         },
     };
 
-    fn encode_kill_switch(action: kill_switch_action::KillSwitchAction) -> Vec<u8> {
-        let len = SBE_HEADER_LEN + kill_switch_codec::SBE_BLOCK_LENGTH as usize;
-        let mut bytes = vec![0_u8; len];
-        encode_header(
-            &mut bytes,
-            kill_switch_codec::SBE_BLOCK_LENGTH,
-            MessageKind::KillSwitch,
-        )
-        .expect("header");
-
-        let write_buf = WriteBuf::new(&mut bytes);
-        let mut encoder =
-            kill_switch_codec::KillSwitchEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
-        encoder.request_id(77).action(action);
-        bytes
+    fn instrument() -> InstrumentSpec {
+        InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 1).expect("instrument")
     }
 
-    fn encode_new_order() -> Vec<u8> {
-        let len = SBE_HEADER_LEN + new_order_codec::SBE_BLOCK_LENGTH as usize;
-        let mut bytes = vec![0_u8; len];
-        encode_header(
-            &mut bytes,
-            new_order_codec::SBE_BLOCK_LENGTH,
-            MessageKind::NewOrder,
-        )
-        .expect("header");
-
-        let write_buf = WriteBuf::new(&mut bytes);
-        let mut encoder =
-            new_order_codec::NewOrderEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
-        encoder
-            .client_order_id(11)
-            .account_id(22)
-            .client_ts(33)
-            .side(wire_side::Side::Buy)
-            .order_type(wire_order_type::OrderType::Limit)
-            .time_in_force(wire_tif::TimeInForce::Gtc)
-            .price(100)
-            .qty(10);
-        bytes
-    }
-
-    #[test]
-    fn control_request_normalizes_kill_switch() {
-        let bytes = encode_kill_switch(kill_switch_action::KillSwitchAction::HaltTrading);
-        let request =
-            decode_and_normalize_control_request(&bytes, RecvTs::new(55)).expect("control request");
-
-        let ControlRequest::KillSwitch(request) = request else {
-            panic!("expected kill switch");
-        };
-
-        assert_eq!(request.request_id.raw(), 77);
-        assert_eq!(request.recv_ts.raw(), 55);
-        assert_eq!(request.action, KillSwitchAction::HaltTrading);
-    }
-
-    #[test]
-    fn control_request_rejects_wrong_endpoint_template() {
-        assert_eq!(
-            decode_control_request(&encode_new_order()),
-            Err(ProtocolError::UnexpectedTemplate { template_id: 100 })
-        );
-    }
-
-    #[test]
-    fn control_request_rejects_null_action() {
-        let bytes = encode_kill_switch(kill_switch_action::KillSwitchAction::NullVal);
-
-        assert_eq!(
-            decode_and_normalize_control_request(&bytes, RecvTs::new(55)),
-            Err(InboundDecodeError::Domain(DomainError::Malformed))
-        );
+    fn price(raw: u64) -> Price {
+        Price::new(raw, &instrument()).expect("price")
     }
 
     #[test]
@@ -301,6 +307,87 @@ mod tests {
         assert_eq!(
             decoder.template_id(),
             MessageKind::ProtocolError.template_id()
+        );
+    }
+
+    #[test]
+    fn control_event_encodes_snapshot_messages() {
+        let request_id = RequestId::new(99).expect("request");
+
+        let mut begin_bytes =
+            [0_u8; SBE_HEADER_LEN + snapshot_begin_codec::SBE_BLOCK_LENGTH as usize];
+        encode_control_event(
+            ControlEvent::SnapshotBegin(SnapshotBegin {
+                engine_seq: EngineSeq::new(1),
+                request_id,
+                recv_ts: RecvTs::new(100),
+                bid_price: Some(price(1_001)),
+                bid_qty: 12,
+                ask_price: None,
+                ask_qty: 0,
+                resting_order_count: 3,
+                last_md_seq: 44,
+                next_trade_id: 55,
+                risk_reference_price: price(1_000),
+            }),
+            &mut begin_bytes,
+        )
+        .expect("encode begin");
+        assert_eq!(
+            decode_header(&begin_bytes).expect("header").kind,
+            MessageKind::SnapshotBegin
+        );
+        let begin = snapshot_begin_codec::SnapshotBeginDecoder::default().wrap(
+            ReadBuf::new(&begin_bytes),
+            SBE_HEADER_LEN,
+            snapshot_begin_codec::SBE_BLOCK_LENGTH,
+            SCHEMA_VERSION,
+        );
+        assert_eq!(begin.bid_price(), 1_001);
+        assert_eq!(begin.ask_price(), 0);
+        assert_eq!(begin.last_md_seq(), 44);
+
+        let mut row_bytes =
+            [0_u8; SBE_HEADER_LEN + snapshot_order_codec::SBE_BLOCK_LENGTH as usize];
+        encode_control_event(
+            ControlEvent::SnapshotOrder(SnapshotOrder {
+                engine_seq: EngineSeq::new(2),
+                request_id,
+                row_index: 0,
+                side: Side::Buy,
+                client_order_id: OrderId::new(11).expect("order"),
+                account_id: AccountId::new(22).expect("account"),
+                price: price(1_001),
+                remaining_qty: 9,
+            }),
+            &mut row_bytes,
+        )
+        .expect("encode row");
+        let row = snapshot_order_codec::SnapshotOrderDecoder::default().wrap(
+            ReadBuf::new(&row_bytes),
+            SBE_HEADER_LEN,
+            snapshot_order_codec::SBE_BLOCK_LENGTH,
+            SCHEMA_VERSION,
+        );
+        assert_eq!(row.side(), wire_side::Side::Buy);
+        assert_eq!(row.client_order_id(), 11);
+
+        let mut end_bytes = [0_u8; SBE_HEADER_LEN + snapshot_end_codec::SBE_BLOCK_LENGTH as usize];
+        encode_control_event(
+            ControlEvent::SnapshotEnd(SnapshotEnd {
+                engine_seq: EngineSeq::new(3),
+                request_id,
+                recv_ts: RecvTs::new(100),
+                row_count: 1,
+                result: ControlResult::Ok,
+                reason: RejectReason::None,
+            }),
+            &mut end_bytes,
+        )
+        .expect("encode end");
+        assert_eq!(
+            decode_header(&end_bytes).expect("header").kind,
+            MessageKind::SnapshotEnd
         );
     }
 }

@@ -199,6 +199,26 @@ impl Engine {
     ) -> OrderProjection {
         self.book.project_order(account_id, side, limit_price, qty)
     }
+
+    /// Append resting orders in deterministic snapshot order.
+    pub fn snapshot_orders(&self, out: &mut Vec<RestingOrderView>) {
+        self.book.snapshot_orders(out);
+    }
+
+    /// Cancel every resting order in deterministic book order.
+    pub fn drain_all(
+        &mut self,
+        sequencer: &mut EngineSequencer,
+        market_data: &mut MarketDataRuntime,
+        events: &mut Vec<TradingEvent>,
+    ) -> Result<(), EngineError> {
+        self.book
+            .drain_all(sequencer, market_data, events)
+            .map_err(|error| match error {
+                DomainError::SequenceOverflow => EngineError::SequenceOverflow,
+                _ => EngineError::InvalidConfig,
+            })
+    }
 }
 
 /// Read-only resting-order view exposed across the engine boundary.

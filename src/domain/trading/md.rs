@@ -95,6 +95,10 @@ impl MarketDataSequencer {
         MdSeq(self.next_md_seq.saturating_sub(1))
     }
 
+    pub const fn next_trade_id_value(&self) -> TradeId {
+        TradeId(self.next_trade_id)
+    }
+
     pub fn next_trade_id(&mut self) -> DomainResult<TradeId> {
         let current = self.next_trade_id;
         self.next_trade_id = self

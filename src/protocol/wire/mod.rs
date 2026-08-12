@@ -79,6 +79,13 @@ pub(crate) fn normalize_side(value: side::Side) -> DomainResult<Side> {
     }
 }
 
+pub(crate) fn to_wire_side(value: Side) -> side::Side {
+    match value {
+        Side::Buy => side::Side::Buy,
+        Side::Sell => side::Side::Sell,
+    }
+}
+
 pub(crate) fn normalize_order_type(
     value: crate::protocol::generated::codecs::order_type::OrderType,
 ) -> DomainResult<OrderType> {

@@ -14,6 +14,13 @@ use crate::domain::{
     },
 };
 
+/// Read-only market-data sequencer state included in control snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketDataSnapshot {
+    pub last_md_seq: u64,
+    pub next_trade_id: u64,
+}
+
 /// Market-data event shaper and deterministic sequence owner.
 #[derive(Debug, Default)]
 pub struct MarketDataRuntime {
@@ -100,5 +107,13 @@ impl MarketDataRuntime {
         events.push(TradingEvent::L1Update(event));
         self.last_l1 = Some(event);
         Ok(())
+    }
+
+    /// Return deterministic outbound sequence state for control snapshots.
+    pub fn snapshot(&self) -> MarketDataSnapshot {
+        MarketDataSnapshot {
+            last_md_seq: self.sequencer.previous_md_seq().raw(),
+            next_trade_id: self.sequencer.next_trade_id_value().raw(),
+        }
     }
 }

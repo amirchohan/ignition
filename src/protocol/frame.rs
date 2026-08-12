@@ -10,7 +10,7 @@ use crate::protocol::error::{ProtocolError, ProtocolResult};
 pub const SCHEMA_ID: u16 = 7001;
 
 /// Current Ignition protocol schema version.
-pub const SCHEMA_VERSION: u16 = 11;
+pub const SCHEMA_VERSION: u16 = 12;
 
 /// Length of the standard SBE message header.
 pub const SBE_HEADER_LEN: usize = 8;
@@ -44,6 +44,12 @@ pub enum MessageKind {
     ControlResponse,
     /// Outbound heartbeat status.
     HeartbeatStatus,
+    /// Outbound snapshot begin marker and metadata.
+    SnapshotBegin,
+    /// Outbound resting-order snapshot row.
+    SnapshotOrder,
+    /// Outbound snapshot end marker.
+    SnapshotEnd,
     /// Outbound protocol error.
     ProtocolError,
 }
@@ -57,6 +63,9 @@ impl MessageKind {
             Self::Heartbeat => 3,
             Self::ControlResponse => 50,
             Self::HeartbeatStatus => 51,
+            Self::SnapshotBegin => 52,
+            Self::SnapshotOrder => 53,
+            Self::SnapshotEnd => 54,
             Self::ProtocolError => 99,
             Self::NewOrder => 100,
             Self::CancelOrder => 101,
@@ -77,6 +86,9 @@ impl MessageKind {
             3 => Ok(Self::Heartbeat),
             50 => Ok(Self::ControlResponse),
             51 => Ok(Self::HeartbeatStatus),
+            52 => Ok(Self::SnapshotBegin),
+            53 => Ok(Self::SnapshotOrder),
+            54 => Ok(Self::SnapshotEnd),
             99 => Ok(Self::ProtocolError),
             100 => Ok(Self::NewOrder),
             101 => Ok(Self::CancelOrder),
@@ -164,7 +176,8 @@ mod tests {
         ReadBuf, WriteBuf, cancel_order_codec, cancel_replace_codec, control_response_codec,
         execution_report_codec, heartbeat_codec, heartbeat_status_codec, kill_switch_codec,
         l1_update_codec, l2_update_codec, mass_cancel_codec, message_header_codec, new_order_codec,
-        order_type, protocol_error_codec, side, snapshot_codec, time_in_force, trade_print_codec,
+        order_type, protocol_error_codec, side, snapshot_begin_codec, snapshot_codec,
+        snapshot_end_codec, snapshot_order_codec, time_in_force, trade_print_codec,
     };
 
     #[test]
@@ -215,6 +228,18 @@ mod tests {
             (
                 MessageKind::HeartbeatStatus,
                 heartbeat_status_codec::SBE_TEMPLATE_ID,
+            ),
+            (
+                MessageKind::SnapshotBegin,
+                snapshot_begin_codec::SBE_TEMPLATE_ID,
+            ),
+            (
+                MessageKind::SnapshotOrder,
+                snapshot_order_codec::SBE_TEMPLATE_ID,
+            ),
+            (
+                MessageKind::SnapshotEnd,
+                snapshot_end_codec::SBE_TEMPLATE_ID,
             ),
             (
                 MessageKind::ProtocolError,

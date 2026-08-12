@@ -3,8 +3,8 @@
     xmlns:sbe="http://fixprotocol.io/2016/sbe"
     package="ignition_protocol_generated"
     id="7001"
-    version="11"
-    semanticVersion="11.0.0"
+    version="12"
+    semanticVersion="12.0.0"
     description="Ignition single-symbol CLOB protocol"
     byteOrder="littleEndian">
 
@@ -115,6 +115,40 @@
         <field name="heartbeatSeq" id="2" type="uint32"/>
         <field name="recvTs" id="3" type="uint64"/>
         <field name="result" id="4" type="ControlResult"/>
+    </message>
+
+    <message name="SnapshotBegin" id="52" description="Begin a deterministic book snapshot">
+        <field name="engineSeq" id="1" type="uint64"/>
+        <field name="requestId" id="2" type="uint32"/>
+        <field name="recvTs" id="3" type="uint64"/>
+        <field name="bidPrice" id="4" type="uint64"/>
+        <field name="bidQty" id="5" type="uint64"/>
+        <field name="askPrice" id="6" type="uint64"/>
+        <field name="askQty" id="7" type="uint64"/>
+        <field name="restingOrderCount" id="8" type="uint64"/>
+        <field name="lastMdSeq" id="9" type="uint64"/>
+        <field name="nextTradeId" id="10" type="uint64"/>
+        <field name="riskReferencePrice" id="11" type="uint64"/>
+    </message>
+
+    <message name="SnapshotOrder" id="53" description="One price-time ordered resting order snapshot row">
+        <field name="engineSeq" id="1" type="uint64"/>
+        <field name="requestId" id="2" type="uint32"/>
+        <field name="rowIndex" id="3" type="uint64"/>
+        <field name="side" id="4" type="Side"/>
+        <field name="clientOrderId" id="5" type="uint64"/>
+        <field name="accountId" id="6" type="uint32"/>
+        <field name="price" id="7" type="uint64"/>
+        <field name="remainingQty" id="8" type="uint64"/>
+    </message>
+
+    <message name="SnapshotEnd" id="54" description="End a deterministic book snapshot">
+        <field name="engineSeq" id="1" type="uint64"/>
+        <field name="requestId" id="2" type="uint32"/>
+        <field name="recvTs" id="3" type="uint64"/>
+        <field name="rowCount" id="4" type="uint64"/>
+        <field name="result" id="5" type="ControlResult"/>
+        <field name="reason" id="6" type="RejectReason"/>
     </message>
 
     <message name="ProtocolError" id="99" description="Outbound protocol-level error">

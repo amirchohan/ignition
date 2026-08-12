@@ -191,6 +191,48 @@ impl OrderBook {
         }
     }
 
+    /// Append resting orders in deterministic book order.
+    pub(crate) fn snapshot_orders(&self, out: &mut Vec<RestingOrderView>) {
+        self.snapshot_side_orders(Side::Buy, out);
+        self.snapshot_side_orders(Side::Sell, out);
+    }
+
+    /// Cancel every resting order in deterministic book order.
+    pub(crate) fn drain_all(
+        &mut self,
+        sequencer: &mut EngineSequencer,
+        market_data: &mut MarketDataRuntime,
+        events: &mut Vec<TradingEvent>,
+    ) -> DomainResult<()> {
+        let mut handles = Vec::with_capacity(self.resting_order_count());
+        self.collect_side_handles(Side::Buy, &mut handles);
+        self.collect_side_handles(Side::Sell, &mut handles);
+
+        for handle in handles {
+            let Some(removed) = self.unlink_and_free(handle) else {
+                continue;
+            };
+            let level_qty = self.current_level_qty(removed.side, removed.price);
+            self.publish_book_update(removed.side, removed.price, level_qty, market_data, events)?;
+            self.push_report(
+                sequencer,
+                events,
+                ReportSpec {
+                    client_order_id: removed.order_id,
+                    account_id: removed.account_id,
+                    exec_type: ExecType::Canceled,
+                    ord_status: OrdStatus::Canceled,
+                    reject_reason: RejectReason::None,
+                    fill_price: None,
+                    fill_qty: 0,
+                    remaining_qty: removed.remaining_qty,
+                },
+            )?;
+        }
+
+        Ok(())
+    }
+
     /// Handle a new order, including matching and optional resting.
     fn on_new_order(
         &mut self,
@@ -943,6 +985,48 @@ impl OrderBook {
         self.side(side)
             .get_level(key)
             .map_or(0, |level| level.total_qty)
+    }
+
+    /// Append one side in price-time priority order.
+    fn snapshot_side_orders(&self, side: Side, out: &mut Vec<RestingOrderView>) {
+        let mut cursor = self.side(side).best_level().map(|(key, _)| key);
+        while let Some(key) = cursor {
+            if let Some(level) = self.side(side).get_level(key) {
+                let mut current = level.head;
+                while let Some(handle) = current {
+                    let Some(order) = self.orders.get(handle) else {
+                        break;
+                    };
+                    out.push(RestingOrderView {
+                        order_id: order.order_id,
+                        account_id: order.account_id,
+                        side: order.side,
+                        price: order.price,
+                        remaining_qty: order.remaining_qty,
+                    });
+                    current = order.level_next;
+                }
+            }
+            cursor = self.next_occupied_key(side, key);
+        }
+    }
+
+    /// Capture handles before drain mutation so traversal remains stable.
+    fn collect_side_handles(&self, side: Side, out: &mut Vec<OrderHandle>) {
+        let mut cursor = self.side(side).best_level().map(|(key, _)| key);
+        while let Some(key) = cursor {
+            if let Some(level) = self.side(side).get_level(key) {
+                let mut current = level.head;
+                while let Some(handle) = current {
+                    let Some(order) = self.orders.get(handle) else {
+                        break;
+                    };
+                    out.push(handle);
+                    current = order.level_next;
+                }
+            }
+            cursor = self.next_occupied_key(side, key);
+        }
     }
 
     /// Return immutable state for one side of the book.

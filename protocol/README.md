@@ -63,7 +63,8 @@ template. Unknown template IDs are still rejected as unknown templates.
 ## Message Families
 
 - Control requests: `KillSwitch`, `Snapshot`, `Heartbeat`
-- Control events: `ControlResponse`, `HeartbeatStatus`, `ProtocolError`
+- Control events: `ControlResponse`, `HeartbeatStatus`, `SnapshotBegin`,
+  `SnapshotOrder`, `SnapshotEnd`, `ProtocolError`
 - Order entry: `NewOrder`, `CancelOrder`, `CancelReplace`, `MassCancel`
 - Trading events: `ExecutionReport`, `TradePrint`, `L1Update`, `L2Update`,
   `ProtocolError`
@@ -80,13 +81,23 @@ quantity as zero.
 
 `L2Update` is an absolute aggregate price-level update. It carries one
 `side + price` level and the current visible aggregate `qty` at that level after
-every visible level mutation. `qty = 0` means the level is deleted. Snapshot and
-gap-recovery streams are deferred to later milestones.
+every visible level mutation. `qty = 0` means the level is deleted.
 
 Outbound trading events do not currently carry timestamps. `mdSeq` is strictly
 monotonic across `TradePrint`, `L1Update`, and `L2Update`. `prevMdSeq` on
 `L1Update` and `L2Update` carries the previous market-data sequence for simple
 gap detection.
+
+## Control Snapshots
+
+`Snapshot` requests produce a fixed-size control-event stream:
+`SnapshotBegin`, zero or more `SnapshotOrder` rows, then `SnapshotEnd`.
+`SnapshotBegin` carries top-of-book aggregates, resting order count, last
+market-data sequence, next trade ID, and the active risk reference price.
+`SnapshotOrder` rows are emitted in deterministic book order: bids from high to
+low price, FIFO within each bid level, then asks from low to high price, FIFO
+within each ask level. `rowIndex` is zero-based. `SnapshotEnd.rowCount` equals
+the number of emitted rows.
 
 ## Execution Reports
 
