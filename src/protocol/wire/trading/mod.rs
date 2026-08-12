@@ -6,8 +6,7 @@ use crate::{
         ProtocolErrorEvent, RecvTs,
         rd::InstrumentSpec,
         trading::{
-            TradingEvent,
-            md::{L1Update, L2Update},
+            md::{L1Update, L2Update, MarketDataEvent},
             order::ExecutionReport,
         },
     },
@@ -24,13 +23,15 @@ pub fn decode_and_normalize_trading_entry(
     order::decode_and_normalize_order_entry(input, recv_ts, instrument)
 }
 
-pub fn encode_trading_event(event: TradingEvent, out: &mut [u8]) -> ProtocolResult<usize> {
+pub fn encode_execution_report(event: ExecutionReport, out: &mut [u8]) -> ProtocolResult<usize> {
+    order::encode_execution_report(event, out)
+}
+
+pub fn encode_market_data_event(event: MarketDataEvent, out: &mut [u8]) -> ProtocolResult<usize> {
     match event {
-        TradingEvent::ExecutionReport(event) => order::encode_execution_report(event, out),
-        TradingEvent::TradePrint(event) => md::encode_trade_print(event, out),
-        TradingEvent::L1Update(event) => md::encode_l1_update(event, out),
-        TradingEvent::L2Update(event) => md::encode_l2_update(event, out),
-        TradingEvent::ProtocolError(event) => encode_protocol_error(event, out),
+        MarketDataEvent::TradePrint(event) => md::encode_trade_print(event, out),
+        MarketDataEvent::L1Update(event) => md::encode_l1_update(event, out),
+        MarketDataEvent::L2Update(event) => md::encode_l2_update(event, out),
     }
 }
 
@@ -50,7 +51,7 @@ mod tests {
     use super::*;
     use crate::{
         domain::{
-            EngineSeq, ErrorCode, Price, ProtocolErrorEvent, Qty, RecvTs, RejectReason,
+            EngineSeq, Price, Qty, RejectReason,
             rd::InstrumentSpec,
             trading::{
                 md::{L1Update, L2Update, MdSeq, TradeId, TradePrint},
@@ -65,28 +66,25 @@ mod tests {
     }
 
     #[test]
-    fn trading_event_encodes_all_families() {
+    fn order_entry_and_market_data_events_encode_all_families() {
         let instrument = instrument();
         let price = Price::new(100, &instrument).expect("price");
         let qty = Qty::new(10, &instrument).expect("qty");
 
-        let events = [
+        let report = ExecutionReport {
+            engine_seq: EngineSeq::new(1),
+            client_order_id: OrderId::new(11).expect("order"),
+            account_id: AccountId::new(22).expect("account"),
+            exec_type: ExecType::New,
+            ord_status: OrdStatus::New,
+            reject_reason: RejectReason::None,
+            fill_price: None,
+            fill_qty: 0,
+            remaining_qty: 10,
+        };
+        let market_data = [
             (
-                TradingEvent::ExecutionReport(ExecutionReport {
-                    engine_seq: EngineSeq::new(1),
-                    client_order_id: OrderId::new(11).expect("order"),
-                    account_id: AccountId::new(22).expect("account"),
-                    exec_type: ExecType::New,
-                    ord_status: OrdStatus::New,
-                    reject_reason: RejectReason::None,
-                    fill_price: None,
-                    fill_qty: 0,
-                    remaining_qty: 10,
-                }),
-                MessageKind::ExecutionReport,
-            ),
-            (
-                TradingEvent::TradePrint(TradePrint {
+                MarketDataEvent::TradePrint(TradePrint {
                     md_seq: MdSeq::new(2),
                     trade_id: TradeId::new(3),
                     maker_order_id: OrderId::new(12).expect("maker"),
@@ -97,7 +95,7 @@ mod tests {
                 MessageKind::TradePrint,
             ),
             (
-                TradingEvent::L1Update(L1Update {
+                MarketDataEvent::L1Update(L1Update {
                     md_seq: MdSeq::new(4),
                     prev_md_seq: MdSeq::new(3),
                     bid_price: None,
@@ -108,7 +106,7 @@ mod tests {
                 MessageKind::L1Update,
             ),
             (
-                TradingEvent::L2Update(L2Update {
+                MarketDataEvent::L2Update(L2Update {
                     md_seq: MdSeq::new(5),
                     prev_md_seq: MdSeq::new(4),
                     side: crate::domain::trading::order::Side::Buy,
@@ -117,20 +115,18 @@ mod tests {
                 }),
                 MessageKind::L2Update,
             ),
-            (
-                TradingEvent::ProtocolError(ProtocolErrorEvent {
-                    engine_seq: EngineSeq::new(6),
-                    template_id: 222,
-                    recv_ts: RecvTs::new(104),
-                    error_code: ErrorCode::UnsupportedTemplate,
-                }),
-                MessageKind::ProtocolError,
-            ),
         ];
 
-        for (event, kind) in events {
+        let mut bytes = [0_u8; 128];
+        let written = encode_execution_report(report, &mut bytes).expect("encode");
+        assert_eq!(
+            decode_header(&bytes[..written]).expect("header").kind,
+            MessageKind::ExecutionReport
+        );
+
+        for (event, kind) in market_data {
             let mut bytes = [0_u8; 128];
-            let written = encode_trading_event(event, &mut bytes).expect("encode");
+            let written = encode_market_data_event(event, &mut bytes).expect("encode");
             assert_eq!(decode_header(&bytes[..written]).expect("header").kind, kind);
         }
     }

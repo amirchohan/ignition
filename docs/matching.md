@@ -1,8 +1,9 @@
 # Matching Behavior
 
 Milestone 3 implements the single-symbol matching core. The engine consumes one
-normalized `OrderEntry` at a time and writes deterministic `TradingEvent` values
-into the caller-provided event buffer.
+normalized `OrderEntry` at a time, emits deterministic `ExecutionReport` values
+through a caller-provided callback, and writes market data through the
+caller-owned `MarketDataRuntime`.
 
 ## Priority
 

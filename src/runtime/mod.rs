@@ -9,14 +9,11 @@ use crate::{
     domain::{
         EngineSequencer, RecvTs, RejectReason,
         control::{ControlEvent, ControlResult, SnapshotBegin, SnapshotEnd, SnapshotOrder},
-        trading::{
-            TradingEvent,
-            order::{ExecType, ExecutionReport, OrdStatus, OrderEntry},
-        },
+        trading::order::{ExecType, ExecutionReport, OrdStatus, OrderEntry},
     },
     engine::{Engine, EngineConfig, EngineError, RestingOrderView},
-    gateway::GatewayRuntime,
-    market_data::MarketDataRuntime,
+    gateway::{GatewayError, GatewayPollError, GatewayPublisher, GatewayRuntime},
+    market_data::{MarketDataFeedError, MarketDataRuntime},
     risk::{RiskConfig, RiskDecision, RiskRuntime},
 };
 
@@ -25,6 +22,8 @@ use crate::{
 pub enum RuntimeError {
     Engine(EngineError),
     Control(ControlError),
+    Gateway(GatewayError),
+    MarketDataFeed(MarketDataFeedError),
 }
 
 impl From<EngineError> for RuntimeError {
@@ -36,6 +35,18 @@ impl From<EngineError> for RuntimeError {
 impl From<ControlError> for RuntimeError {
     fn from(error: ControlError) -> Self {
         Self::Control(error)
+    }
+}
+
+impl From<GatewayError> for RuntimeError {
+    fn from(error: GatewayError) -> Self {
+        Self::Gateway(error)
+    }
+}
+
+impl From<MarketDataFeedError> for RuntimeError {
+    fn from(error: MarketDataFeedError) -> Self {
+        Self::MarketDataFeed(error)
     }
 }
 
@@ -52,18 +63,14 @@ pub struct Runtime {
     control: ControlRuntime,
     /// Order-entry ingress and trading egress.
     gateway: GatewayRuntime,
+    /// Market-data multicast egress.
+    market_data: MarketDataRuntime,
     /// Pre-match risk gate and reference-price state.
     risk: RiskRuntime,
     /// Matching engine state.
     engine: Engine,
-    /// Market-data shaper and market-data sequencer.
-    market_data: MarketDataRuntime,
     /// Shared deterministic execution/control sequencer.
     sequencer: EngineSequencer,
-    /// Reusable per-iteration order buffer.
-    orders: Vec<OrderEntry>,
-    /// Reusable per-order event buffer.
-    events: Vec<TradingEvent>,
     /// Reusable snapshot row buffer.
     snapshot_orders: Vec<RestingOrderView>,
     /// Set after deterministic drain-and-shutdown completes.
@@ -77,16 +84,15 @@ impl Runtime {
         risk_config: RiskConfig,
         control: ControlRuntime,
         gateway: GatewayRuntime,
+        market_data: MarketDataRuntime,
     ) -> Result<Self, RuntimeError> {
         Ok(Self {
             control,
             gateway,
+            market_data,
             risk: RiskRuntime::new(risk_config),
             engine: Engine::new(engine_config)?,
-            market_data: MarketDataRuntime::default(),
             sequencer: EngineSequencer::default(),
-            orders: Vec::new(),
-            events: Vec::new(),
             snapshot_orders: Vec::new(),
             terminal: false,
         })
@@ -120,12 +126,10 @@ impl Runtime {
         let Runtime {
             control,
             gateway,
+            market_data,
             risk,
             engine,
-            market_data,
             sequencer,
-            orders,
-            events,
             snapshot_orders,
             terminal,
         } = self;
@@ -143,7 +147,7 @@ impl Runtime {
                     let mut snapshot_emitter = SnapshotEmitter {
                         engine,
                         risk,
-                        market_data_runtime: market_data,
+                        market_data,
                         sequencer,
                         snapshot_orders,
                         publisher,
@@ -155,26 +159,47 @@ impl Runtime {
         })?;
 
         if shutdown_requested {
-            events.clear();
-            engine.drain_all(sequencer, market_data, events)?;
-            gateway.publish_trading(events);
+            {
+                let mut emit_report = |report| gateway.emit_execution_report(report);
+                engine.drain_all(sequencer, market_data, &mut emit_report)?;
+                if let Some(price) = market_data.take_reference_price_update() {
+                    risk.observe_trade_price(price);
+                }
+            }
+            gateway.finish()?;
+            market_data.finish()?;
+            gateway.flush_pending()?;
+            market_data.flush_pending()?;
             *terminal = true;
             return Ok(true);
         }
 
-        orders.clear();
-        let gateway_poll = gateway.poll(orders);
-
         let mut handled_order = false;
-        for &order in orders.iter() {
-            handled_order = true;
-            Self::process_order(control, risk, engine, market_data, sequencer, events, order)?;
-            gateway.publish_trading(events);
-        }
-        orders.clear();
+        let gateway_progress = gateway
+            .poll(sequencer, |order, publisher, sequencer| {
+                handled_order = true;
+                let mut processor = OrderProcessor {
+                    control,
+                    risk,
+                    engine,
+                    sequencer,
+                    reports: publisher,
+                    market_data,
+                };
+                processor.process(order)?;
+                market_data.finish()?;
+                Ok::<(), RuntimeError>(())
+            })
+            .map_err(|error| match error {
+                GatewayPollError::Gateway(error) => RuntimeError::Gateway(error),
+                GatewayPollError::Handler(error) => error,
+            })?;
+
+        let market_data_progress = market_data.flush_pending()?;
 
         Ok(control_progress
-            || gateway_poll.made_progress
+            || gateway_progress
+            || market_data_progress
             || handled_control_request
             || handled_order)
     }
@@ -184,55 +209,9 @@ impl Runtime {
         &self.engine
     }
 
-    /// Return the runtime-owned risk state.
-    pub fn risk(&self) -> &RiskRuntime {
-        &self.risk
-    }
-
-    /// Return the runtime-owned gateway.
-    pub fn gateway(&self) -> &GatewayRuntime {
-        &self.gateway
-    }
-
-    /// Return the runtime-owned control state.
-    pub fn control(&self) -> &ControlRuntime {
-        &self.control
-    }
-
-    fn process_order(
-        control: &ControlRuntime,
-        risk: &mut RiskRuntime,
-        engine: &mut Engine,
-        market_data: &mut MarketDataRuntime,
-        sequencer: &mut EngineSequencer,
-        events: &mut Vec<TradingEvent>,
-        entry: OrderEntry,
-    ) -> Result<(), RuntimeError> {
-        events.clear();
-        if is_risk_increasing(entry) {
-            let reason = control.reject_reason_for(entry_recv_ts(entry));
-            if reason != RejectReason::None {
-                Self::reject(sequencer, events, entry, reason)?;
-                return Ok(());
-            }
-        }
-
-        match risk.evaluate(entry, engine) {
-            RiskDecision::Accept => {
-                engine.execute(entry, sequencer, market_data, events)?;
-                risk.observe_events(events);
-                Ok(())
-            }
-            RiskDecision::Reject(reason) => {
-                Self::reject(sequencer, events, entry, reason)?;
-                Ok(())
-            }
-        }
-    }
-
     fn reject(
         sequencer: &mut EngineSequencer,
-        events: &mut Vec<TradingEvent>,
+        emit_report: &mut impl FnMut(ExecutionReport),
         entry: OrderEntry,
         reason: RejectReason,
     ) -> Result<(), RuntimeError> {
@@ -252,7 +231,7 @@ impl Runtime {
         let engine_seq = sequencer
             .next_engine_seq()
             .map_err(|_| RuntimeError::Engine(EngineError::SequenceOverflow))?;
-        events.push(TradingEvent::ExecutionReport(ExecutionReport {
+        emit_report(ExecutionReport {
             engine_seq,
             client_order_id,
             account_id,
@@ -262,15 +241,52 @@ impl Runtime {
             fill_price: None,
             fill_qty: 0,
             remaining_qty,
-        }));
+        });
         Ok(())
+    }
+}
+
+struct OrderProcessor<'a, 'b, 'c> {
+    control: &'a ControlRuntime,
+    risk: &'a mut RiskRuntime,
+    engine: &'a mut Engine,
+    sequencer: &'a mut EngineSequencer,
+    reports: &'a mut GatewayPublisher<'b, 'c>,
+    market_data: &'a mut MarketDataRuntime,
+}
+
+impl OrderProcessor<'_, '_, '_> {
+    fn process(&mut self, entry: OrderEntry) -> Result<(), RuntimeError> {
+        let mut emit_report = |report| self.reports.emit_execution_report(report);
+        if is_risk_increasing(entry) {
+            let reason = self.control.reject_reason_for(entry_recv_ts(entry));
+            if reason != RejectReason::None {
+                Runtime::reject(self.sequencer, &mut emit_report, entry, reason)?;
+                return Ok(());
+            }
+        }
+
+        match self.risk.evaluate(entry, self.engine) {
+            RiskDecision::Accept => {
+                self.engine
+                    .execute(entry, self.sequencer, self.market_data, &mut emit_report)?;
+                if let Some(price) = self.market_data.take_reference_price_update() {
+                    self.risk.observe_trade_price(price);
+                }
+                Ok(())
+            }
+            RiskDecision::Reject(reason) => {
+                Runtime::reject(self.sequencer, &mut emit_report, entry, reason)?;
+                Ok(())
+            }
+        }
     }
 }
 
 struct SnapshotEmitter<'a, 'b, 'c> {
     engine: &'a Engine,
     risk: &'a RiskRuntime,
-    market_data_runtime: &'a MarketDataRuntime,
+    market_data: &'a MarketDataRuntime,
     sequencer: &'a mut EngineSequencer,
     snapshot_orders: &'a mut Vec<RestingOrderView>,
     publisher: &'a mut ControlPublisher<'b, 'c>,
@@ -286,7 +302,7 @@ impl SnapshotEmitter<'_, '_, '_> {
         self.engine.snapshot_orders(self.snapshot_orders);
         let best_bid = self.engine.best_bid();
         let best_ask = self.engine.best_ask();
-        let market_data = self.market_data_runtime.snapshot();
+        let market_data = self.market_data.snapshot();
 
         self.publisher
             .publish(ControlEvent::SnapshotBegin(SnapshotBegin {
@@ -357,13 +373,16 @@ mod tests {
         rd::InstrumentSpec,
         trading::order::{AccountId, ClientTs, NewOrder, OrderId, OrderType, Side, TimeInForce},
     };
+    use crate::market_data::{MarketDataFeedConfig, MarketDataRuntime};
     use crate::protocol::{
         MessageKind, SBE_HEADER_LEN, SCHEMA_VERSION, decode_header, encode_header,
         generated::codecs::{
-            ReadBuf, WriteBuf, control_result as wire_control_result, heartbeat_codec,
-            kill_switch_action, kill_switch_codec, reject_reason as wire_reject_reason,
-            side as wire_side, snapshot_begin_codec, snapshot_codec, snapshot_end_codec,
-            snapshot_order_codec,
+            ReadBuf, WriteBuf, cancel_order_codec, cancel_replace_codec,
+            control_result as wire_control_result, execution_report_codec, heartbeat_codec,
+            kill_switch_action, kill_switch_codec, mass_cancel_codec, new_order_codec,
+            order_type as wire_order_type, reject_reason as wire_reject_reason, side as wire_side,
+            snapshot_begin_codec, snapshot_codec, snapshot_end_codec, snapshot_order_codec,
+            time_in_force as wire_tif,
         },
     };
     use std::{
@@ -440,32 +459,89 @@ mod tests {
     fn runtime_with_orders(
         orders: impl IntoIterator<Item = OrderEntry>,
         risk_config: RiskConfig,
-    ) -> Option<Runtime> {
-        Some(runtime_with_control_and_orders(
-            new_control()?,
-            orders,
-            risk_config,
-        ))
+    ) -> Option<(Runtime, TcpStream)> {
+        let control = new_control()?;
+        runtime_with_control_and_orders(control, orders, risk_config)
+    }
+
+    fn runtime_without_gateway_client(risk_config: RiskConfig) -> Option<Runtime> {
+        let control = new_control()?;
+        let market_data = new_market_data()?;
+        let gateway_addr = reserve_loopback_addr()?;
+        let gateway = match GatewayRuntime::new(
+            crate::gateway::GatewayConfig {
+                bind_addr: gateway_addr.to_string(),
+                ..crate::gateway::GatewayConfig::default()
+            },
+            instrument(),
+        ) {
+            Ok(gateway) => gateway,
+            Err(crate::gateway::GatewayError::Io(crate::io::IoError::Bind(error)))
+                if error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return None;
+            }
+            Err(error) => panic!("gateway: {error:?}"),
+        };
+        Some(
+            Runtime::new(engine_config(), risk_config, control, gateway, market_data)
+                .expect("runtime"),
+        )
     }
 
     fn runtime_with_control_and_orders(
         control: ControlRuntime,
         orders: impl IntoIterator<Item = OrderEntry>,
         risk_config: RiskConfig,
-    ) -> Runtime {
-        Runtime::new(
-            engine_config(),
-            risk_config,
-            control,
-            GatewayRuntime::from_orders(orders),
+    ) -> Option<(Runtime, TcpStream)> {
+        let market_data = new_market_data()?;
+        let gateway_addr = reserve_loopback_addr()?;
+        let gateway_config = crate::gateway::GatewayConfig {
+            bind_addr: gateway_addr.to_string(),
+            ..crate::gateway::GatewayConfig::default()
+        };
+        let gateway = match GatewayRuntime::new(gateway_config, instrument()) {
+            Ok(gateway) => gateway,
+            Err(crate::gateway::GatewayError::Io(crate::io::IoError::Bind(error)))
+                if error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return None;
+            }
+            Err(error) => panic!("gateway: {error:?}"),
+        };
+        let mut client = TcpStream::connect(gateway_addr).expect("connect gateway");
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("gateway timeout");
+        write_gateway_orders(&mut client, orders);
+        Some(
+            Runtime::new(engine_config(), risk_config, control, gateway, market_data)
+                .expect("runtime"),
         )
-        .expect("runtime")
+        .map(|runtime| (runtime, client))
     }
 
     fn control_config() -> ControlConfig {
         ControlConfig {
             bind_addr: "127.0.0.1:0".to_owned(),
             ..ControlConfig::default()
+        }
+    }
+
+    fn new_market_data() -> Option<MarketDataRuntime> {
+        match MarketDataRuntime::new(MarketDataFeedConfig {
+            bind_addr: "0.0.0.0:0".to_owned(),
+            group_addr: "239.255.0.1:9002".to_owned(),
+            multicast_loop_v4: true,
+            ..MarketDataFeedConfig::default()
+        }) {
+            Ok(feed) => Some(feed),
+            Err(crate::market_data::MarketDataFeedError::Io(crate::io::IoError::Bind(error)))
+                if error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                None
+            }
+            Err(error) => panic!("market-data feed: {error:?}"),
         }
     }
 
@@ -496,7 +572,7 @@ mod tests {
     fn runtime_with_control_client_and_orders(
         orders: impl IntoIterator<Item = OrderEntry>,
         risk_config: RiskConfig,
-    ) -> Option<(Runtime, TcpStream)> {
+    ) -> Option<(Runtime, TcpStream, TcpStream)> {
         let bind_addr = reserve_loopback_addr()?;
         let control = new_control_with_config(ControlConfig {
             bind_addr: bind_addr.to_string(),
@@ -506,14 +582,125 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(1)))
             .expect("timeout");
-        Some((
-            runtime_with_control_and_orders(control, orders, risk_config),
-            client,
-        ))
+        let (runtime, gateway_client) =
+            runtime_with_control_and_orders(control, orders, risk_config)?;
+        Some((runtime, client, gateway_client))
     }
 
     fn write_control(client: &mut TcpStream, frame: &[u8]) {
         client.write_all(frame).expect("write control");
+    }
+
+    fn write_gateway_orders(client: &mut TcpStream, orders: impl IntoIterator<Item = OrderEntry>) {
+        for order in orders {
+            client
+                .write_all(&order_entry_frame(order))
+                .expect("write gateway");
+        }
+    }
+
+    fn order_entry_frame(entry: OrderEntry) -> Vec<u8> {
+        match entry {
+            OrderEntry::NewOrder(order) => {
+                let mut bytes =
+                    vec![0_u8; SBE_HEADER_LEN + new_order_codec::SBE_BLOCK_LENGTH as usize];
+                encode_header(
+                    &mut bytes,
+                    new_order_codec::SBE_BLOCK_LENGTH,
+                    MessageKind::NewOrder,
+                )
+                .expect("header");
+                let write_buf = WriteBuf::new(&mut bytes);
+                let mut encoder =
+                    new_order_codec::NewOrderEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+                encoder
+                    .client_order_id(order.client_order_id.raw())
+                    .account_id(order.account_id.raw())
+                    .client_ts(order.client_ts.raw())
+                    .side(to_wire_side(order.side))
+                    .order_type(match order.order_type {
+                        OrderType::Limit => wire_order_type::OrderType::Limit,
+                        OrderType::Market => wire_order_type::OrderType::Market,
+                    })
+                    .time_in_force(to_wire_tif(order.time_in_force))
+                    .price(order.price.map_or(0, Price::raw))
+                    .qty(order.qty.raw());
+                bytes
+            }
+            OrderEntry::CancelOrder(cancel) => {
+                let mut bytes =
+                    vec![0_u8; SBE_HEADER_LEN + cancel_order_codec::SBE_BLOCK_LENGTH as usize];
+                encode_header(
+                    &mut bytes,
+                    cancel_order_codec::SBE_BLOCK_LENGTH,
+                    MessageKind::CancelOrder,
+                )
+                .expect("header");
+                let write_buf = WriteBuf::new(&mut bytes);
+                let mut encoder = cancel_order_codec::CancelOrderEncoder::default()
+                    .wrap(write_buf, SBE_HEADER_LEN);
+                encoder
+                    .client_order_id(cancel.client_order_id.raw())
+                    .account_id(cancel.account_id.raw())
+                    .orig_client_order_id(cancel.orig_client_order_id.raw())
+                    .client_ts(cancel.client_ts.raw());
+                bytes
+            }
+            OrderEntry::CancelReplace(replace) => {
+                let mut bytes =
+                    vec![0_u8; SBE_HEADER_LEN + cancel_replace_codec::SBE_BLOCK_LENGTH as usize];
+                encode_header(
+                    &mut bytes,
+                    cancel_replace_codec::SBE_BLOCK_LENGTH,
+                    MessageKind::CancelReplace,
+                )
+                .expect("header");
+                let write_buf = WriteBuf::new(&mut bytes);
+                let mut encoder = cancel_replace_codec::CancelReplaceEncoder::default()
+                    .wrap(write_buf, SBE_HEADER_LEN);
+                encoder
+                    .client_order_id(replace.client_order_id.raw())
+                    .account_id(replace.account_id.raw())
+                    .orig_client_order_id(replace.orig_client_order_id.raw())
+                    .client_ts(replace.client_ts.raw())
+                    .price(replace.price.raw())
+                    .qty(replace.qty.raw());
+                bytes
+            }
+            OrderEntry::MassCancel(cancel) => {
+                let mut bytes =
+                    vec![0_u8; SBE_HEADER_LEN + mass_cancel_codec::SBE_BLOCK_LENGTH as usize];
+                encode_header(
+                    &mut bytes,
+                    mass_cancel_codec::SBE_BLOCK_LENGTH,
+                    MessageKind::MassCancel,
+                )
+                .expect("header");
+                let write_buf = WriteBuf::new(&mut bytes);
+                let mut encoder =
+                    mass_cancel_codec::MassCancelEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+                encoder
+                    .client_order_id(cancel.client_order_id.raw())
+                    .account_id(cancel.account_id.raw())
+                    .client_ts(cancel.client_ts.raw());
+                bytes
+            }
+        }
+    }
+
+    fn to_wire_side(side: Side) -> wire_side::Side {
+        match side {
+            Side::Buy => wire_side::Side::Buy,
+            Side::Sell => wire_side::Side::Sell,
+        }
+    }
+
+    fn to_wire_tif(tif: TimeInForce) -> wire_tif::TimeInForce {
+        match tif {
+            TimeInForce::Gtc => wire_tif::TimeInForce::Gtc,
+            TimeInForce::Ioc => wire_tif::TimeInForce::Ioc,
+            TimeInForce::PostOnly => wire_tif::TimeInForce::PostOnly,
+        }
     }
 
     fn poll_until_control(runtime: &mut Runtime) {
@@ -606,6 +793,119 @@ mod tests {
         frame
     }
 
+    fn read_gateway_frame(client: &mut TcpStream) -> Vec<u8> {
+        let mut header = [0_u8; SBE_HEADER_LEN];
+        client.read_exact(&mut header).expect("read gateway header");
+        let frame_len = SBE_HEADER_LEN + u16::from_le_bytes([header[0], header[1]]) as usize;
+        let mut frame = vec![0_u8; frame_len];
+        frame[..SBE_HEADER_LEN].copy_from_slice(&header);
+        client
+            .read_exact(&mut frame[SBE_HEADER_LEN..])
+            .expect("read gateway payload");
+        frame
+    }
+
+    fn read_execution_reports(client: &mut TcpStream, count: usize) -> Vec<ExecutionReport> {
+        let mut reports = Vec::with_capacity(count);
+        while reports.len() < count {
+            let frame = read_gateway_frame(client);
+            let header = decode_header(&frame).expect("gateway header");
+            if header.kind != MessageKind::ExecutionReport {
+                continue;
+            }
+            let decoder = execution_report_codec::ExecutionReportDecoder::default().wrap(
+                ReadBuf::new(&frame),
+                SBE_HEADER_LEN,
+                execution_report_codec::SBE_BLOCK_LENGTH,
+                SCHEMA_VERSION,
+            );
+            reports.push(ExecutionReport {
+                engine_seq: crate::domain::EngineSeq::new(decoder.engine_seq()),
+                client_order_id: OrderId::new(decoder.client_order_id()).expect("order"),
+                account_id: AccountId::new(decoder.account_id()).expect("account"),
+                exec_type: match decoder.exec_type() {
+                    crate::protocol::generated::codecs::exec_type::ExecType::New => ExecType::New,
+                    crate::protocol::generated::codecs::exec_type::ExecType::Trade => {
+                        ExecType::Trade
+                    }
+                    crate::protocol::generated::codecs::exec_type::ExecType::Canceled => {
+                        ExecType::Canceled
+                    }
+                    crate::protocol::generated::codecs::exec_type::ExecType::Replaced => {
+                        ExecType::Replaced
+                    }
+                    crate::protocol::generated::codecs::exec_type::ExecType::Rejected => {
+                        ExecType::Rejected
+                    }
+                    crate::protocol::generated::codecs::exec_type::ExecType::Expired => {
+                        ExecType::Expired
+                    }
+                    crate::protocol::generated::codecs::exec_type::ExecType::NullVal => {
+                        panic!("null exec type")
+                    }
+                },
+                ord_status: match decoder.ord_status() {
+                    crate::protocol::generated::codecs::ord_status::OrdStatus::New => {
+                        OrdStatus::New
+                    }
+                    crate::protocol::generated::codecs::ord_status::OrdStatus::PartiallyFilled => {
+                        OrdStatus::PartiallyFilled
+                    }
+                    crate::protocol::generated::codecs::ord_status::OrdStatus::Filled => {
+                        OrdStatus::Filled
+                    }
+                    crate::protocol::generated::codecs::ord_status::OrdStatus::Canceled => {
+                        OrdStatus::Canceled
+                    }
+                    crate::protocol::generated::codecs::ord_status::OrdStatus::Replaced => {
+                        OrdStatus::Replaced
+                    }
+                    crate::protocol::generated::codecs::ord_status::OrdStatus::Rejected => {
+                        OrdStatus::Rejected
+                    }
+                    crate::protocol::generated::codecs::ord_status::OrdStatus::Expired => {
+                        OrdStatus::Expired
+                    }
+                    crate::protocol::generated::codecs::ord_status::OrdStatus::NullVal => {
+                        panic!("null order status")
+                    }
+                },
+                reject_reason: match decoder.reject_reason() {
+                    wire_reject_reason::RejectReason::None => RejectReason::None,
+                    wire_reject_reason::RejectReason::Malformed => RejectReason::Malformed,
+                    wire_reject_reason::RejectReason::UnknownOrder => RejectReason::UnknownOrder,
+                    wire_reject_reason::RejectReason::InvalidPrice => RejectReason::InvalidPrice,
+                    wire_reject_reason::RejectReason::InvalidQuantity => {
+                        RejectReason::InvalidQuantity
+                    }
+                    wire_reject_reason::RejectReason::RiskOpenOrderLimit => {
+                        RejectReason::RiskOpenOrderLimit
+                    }
+                    wire_reject_reason::RejectReason::RiskNotionalLimit => {
+                        RejectReason::RiskNotionalLimit
+                    }
+                    wire_reject_reason::RejectReason::PriceBand => RejectReason::PriceBand,
+                    wire_reject_reason::RejectReason::SelfTradePrevention => {
+                        RejectReason::SelfTradePrevention
+                    }
+                    wire_reject_reason::RejectReason::KillSwitchActive => {
+                        RejectReason::KillSwitchActive
+                    }
+                    wire_reject_reason::RejectReason::HeartbeatLost => RejectReason::HeartbeatLost,
+                    wire_reject_reason::RejectReason::NullVal => panic!("null reject reason"),
+                },
+                fill_price: if decoder.fill_price() == 0 {
+                    None
+                } else {
+                    Some(price(decoder.fill_price()))
+                },
+                fill_qty: decoder.fill_qty(),
+                remaining_qty: decoder.remaining_qty(),
+            });
+        }
+        reports
+    }
+
     fn assert_no_control_frame(client: &mut TcpStream) {
         let mut header = [0_u8; SBE_HEADER_LEN];
         let error = client
@@ -684,19 +984,9 @@ mod tests {
         events
     }
 
-    fn reports(events: &[TradingEvent]) -> Vec<ExecutionReport> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                TradingEvent::ExecutionReport(report) => Some(*report),
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
     fn poll_once_processes_gateway_orders_fifo_through_engine() {
-        let Some(mut runtime) = runtime_with_orders(
+        let Some((mut runtime, mut gateway_client)) = runtime_with_orders(
             [
                 new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
                 new_order(2, 2, Side::Buy, TimeInForce::Gtc, 1_001, 5),
@@ -710,8 +1000,7 @@ mod tests {
 
         assert!(made_progress);
         assert_eq!(runtime.engine().best_bid(), Some((price(1_001), 5)));
-        let published = runtime.gateway().published_trading();
-        let reports = reports(published);
+        let reports = read_execution_reports(&mut gateway_client, 2);
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].client_order_id.raw(), 1);
         assert_eq!(reports[1].client_order_id.raw(), 2);
@@ -719,7 +1008,7 @@ mod tests {
 
     #[test]
     fn risk_reject_uses_shared_engine_sequence_and_publishes() {
-        let Some(mut runtime) = runtime_with_orders(
+        let Some((mut runtime, mut gateway_client)) = runtime_with_orders(
             [
                 new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
                 new_order(2, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
@@ -730,7 +1019,7 @@ mod tests {
         };
 
         let made_progress = runtime.poll_once().expect("poll");
-        let reports = reports(runtime.gateway().published_trading());
+        let reports = read_execution_reports(&mut gateway_client, 2);
 
         assert!(made_progress);
         assert_eq!(reports.len(), 2);
@@ -742,7 +1031,7 @@ mod tests {
 
     #[test]
     fn risk_reject_does_not_mutate_book() {
-        let Some(mut runtime) = runtime_with_orders(
+        let Some((mut runtime, mut gateway_client)) = runtime_with_orders(
             [new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10)],
             risk_config(10, 9_999),
         ) else {
@@ -760,14 +1049,14 @@ mod tests {
             Some(0)
         );
         assert_eq!(
-            reports(runtime.gateway().published_trading())[0].reject_reason,
+            read_execution_reports(&mut gateway_client, 1)[0].reject_reason,
             RejectReason::RiskNotionalLimit
         );
     }
 
     #[test]
     fn duplicate_order_id_reaches_engine_structural_reject() {
-        let Some(mut runtime) = runtime_with_orders(
+        let Some((mut runtime, mut gateway_client)) = runtime_with_orders(
             [
                 new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
                 new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
@@ -778,7 +1067,7 @@ mod tests {
         };
 
         let made_progress = runtime.poll_once().expect("poll");
-        let reports = reports(runtime.gateway().published_trading());
+        let reports = read_execution_reports(&mut gateway_client, 2);
 
         assert!(made_progress);
         assert_eq!(reports.len(), 2);
@@ -789,14 +1078,14 @@ mod tests {
 
     #[test]
     fn unknown_replace_reaches_engine_unknown_order_reject() {
-        let Some(mut runtime) =
+        let Some((mut runtime, mut gateway_client)) =
             runtime_with_orders([replace(2, 1, 404, 1_000, 15)], risk_config(10, 1_000_000))
         else {
             return;
         };
 
         let made_progress = runtime.poll_once().expect("poll");
-        let reports = reports(runtime.gateway().published_trading());
+        let reports = read_execution_reports(&mut gateway_client, 1);
 
         assert!(made_progress);
         assert_eq!(reports.len(), 1);
@@ -807,7 +1096,7 @@ mod tests {
 
     #[test]
     fn poll_once_processes_gateway_without_closing_live_control() {
-        let Some(mut runtime) = runtime_with_orders(
+        let Some((mut runtime, mut gateway_client)) = runtime_with_orders(
             [new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10)],
             risk_config(10, 1_000_000),
         ) else {
@@ -818,11 +1107,12 @@ mod tests {
 
         assert!(made_progress);
         assert_eq!(runtime.engine().resting_order_count(), 1);
+        let _ = read_execution_reports(&mut gateway_client, 1);
     }
 
     #[test]
     fn empty_live_runtime_poll_is_open_without_progress() {
-        let Some(mut runtime) = runtime_with_orders([], risk_config(10, 1_000_000)) else {
+        let Some(mut runtime) = runtime_without_gateway_client(risk_config(10, 1_000_000)) else {
             return;
         };
 
@@ -833,19 +1123,21 @@ mod tests {
 
     #[test]
     fn halt_trading_rejects_new_and_replace_before_risk() {
-        let Some((mut runtime, mut client)) = runtime_with_control_client_and_orders(
-            [
-                new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
-                replace(2, 1, 1, 1_001, 10),
-            ],
-            risk_config(10, 1_000_000),
-        ) else {
+        let Some((mut runtime, mut client, mut gateway_client)) =
+            runtime_with_control_client_and_orders(
+                [
+                    new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
+                    replace(2, 1, 1, 1_001, 10),
+                ],
+                risk_config(10, 1_000_000),
+            )
+        else {
             return;
         };
         write_control(&mut client, &kill_switch(KillSwitchAction::HaltTrading));
 
         poll_until_control(&mut runtime);
-        let reports = reports(runtime.gateway().published_trading());
+        let reports = read_execution_reports(&mut gateway_client, 2);
 
         assert_eq!(reports.len(), 2);
         assert_eq!(runtime.engine().resting_order_count(), 0);
@@ -858,19 +1150,21 @@ mod tests {
 
     #[test]
     fn halt_trading_allows_cancel_flow_through_engine() {
-        let Some((mut runtime, mut client)) = runtime_with_control_client_and_orders(
-            [
-                new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
-                cancel(2, 1, 1),
-            ],
-            risk_config(10, 1_000_000),
-        ) else {
+        let Some((mut runtime, mut client, mut gateway_client)) =
+            runtime_with_control_client_and_orders(
+                [
+                    new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
+                    cancel(2, 1, 1),
+                ],
+                risk_config(10, 1_000_000),
+            )
+        else {
             return;
         };
         write_control(&mut client, &kill_switch(KillSwitchAction::HaltTrading));
 
         poll_until_control(&mut runtime);
-        let reports = reports(runtime.gateway().published_trading());
+        let reports = read_execution_reports(&mut gateway_client, 2);
 
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].reject_reason, RejectReason::KillSwitchActive);
@@ -891,7 +1185,7 @@ mod tests {
             return;
         };
         let mut client = TcpStream::connect(bind_addr).expect("connect");
-        let mut runtime = runtime_with_control_and_orders(
+        let Some((mut runtime, mut gateway_client)) = runtime_with_control_and_orders(
             control,
             [new_order(
                 1_000_000_000,
@@ -902,11 +1196,13 @@ mod tests {
                 10,
             )],
             risk_config(10, 1_000_000),
-        );
+        ) else {
+            return;
+        };
         write_control(&mut client, &heartbeat(1));
 
         poll_until_control(&mut runtime);
-        let reports = reports(runtime.gateway().published_trading());
+        let reports = read_execution_reports(&mut gateway_client, 1);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].reject_reason, RejectReason::HeartbeatLost);
@@ -915,18 +1211,21 @@ mod tests {
 
     #[test]
     fn snapshot_emits_price_time_rows_and_state_metadata() {
-        let Some((mut runtime, mut client)) = runtime_with_control_client_and_orders(
-            [
-                new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
-                new_order(2, 2, Side::Buy, TimeInForce::Gtc, 1_001, 5),
-                new_order(3, 3, Side::Buy, TimeInForce::Gtc, 1_001, 7),
-                new_order(4, 4, Side::Sell, TimeInForce::Gtc, 1_100, 9),
-            ],
-            RiskConfig::new(10, 10_000_000, price(1_000), 2_000).expect("risk config"),
-        ) else {
+        let Some((mut runtime, mut client, mut gateway_client)) =
+            runtime_with_control_client_and_orders(
+                [
+                    new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
+                    new_order(2, 2, Side::Buy, TimeInForce::Gtc, 1_001, 5),
+                    new_order(3, 3, Side::Buy, TimeInForce::Gtc, 1_001, 7),
+                    new_order(4, 4, Side::Sell, TimeInForce::Gtc, 1_100, 9),
+                ],
+                RiskConfig::new(10, 10_000_000, price(1_000), 2_000).expect("risk config"),
+            )
+        else {
             return;
         };
         runtime.poll_once().expect("seed book");
+        let _ = read_execution_reports(&mut gateway_client, 4);
         write_control(&mut client, &snapshot(99));
 
         poll_until_control(&mut runtime);
@@ -977,17 +1276,19 @@ mod tests {
 
     #[test]
     fn shutdown_drains_book_and_closes_runtime() {
-        let Some((mut runtime, mut client)) = runtime_with_control_client_and_orders(
-            [new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10)],
-            risk_config(10, 1_000_000),
-        ) else {
+        let Some((mut runtime, mut client, mut gateway_client)) =
+            runtime_with_control_client_and_orders(
+                [new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10)],
+                risk_config(10, 1_000_000),
+            )
+        else {
             return;
         };
         runtime.poll_once().expect("seed book");
         write_control(&mut client, &kill_switch(KillSwitchAction::Shutdown));
 
         poll_until_control(&mut runtime);
-        let reports = reports(runtime.gateway().published_trading());
+        let reports = read_execution_reports(&mut gateway_client, 2);
 
         assert!(runtime.terminal);
         assert_eq!(runtime.engine().resting_order_count(), 0);
@@ -1003,7 +1304,7 @@ mod tests {
 
     #[test]
     fn shutdown_stops_same_poll_control_processing() {
-        let Some((mut runtime, mut client)) =
+        let Some((mut runtime, mut client, _gateway_client)) =
             runtime_with_control_client_and_orders([], risk_config(10, 1_000_000))
         else {
             return;

@@ -6,10 +6,7 @@
 use crate::{
     domain::{
         DomainError, DomainResult, Price, RejectReason,
-        trading::{
-            TradingEvent,
-            order::{AccountId, CancelReplace, NewOrder, OrderEntry, OrderType, TimeInForce},
-        },
+        trading::order::{AccountId, CancelReplace, NewOrder, OrderEntry, OrderType, TimeInForce},
     },
     engine::{Engine, OrderProjection, RestingOrderView},
 };
@@ -97,16 +94,9 @@ impl RiskRuntime {
         }
     }
 
-    /// Observe emitted trading events after matching to update the risk reference price.
-    ///
-    /// The price-band reference starts from config and then follows the latest
-    /// deterministic trade print emitted by the matcher.
-    pub fn observe_events(&mut self, events: &[TradingEvent]) {
-        for event in events {
-            if let TradingEvent::TradePrint(trade) = event {
-                self.reference_price = trade.price;
-            }
-        }
+    /// Observe the latest deterministic trade price emitted by market data.
+    pub fn observe_trade_price(&mut self, price: Price) {
+        self.reference_price = price;
     }
 
     /// Evaluate risk policy for a new order.
@@ -295,7 +285,7 @@ mod tests {
         domain::{
             EngineSequencer, Qty, RecvTs,
             rd::InstrumentSpec,
-            trading::order::{ClientTs, OrderId, Side},
+            trading::order::{ClientTs, ExecutionReport, OrderId, Side},
         },
         engine::{Engine, EngineConfig},
         market_data::MarketDataRuntime,
@@ -356,14 +346,15 @@ mod tests {
         }
     }
 
-    fn execute(engine: &mut Engine, entry: OrderEntry) -> Vec<TradingEvent> {
+    fn execute(engine: &mut Engine, entry: OrderEntry) -> Vec<ExecutionReport> {
         let mut sequencer = EngineSequencer::default();
         let mut market_data = MarketDataRuntime::default();
-        let mut events = Vec::new();
+        let mut reports = Vec::new();
+        let mut emit_report = |report| reports.push(report);
         engine
-            .execute(entry, &mut sequencer, &mut market_data, &mut events)
+            .execute(entry, &mut sequencer, &mut market_data, &mut emit_report)
             .expect("execute");
-        events
+        reports
     }
 
     #[test]
@@ -553,18 +544,10 @@ mod tests {
     }
 
     #[test]
-    fn observes_trade_prints_as_new_reference_price() {
+    fn observes_trade_price_as_new_reference_price() {
         let mut risk = RiskRuntime::new(risk_config(10, 1_000_000));
-        let event = TradingEvent::TradePrint(crate::domain::trading::md::TradePrint {
-            md_seq: crate::domain::trading::md::MdSeq::new(1),
-            trade_id: crate::domain::trading::md::TradeId::new(1),
-            maker_order_id: OrderId::new(1).expect("maker"),
-            taker_order_id: OrderId::new(2).expect("taker"),
-            price: price(1_010),
-            qty: qty(1),
-        });
 
-        risk.observe_events(&[event]);
+        risk.observe_trade_price(price(1_010));
 
         assert_eq!(risk.reference_price(), price(1_010));
     }

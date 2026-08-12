@@ -47,15 +47,18 @@ the current no-price sentinel.
 
 ## Endpoint Model
 
-The protocol is exposed as two ingress endpoint families and two egress endpoint
-families:
+The protocol is exposed as two ingress endpoint families and three egress
+endpoint families:
 
 - Control ingress decodes `KillSwitch`, `Snapshot`, and `Heartbeat` into
   `domain::control::ControlRequest`.
 - Trading ingress decodes `NewOrder`, `CancelOrder`, `CancelReplace`, and
   `MassCancel` into `domain::trading::order::OrderEntry`.
 - Control egress encodes `domain::control::ControlEvent`.
-- Trading egress encodes `domain::trading::TradingEvent`.
+- Order-entry egress encodes `domain::trading::order::ExecutionReport` and
+  order-entry `ProtocolError` responses on the trading TCP connection.
+- Market-data egress encodes `domain::trading::md::MarketDataEvent` on the
+  multicast UDP feed.
 
 A known template sent to the wrong endpoint is rejected as an unexpected
 template. Unknown template IDs are still rejected as unknown templates.

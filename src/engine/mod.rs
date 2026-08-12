@@ -2,7 +2,8 @@
 //!
 //! The engine owns order-book state, price-time priority mutations, and
 //! matching behavior. It accepts protocol-agnostic domain commands and emits
-//! domain trading events; gateway and protocol code stay outside this module.
+//! typed order-entry and market-data outputs; gateway and protocol code stay
+//! outside this module.
 
 mod accounts;
 mod book;
@@ -12,10 +13,7 @@ mod orders;
 use crate::domain::{
     DomainError, DomainResult, EngineSequencer, Price, RejectReason,
     rd::InstrumentSpec,
-    trading::{
-        TradingEvent,
-        order::{AccountId, OrderEntry, OrderId, Side},
-    },
+    trading::order::{AccountId, ExecutionReport, OrderEntry, OrderId, Side},
 };
 use crate::market_data::MarketDataRuntime;
 
@@ -133,17 +131,16 @@ impl Engine {
         })
     }
 
-    /// Execute one normalized order-entry command into a caller-owned event buffer.
+    /// Execute one normalized order-entry command into caller-owned output sinks.
     pub fn execute(
         &mut self,
         entry: OrderEntry,
         sequencer: &mut EngineSequencer,
         market_data: &mut MarketDataRuntime,
-        events: &mut Vec<TradingEvent>,
+        emit_report: &mut impl FnMut(ExecutionReport),
     ) -> Result<(), EngineError> {
-        events.clear();
         self.book
-            .execute(entry, sequencer, market_data, events)
+            .execute(entry, sequencer, market_data, emit_report)
             .map_err(|error| match error {
                 DomainError::SequenceOverflow => EngineError::SequenceOverflow,
                 _ => EngineError::InvalidConfig,
@@ -210,10 +207,10 @@ impl Engine {
         &mut self,
         sequencer: &mut EngineSequencer,
         market_data: &mut MarketDataRuntime,
-        events: &mut Vec<TradingEvent>,
+        emit_report: &mut impl FnMut(ExecutionReport),
     ) -> Result<(), EngineError> {
         self.book
-            .drain_all(sequencer, market_data, events)
+            .drain_all(sequencer, market_data, emit_report)
             .map_err(|error| match error {
                 DomainError::SequenceOverflow => EngineError::SequenceOverflow,
                 _ => EngineError::InvalidConfig,
@@ -256,15 +253,28 @@ mod tests {
         EngineSeq, Price, Qty, RecvTs,
         rd::InstrumentSpec,
         trading::{
-            TradingEvent,
-            md::{L1Update, L2Update, MdSeq},
+            md::{L1Update, L2Update, MdSeq, TradeId, TradePrint},
             order::{
-                AccountId, ClientTs, ExecType, NewOrder, OrdStatus, OrderId, OrderType, Side,
-                TimeInForce,
+                AccountId, ClientTs, ExecType, ExecutionReport, NewOrder, OrdStatus, OrderId,
+                OrderType, Side, TimeInForce,
             },
         },
     };
     use crate::market_data::MarketDataRuntime;
+    use crate::protocol::{
+        MessageKind, SBE_HEADER_LEN, SCHEMA_VERSION, decode_header,
+        generated::codecs::{
+            ReadBuf, book_side, l1_update_codec, l2_update_codec, trade_print_codec,
+        },
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TradingEvent {
+        ExecutionReport(ExecutionReport),
+        TradePrint(TradePrint),
+        L1Update(L1Update),
+        L2Update(L2Update),
+    }
 
     fn instrument() -> InstrumentSpec {
         InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 1).expect("instrument")
@@ -415,6 +425,63 @@ mod tests {
             .collect()
     }
 
+    fn decode_market_data_event(frame: &[u8]) -> TradingEvent {
+        match decode_header(frame).expect("market-data header").kind {
+            MessageKind::TradePrint => {
+                let decoder = trade_print_codec::TradePrintDecoder::default().wrap(
+                    ReadBuf::new(frame),
+                    SBE_HEADER_LEN,
+                    trade_print_codec::SBE_BLOCK_LENGTH,
+                    SCHEMA_VERSION,
+                );
+                TradingEvent::TradePrint(TradePrint {
+                    md_seq: MdSeq::new(decoder.md_seq()),
+                    trade_id: TradeId::new(decoder.trade_id()),
+                    maker_order_id: OrderId::new(decoder.maker_order_id()).expect("maker"),
+                    taker_order_id: OrderId::new(decoder.taker_order_id()).expect("taker"),
+                    price: price(decoder.price()),
+                    qty: qty(decoder.qty()),
+                })
+            }
+            MessageKind::L1Update => {
+                let decoder = l1_update_codec::L1UpdateDecoder::default().wrap(
+                    ReadBuf::new(frame),
+                    SBE_HEADER_LEN,
+                    l1_update_codec::SBE_BLOCK_LENGTH,
+                    SCHEMA_VERSION,
+                );
+                TradingEvent::L1Update(L1Update {
+                    md_seq: MdSeq::new(decoder.md_seq()),
+                    prev_md_seq: MdSeq::new(decoder.prev_md_seq()),
+                    bid_price: (decoder.bid_price() != 0).then(|| price(decoder.bid_price())),
+                    bid_qty: decoder.bid_qty(),
+                    ask_price: (decoder.ask_price() != 0).then(|| price(decoder.ask_price())),
+                    ask_qty: decoder.ask_qty(),
+                })
+            }
+            MessageKind::L2Update => {
+                let decoder = l2_update_codec::L2UpdateDecoder::default().wrap(
+                    ReadBuf::new(frame),
+                    SBE_HEADER_LEN,
+                    l2_update_codec::SBE_BLOCK_LENGTH,
+                    SCHEMA_VERSION,
+                );
+                TradingEvent::L2Update(L2Update {
+                    md_seq: MdSeq::new(decoder.md_seq()),
+                    prev_md_seq: MdSeq::new(decoder.prev_md_seq()),
+                    side: match decoder.side() {
+                        book_side::BookSide::Bid => Side::Buy,
+                        book_side::BookSide::Ask => Side::Sell,
+                        book_side::BookSide::NullVal => panic!("null book side"),
+                    },
+                    price: price(decoder.price()),
+                    qty: decoder.qty(),
+                })
+            }
+            kind => panic!("unexpected market-data frame: {kind:?}"),
+        }
+    }
+
     struct TestEngine {
         engine: Engine,
         sequencer: EngineSequencer,
@@ -453,9 +520,22 @@ mod tests {
         }
 
         fn execute(&mut self, entry: OrderEntry, events: &mut Vec<TradingEvent>, label: &str) {
+            events.clear();
+            self.market_data.clear_queued_frames();
+            let mut emit_report = |report| {
+                events.push(TradingEvent::ExecutionReport(report));
+            };
             self.engine
-                .execute(entry, &mut self.sequencer, &mut self.market_data, events)
+                .execute(
+                    entry,
+                    &mut self.sequencer,
+                    &mut self.market_data,
+                    &mut emit_report,
+                )
                 .expect(label);
+            for frame in self.market_data.queued_frames() {
+                events.push(decode_market_data_event(frame));
+            }
         }
     }
 
@@ -486,7 +566,7 @@ mod tests {
                     assert_eq!(update.md_seq.raw(), previous.raw() + 1);
                     previous = update.md_seq;
                 }
-                TradingEvent::ExecutionReport(_) | TradingEvent::ProtocolError(_) => {}
+                TradingEvent::ExecutionReport(_) => {}
             }
         }
     }

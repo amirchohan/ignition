@@ -12,6 +12,8 @@ use crate::{
     control::ControlConfig,
     domain::{DomainError, DomainResult, Price, rd::InstrumentSpec},
     engine::EngineConfig,
+    gateway::GatewayConfig,
+    market_data::MarketDataFeedConfig,
     risk::RiskConfig,
 };
 
@@ -25,6 +27,10 @@ pub struct ServerConfig {
     pub risk: RiskRuntimeConfig,
     #[serde(default)]
     pub control: ControlRuntimeConfig,
+    #[serde(default)]
+    pub gateway: GatewayRuntimeConfig,
+    #[serde(default)]
+    pub market_data: MarketDataRuntimeConfig,
 }
 
 impl ServerConfig {
@@ -56,6 +62,16 @@ impl ServerConfig {
     /// Validate control-plane runtime settings.
     pub fn validate_control(&self) -> ControlConfig {
         self.control.validate()
+    }
+
+    /// Validate trading gateway runtime settings.
+    pub fn validate_gateway(&self) -> GatewayConfig {
+        self.gateway.validate()
+    }
+
+    /// Validate market-data multicast feed runtime settings.
+    pub fn validate_market_data(&self) -> MarketDataFeedConfig {
+        self.market_data.validate()
     }
 }
 
@@ -205,6 +221,124 @@ const fn default_control_max_pending_write_bytes() -> usize {
     1 << 20
 }
 
+/// Trading gateway runtime configuration loaded from YAML.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct GatewayRuntimeConfig {
+    #[serde(default = "default_gateway_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default = "default_gateway_max_frame_len")]
+    pub max_frame_len: usize,
+    #[serde(default = "default_gateway_max_pending_write_bytes")]
+    pub max_pending_write_bytes: usize,
+    #[serde(default = "default_gateway_max_messages_per_poll")]
+    pub max_messages_per_poll: usize,
+}
+
+impl Default for GatewayRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: default_gateway_bind_addr(),
+            max_frame_len: default_gateway_max_frame_len(),
+            max_pending_write_bytes: default_gateway_max_pending_write_bytes(),
+            max_messages_per_poll: default_gateway_max_messages_per_poll(),
+        }
+    }
+}
+
+impl GatewayRuntimeConfig {
+    pub fn validate(&self) -> GatewayConfig {
+        GatewayConfig {
+            bind_addr: self.bind_addr.clone(),
+            max_frame_len: self.max_frame_len,
+            max_pending_write_bytes: self.max_pending_write_bytes,
+            max_messages_per_poll: self.max_messages_per_poll,
+        }
+    }
+}
+
+fn default_gateway_bind_addr() -> String {
+    "127.0.0.1:9000".to_owned()
+}
+
+const fn default_gateway_max_frame_len() -> usize {
+    4096
+}
+
+const fn default_gateway_max_pending_write_bytes() -> usize {
+    1 << 20
+}
+
+const fn default_gateway_max_messages_per_poll() -> usize {
+    1024
+}
+
+/// Market-data multicast feed runtime configuration loaded from YAML.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MarketDataRuntimeConfig {
+    #[serde(default = "default_market_data_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default = "default_market_data_group_addr")]
+    pub group_addr: String,
+    #[serde(default = "default_market_data_multicast_ttl")]
+    pub multicast_ttl: u32,
+    #[serde(default = "default_market_data_multicast_loop_v4")]
+    pub multicast_loop_v4: bool,
+    #[serde(default = "default_market_data_max_datagram_len")]
+    pub max_datagram_len: usize,
+    #[serde(default = "default_market_data_max_pending_datagram_bytes")]
+    pub max_pending_datagram_bytes: usize,
+}
+
+impl Default for MarketDataRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            bind_addr: default_market_data_bind_addr(),
+            group_addr: default_market_data_group_addr(),
+            multicast_ttl: default_market_data_multicast_ttl(),
+            multicast_loop_v4: default_market_data_multicast_loop_v4(),
+            max_datagram_len: default_market_data_max_datagram_len(),
+            max_pending_datagram_bytes: default_market_data_max_pending_datagram_bytes(),
+        }
+    }
+}
+
+impl MarketDataRuntimeConfig {
+    pub fn validate(&self) -> MarketDataFeedConfig {
+        MarketDataFeedConfig {
+            bind_addr: self.bind_addr.clone(),
+            group_addr: self.group_addr.clone(),
+            multicast_ttl: self.multicast_ttl,
+            multicast_loop_v4: self.multicast_loop_v4,
+            max_datagram_len: self.max_datagram_len,
+            max_pending_datagram_bytes: self.max_pending_datagram_bytes,
+        }
+    }
+}
+
+fn default_market_data_bind_addr() -> String {
+    "0.0.0.0:0".to_owned()
+}
+
+fn default_market_data_group_addr() -> String {
+    "239.255.0.1:9002".to_owned()
+}
+
+const fn default_market_data_multicast_ttl() -> u32 {
+    1
+}
+
+const fn default_market_data_multicast_loop_v4() -> bool {
+    true
+}
+
+const fn default_market_data_max_datagram_len() -> usize {
+    4096
+}
+
+const fn default_market_data_max_pending_datagram_bytes() -> usize {
+    1 << 20
+}
+
 /// Config load/parse/validation errors.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -344,5 +478,33 @@ control:
         assert_eq!(control.bind_addr, "127.0.0.1:9011");
         assert_eq!(control.max_frame_len, 8192);
         assert_eq!(control.max_pending_write_bytes, 16384);
+    }
+
+    #[test]
+    fn parses_and_validates_gateway_config() {
+        let config = parse(
+            r#"
+reference_data:
+  instrument:
+    instrument_id: 1001
+    base_asset_id: 1
+    quote_asset_id: 2
+    price_decimals: 2
+    qty_decimals: 8
+    price_tick: 1
+    qty_lot: 1
+gateway:
+  bind_addr: "127.0.0.1:9010"
+  max_frame_len: 8192
+  max_pending_write_bytes: 32768
+  max_messages_per_poll: 64
+"#,
+        );
+
+        let gateway = config.validate_gateway();
+        assert_eq!(gateway.bind_addr, "127.0.0.1:9010");
+        assert_eq!(gateway.max_frame_len, 8192);
+        assert_eq!(gateway.max_pending_write_bytes, 32768);
+        assert_eq!(gateway.max_messages_per_poll, 64);
     }
 }

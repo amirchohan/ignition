@@ -34,22 +34,18 @@ ownership boundary.
 
 ### `gateway`
 
-- Owns frame/session ingress and egress for two endpoint families:
-  control and trading.
-- Control ingress decodes only control requests: kill switch, snapshot, and
-  heartbeat.
+- Owns trading frame/session ingress and egress for the order-entry endpoint.
 - Trading ingress decodes only order-entry messages: new, cancel,
   cancel-replace, and mass cancel.
-- Control egress encodes control responses, heartbeat status, and protocol
-  errors for the control endpoint.
-- Trading egress encodes execution reports, trade prints, L1/L2 updates, and
-  protocol errors for the trading endpoint.
-- Does not own matching, risk, market-data sequencing, or control-plane policy.
+- Trading egress encodes execution reports and protocol errors for the trading
+  endpoint.
+- The live TCP path decodes a borrowed complete frame, normalizes it once, and
+  lets runtime process/publish through a borrowed gateway publisher.
+- Does not own matching, risk, market-data feed state, or control-plane policy.
 
 ### `runtime`
 
-- Owns orchestration state, including the matching engine and market-data
-  runtime.
+- Owns orchestration state, including the matching engine and market-data feed.
 - Connects the separate control and trading queues to control state, risk
   checks, engine execution, market-data output, and protocol egress in explicit
   phases.
@@ -60,15 +56,15 @@ ownership boundary.
 - Owns order-book state, order lifecycle mutations, and price-time priority
   matching.
 - Accepts internal typed `OrderEntry` values, not raw protocol buffers.
-- Exposes `Engine::execute(entry, market_data, events)`, where the caller owns
-  market-data state and the reusable output buffer for trading events.
+- Exposes `Engine::execute(entry, market_data, emit_report)`, where the
+  caller owns market-data feed state and order-entry report egress.
 - Stores the book as two `SideLadder` values, one shared resting-order arena, a
   `client_order_id -> handle` lookup, and a dense account table.
 - Uses a fixed storage envelope from `configs/server.yaml` for direct price
   addressing; dynamic risk price bands are enforced outside the matching data
   structure.
 - Emits deterministic execution reports and delegates trade-print/L1/L2 shaping
-  to the caller-owned market-data runtime.
+  to the caller-owned market-data feed runtime.
 - Does not read wall-clock time, parse protocol bytes, perform transport IO, or
   make risk-policy decisions.
 
@@ -81,19 +77,19 @@ ownership boundary.
 
 ### `market_data`
 
-- Owns outbound trade-print, L1, and L2 market-data shaping.
+- Owns outbound trade-print, L1, and L2 market-data shaping and multicast UDP
+  egress.
 - Owns market-data sequencing separately from the matching engine's execution
   report sequencing.
-- Centralizes top-of-book change output and absolute level-update output.
+- Centralizes top-of-book change output, absolute level-update output, encoding,
+  queueing, and flush/error state.
 - Tracks only last-published L1 state; the matching book remains the source of truth.
 - Does not make matching or risk decisions.
 
 ### `control`
 
-- Owns future operational state: kill switch, snapshot requests, heartbeat
-  liveness, and status responses.
-- The exact missed-heartbeat fail-fast behavior is deferred to the control
-  milestone.
+- Owns operational state: kill switch, snapshot requests, heartbeat liveness,
+  and status responses.
 - Does not mutate the book directly; runtime applies control outcomes in order.
 
 ### Client Tooling
@@ -113,9 +109,8 @@ The intended flow is:
 4. control state and risk gates are observed before matching,
 5. engine mutates book state and emits internal execution/book effects,
 6. market-data and execution outputs are sequenced,
-7. gateway encodes control or trading egress frames.
+7. control and gateway encode endpoint-specific egress frames.
 
 Milestones 1 through 3 define this ownership contract, protocol/domain boundary,
 single-symbol reference data, deterministic core model, and matching behavior.
-Risk behavior, real transport IO, clients, replay, and benchmarking remain later
-milestones.
+Client tooling, replay, and benchmarking remain later milestones.

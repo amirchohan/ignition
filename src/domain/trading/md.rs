@@ -58,6 +58,14 @@ pub struct L2Update {
     pub qty: u64,
 }
 
+/// Market-data output emitted by deterministic book mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketDataEvent {
+    TradePrint(TradePrint),
+    L1Update(L1Update),
+    L2Update(L2Update),
+}
+
 /// Deterministic sequence allocator for market-data streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MarketDataSequencer {

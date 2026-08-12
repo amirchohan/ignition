@@ -18,8 +18,8 @@ use crate::{
 };
 
 use super::{
-    encode_protocol_error, ensure_complete, ensure_out, to_wire_control_result,
-    to_wire_reject_reason, to_wire_side, unexpected_template,
+    encode_protocol_error, ensure_complete, ensure_out, protocol_error_code, template_id,
+    to_wire_control_result, to_wire_reject_reason, to_wire_side, unexpected_template,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,17 +31,10 @@ pub struct WireDecodeError {
 
 impl WireDecodeError {
     fn protocol(error: ProtocolError, bytes: &[u8], recv_ts: RecvTs) -> Self {
-        let error_code = match error {
-            ProtocolError::UnexpectedTemplate { .. } | ProtocolError::UnknownTemplate { .. } => {
-                ErrorCode::UnsupportedTemplate
-            }
-            ProtocolError::UnsupportedVersion { .. } => ErrorCode::UnsupportedVersion,
-            _ => ErrorCode::DecodeError,
-        };
         Self {
             template_id: template_id(bytes),
             recv_ts,
-            error_code,
+            error_code: protocol_error_code(error),
         }
     }
 
@@ -126,13 +119,6 @@ pub fn decode_control_request(
         }
         _ => unreachable!("control request kind checked above"),
     }
-}
-
-fn template_id(bytes: &[u8]) -> u16 {
-    if bytes.len() < SBE_HEADER_LEN {
-        return 0;
-    }
-    u16::from_le_bytes([bytes[2], bytes[3]])
 }
 
 pub fn encode_control_event(event: ControlEvent, out: &mut [u8]) -> ProtocolResult<usize> {

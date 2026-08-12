@@ -52,6 +52,23 @@ pub(crate) fn unexpected_template(kind: MessageKind) -> ProtocolError {
     }
 }
 
+pub(crate) fn protocol_error_code(error: ProtocolError) -> ErrorCode {
+    match error {
+        ProtocolError::UnexpectedTemplate { .. } | ProtocolError::UnknownTemplate { .. } => {
+            ErrorCode::UnsupportedTemplate
+        }
+        ProtocolError::UnsupportedVersion { .. } => ErrorCode::UnsupportedVersion,
+        _ => ErrorCode::DecodeError,
+    }
+}
+
+pub(crate) fn template_id(input: &[u8]) -> u16 {
+    if input.len() < SBE_HEADER_LEN {
+        return 0;
+    }
+    u16::from_le_bytes([input[2], input[3]])
+}
+
 pub(crate) fn encode_protocol_error(
     event: ProtocolErrorEvent,
     out: &mut [u8],
