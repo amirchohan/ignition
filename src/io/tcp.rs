@@ -11,30 +11,7 @@ use std::{
 
 use crate::{domain::RecvTs, protocol::SBE_HEADER_LEN};
 
-/// Transport-level failure.
-#[derive(Debug)]
-pub enum IoError {
-    Bind(std::io::Error),
-    LocalAddr(std::io::Error),
-    Configure(std::io::Error),
-    Read(std::io::Error),
-    Write(std::io::Error),
-    FrameTooLarge {
-        frame_len: usize,
-        max_frame_len: usize,
-    },
-    PendingWriteLimit {
-        pending_bytes: usize,
-        max_pending_write_bytes: usize,
-    },
-}
-
-/// Error returned by transport poll when either I/O or frame handling fails.
-#[derive(Debug)]
-pub enum FramePollError<E> {
-    Io(IoError),
-    Handler(E),
-}
+use super::{FramePollError, IoError};
 
 /// Raw frame publisher borrowed during transport polling.
 #[derive(Debug)]
@@ -47,6 +24,16 @@ pub struct TcpFramePublisher<'a> {
 }
 
 impl TcpFramePublisher<'_> {
+    pub fn reborrow(&mut self) -> TcpFramePublisher<'_> {
+        TcpFramePublisher {
+            active: self.active,
+            write_buf: self.write_buf,
+            write_head: self.write_head,
+            write_len: self.write_len,
+            max_pending_write_bytes: self.max_pending_write_bytes,
+        }
+    }
+
     pub fn publish(&mut self, frame: &[u8]) -> Result<(), IoError> {
         self.flush_pending()?;
         self.queue_frame(frame)?;
@@ -383,9 +370,17 @@ impl TcpFrameIo {
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
+        // First accept any waiting client so new input can be read this tick.
         let accepted = self.accept_available().map_err(FramePollError::Io)?;
+
+        // Then read whatever bytes are available and call the handler for each
+        // complete frame. Partial frames stay buffered for a later poll.
         let read = self.read_available(on_frame, max_frames)?;
+
+        // Finally push out anything endpoint code queued while handling input.
         let flushed = self.flush_writes().map_err(FramePollError::Io)?;
+
+        // The scheduler only needs to know whether this poll did useful work.
         Ok(accepted || read || flushed)
     }
 

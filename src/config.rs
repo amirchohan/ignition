@@ -13,6 +13,7 @@ use crate::{
     domain::{DomainError, DomainResult, Price, rd::InstrumentSpec},
     engine::EngineConfig,
     gateway::GatewayConfig,
+    io::IOConfig,
     market_data::MarketDataFeedConfig,
     risk::RiskConfig,
 };
@@ -202,9 +203,12 @@ impl ControlRuntimeConfig {
     pub fn validate(&self) -> ControlConfig {
         ControlConfig {
             heartbeat_timeout_ns: self.heartbeat_timeout_ns,
-            bind_addr: self.bind_addr.clone(),
-            max_frame_len: self.max_frame_len,
-            max_pending_write_bytes: self.max_pending_write_bytes,
+            io: IOConfig::Tcp {
+                bind_addr: self.bind_addr.clone(),
+                max_frame_len: self.max_frame_len,
+                max_pending_write_bytes: self.max_pending_write_bytes,
+                record_path: None,
+            },
         }
     }
 }
@@ -248,9 +252,12 @@ impl Default for GatewayRuntimeConfig {
 impl GatewayRuntimeConfig {
     pub fn validate(&self) -> GatewayConfig {
         GatewayConfig {
-            bind_addr: self.bind_addr.clone(),
-            max_frame_len: self.max_frame_len,
-            max_pending_write_bytes: self.max_pending_write_bytes,
+            io: IOConfig::Tcp {
+                bind_addr: self.bind_addr.clone(),
+                max_frame_len: self.max_frame_len,
+                max_pending_write_bytes: self.max_pending_write_bytes,
+                record_path: None,
+            },
             max_messages_per_poll: self.max_messages_per_poll,
         }
     }
@@ -305,12 +312,14 @@ impl Default for MarketDataRuntimeConfig {
 impl MarketDataRuntimeConfig {
     pub fn validate(&self) -> MarketDataFeedConfig {
         MarketDataFeedConfig {
-            bind_addr: self.bind_addr.clone(),
-            group_addr: self.group_addr.clone(),
-            multicast_ttl: self.multicast_ttl,
-            multicast_loop_v4: self.multicast_loop_v4,
-            max_datagram_len: self.max_datagram_len,
-            max_pending_datagram_bytes: self.max_pending_datagram_bytes,
+            io: IOConfig::Udp {
+                bind_addr: self.bind_addr.clone(),
+                group_addr: self.group_addr.clone(),
+                multicast_ttl: self.multicast_ttl,
+                multicast_loop_v4: self.multicast_loop_v4,
+                max_datagram_len: self.max_datagram_len,
+                max_pending_datagram_bytes: self.max_pending_datagram_bytes,
+            },
         }
     }
 }
@@ -475,9 +484,19 @@ control:
 
         let control = config.validate_control();
         assert_eq!(control.heartbeat_timeout_ns, 500);
-        assert_eq!(control.bind_addr, "127.0.0.1:9011");
-        assert_eq!(control.max_frame_len, 8192);
-        assert_eq!(control.max_pending_write_bytes, 16384);
+        let IOConfig::Tcp {
+            bind_addr,
+            max_frame_len,
+            max_pending_write_bytes,
+            record_path,
+        } = control.io
+        else {
+            panic!("control io");
+        };
+        assert_eq!(bind_addr, "127.0.0.1:9011");
+        assert_eq!(max_frame_len, 8192);
+        assert_eq!(max_pending_write_bytes, 16384);
+        assert_eq!(record_path, None);
     }
 
     #[test]
@@ -502,9 +521,19 @@ gateway:
         );
 
         let gateway = config.validate_gateway();
-        assert_eq!(gateway.bind_addr, "127.0.0.1:9010");
-        assert_eq!(gateway.max_frame_len, 8192);
-        assert_eq!(gateway.max_pending_write_bytes, 32768);
+        let IOConfig::Tcp {
+            bind_addr,
+            max_frame_len,
+            max_pending_write_bytes,
+            record_path,
+        } = gateway.io
+        else {
+            panic!("gateway io");
+        };
+        assert_eq!(bind_addr, "127.0.0.1:9010");
+        assert_eq!(max_frame_len, 8192);
+        assert_eq!(max_pending_write_bytes, 32768);
+        assert_eq!(record_path, None);
         assert_eq!(gateway.max_messages_per_poll, 64);
     }
 }

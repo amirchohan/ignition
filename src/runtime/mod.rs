@@ -4,8 +4,11 @@
 //! own book internals; it moves typed messages between control, gateway, risk,
 //! matching, market-data, and egress in a deterministic loop.
 
+mod mode;
 mod order;
 mod snapshot;
+
+pub use mode::Mode;
 
 use self::order::OrderProcessor;
 use self::snapshot::SnapshotProcessor;
@@ -17,6 +20,7 @@ use crate::{
     },
     engine::{Engine, EngineConfig, EngineError},
     gateway::{GatewayError, GatewayPollError, GatewayRuntime},
+    io::IoError,
     market_data::{MarketDataError, MarketDataRuntime},
     risk::{RiskConfig, RiskRuntime},
 };
@@ -24,6 +28,8 @@ use crate::{
 /// Poll-driven runtime orchestrator.
 #[derive(Debug)]
 pub struct Runtime {
+    /// Live or deterministic replay mode.
+    mode: Mode,
     /// Control-plane state and ingress.
     control: ControlRuntime,
     /// Pre-match risk gate and reference-price state.
@@ -43,6 +49,7 @@ pub struct Runtime {
 impl Runtime {
     /// Build the single-writer runtime from pre-opened adapters and validated configs.
     pub fn new(
+        mode: Mode,
         engine_config: EngineConfig,
         risk_config: RiskConfig,
         control: ControlRuntime,
@@ -50,6 +57,7 @@ impl Runtime {
         market_data: MarketDataRuntime,
     ) -> Result<Self, RuntimeError> {
         Ok(Self {
+            mode,
             control,
             gateway,
             market_data,
@@ -76,10 +84,8 @@ impl Runtime {
             // then process order entry and flush any market data caused by it.
             let gateway_progress = self.poll_gateway()?;
 
-            // give the scheduler a chance to run something else when there was nothing useful to do.
-            if !control_progress && !gateway_progress {
-                // todo - we should be able to switch between yield types (e.g. no-op)
-                std::thread::yield_now();
+            if !self.handle_idle_iteration(control_progress, gateway_progress)? {
+                return Ok(());
             }
         }
     }
@@ -97,12 +103,12 @@ impl Runtime {
             engine,
             sequencer,
             terminal,
+            mode,
         } = self;
-
         // poll every ready control frame before touching order entry. Normal
         // control state is updated inside `ControlRuntime`; this closure only
         // handles work that needs runtime-owned engine or market-data state.
-        let control_progress = control.poll(sequencer, |request, publisher, sequencer| {
+        let control_progress = control.poll(mode, sequencer, |request, publisher, sequencer| {
             handled_control_request = true;
             match request {
                 ControlRequest::KillSwitch(request) => {
@@ -148,6 +154,7 @@ impl Runtime {
     fn poll_gateway(&mut self) -> Result<bool, RuntimeError> {
         let mut handled_order = false;
         let Runtime {
+            mode,
             control,
             gateway,
             market_data,
@@ -156,12 +163,11 @@ impl Runtime {
             sequencer,
             ..
         } = self;
-
         // the gateway may hand us several ready orders in one poll. Process
         // them one at a time so reports, book changes, and market data stay in
         // the same order as the incoming frames.
         let gateway_progress = gateway
-            .poll(sequencer, |entry, publisher, sequencer| {
+            .poll(mode, sequencer, |entry, publisher, sequencer| {
                 handled_order = true;
                 // the same sequencer is passed through the gateway callback so
                 // protocol rejects and engine reports share one monotonic stream.
@@ -179,6 +185,32 @@ impl Runtime {
         let market_data_progress = market_data.flush_pending()?;
         Ok(gateway_progress || market_data_progress || handled_order)
     }
+
+    /// Handle a run-loop iteration that may have made no IO/runtime progress.
+    ///
+    /// Returns `false` when replay input is fully drained and the runtime should
+    /// exit normally.
+    fn handle_idle_iteration(&mut self, control_progress: bool, gateway_progress: bool) -> Result<bool, RuntimeError> {
+        if control_progress || gateway_progress {
+            return Ok(true);
+        }
+
+        if self.mode.is_replay() {
+            if self.control.replay_input_exhausted()? && self.gateway.replay_input_exhausted()? {
+                return Ok(false);
+            }
+            return Err(RuntimeError::Io(IoError::ReplayStalled {
+                expected_input_seq: match self.mode {
+                    Mode::Replay { expected_input_seq } => expected_input_seq,
+                    Mode::Live { next_input_seq } => next_input_seq,
+                },
+            }));
+        }
+
+        // todo - we should be able to switch between yield types (e.g. no-op)
+        std::thread::yield_now();
+        Ok(true)
+    }
 }
 
 /// Runtime orchestration failure.
@@ -188,6 +220,7 @@ pub enum RuntimeError {
     Control(ControlError),
     Gateway(GatewayError),
     MarketData(MarketDataError),
+    Io(IoError),
 }
 
 impl From<EngineError> for RuntimeError {
@@ -214,6 +247,12 @@ impl From<MarketDataError> for RuntimeError {
     }
 }
 
+impl From<IoError> for RuntimeError {
+    fn from(error: IoError) -> Self {
+        Self::Io(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +266,7 @@ mod tests {
             OrderType, Side, TimeInForce,
         },
     };
+    use crate::io::IOConfig;
     use crate::market_data::{MarketDataFeedConfig, MarketDataRuntime};
     use crate::protocol::{
         MessageKind, SBE_HEADER_LEN, SCHEMA_VERSION, decode_header, encode_header,
@@ -312,7 +352,12 @@ mod tests {
         let gateway_addr = reserve_loopback_addr()?;
         let gateway = match GatewayRuntime::new(
             crate::gateway::GatewayConfig {
-                bind_addr: gateway_addr.to_string(),
+                io: IOConfig::Tcp {
+                    bind_addr: gateway_addr.to_string(),
+                    max_frame_len: 4096,
+                    max_pending_write_bytes: 1 << 20,
+                    record_path: None,
+                },
                 ..crate::gateway::GatewayConfig::default()
             },
             instrument(),
@@ -325,7 +370,7 @@ mod tests {
             }
             Err(error) => panic!("gateway: {error:?}"),
         };
-        Some(Runtime::new(engine_config(), risk_config, control, gateway, market_data).expect("runtime"))
+        Some(Runtime::new(Mode::default(), engine_config(), risk_config, control, gateway, market_data).expect("runtime"))
     }
 
     fn runtime_with_control_and_orders(
@@ -336,7 +381,12 @@ mod tests {
         let market_data = new_market_data()?;
         let gateway_addr = reserve_loopback_addr()?;
         let gateway_config = crate::gateway::GatewayConfig {
-            bind_addr: gateway_addr.to_string(),
+            io: IOConfig::Tcp {
+                bind_addr: gateway_addr.to_string(),
+                max_frame_len: 4096,
+                max_pending_write_bytes: 1 << 20,
+                record_path: None,
+            },
             ..crate::gateway::GatewayConfig::default()
         };
         let gateway = match GatewayRuntime::new(gateway_config, instrument()) {
@@ -351,23 +401,24 @@ mod tests {
         let mut client = TcpStream::connect(gateway_addr).expect("connect gateway");
         client.set_read_timeout(Some(Duration::from_secs(1))).expect("gateway timeout");
         write_gateway_orders(&mut client, orders);
-        Some(Runtime::new(engine_config(), risk_config, control, gateway, market_data).expect("runtime")).map(|runtime| (runtime, client))
+        Some(Runtime::new(Mode::default(), engine_config(), risk_config, control, gateway, market_data).expect("runtime"))
+            .map(|runtime| (runtime, client))
     }
 
     fn control_config() -> ControlConfig {
         ControlConfig {
-            bind_addr: "127.0.0.1:0".to_owned(),
+            io: IOConfig::Tcp {
+                bind_addr: "127.0.0.1:0".to_owned(),
+                max_frame_len: 4096,
+                max_pending_write_bytes: 1 << 20,
+                record_path: None,
+            },
             ..ControlConfig::default()
         }
     }
 
     fn new_market_data() -> Option<MarketDataRuntime> {
-        match MarketDataRuntime::new(MarketDataFeedConfig {
-            bind_addr: "0.0.0.0:0".to_owned(),
-            group_addr: "239.255.0.1:9002".to_owned(),
-            multicast_loop_v4: true,
-            ..MarketDataFeedConfig::default()
-        }) {
+        match MarketDataRuntime::new(MarketDataFeedConfig::default()) {
             Ok(feed) => Some(feed),
             Err(crate::market_data::MarketDataError::Io(crate::io::IoError::Bind(error)))
                 if error.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -402,13 +453,29 @@ mod tests {
         }
     }
 
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("ignition-{name}-{}-{}.bin", std::process::id(), unique_suffix()))
+    }
+
+    fn unique_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time")
+            .as_nanos()
+    }
+
     fn runtime_with_control_client_and_orders(
         orders: impl IntoIterator<Item = OrderEntry>,
         risk_config: RiskConfig,
     ) -> Option<(Runtime, TcpStream, TcpStream)> {
         let bind_addr = reserve_loopback_addr()?;
         let control = new_control_with_config(ControlConfig {
-            bind_addr: bind_addr.to_string(),
+            io: IOConfig::Tcp {
+                bind_addr: bind_addr.to_string(),
+                max_frame_len: 4096,
+                max_pending_write_bytes: 1 << 20,
+                record_path: None,
+            },
             ..ControlConfig::default()
         })?;
         let client = TcpStream::connect(bind_addr).expect("connect");
@@ -856,6 +923,58 @@ mod tests {
     }
 
     #[test]
+    fn empty_replay_with_file_market_data_output_drains_without_progress() {
+        let market_data_path = temp_path("replay-market-data-output");
+        let control = ControlRuntime::new(ControlConfig {
+            io: IOConfig::File {
+                input_path: None,
+                output_path: None,
+                max_frame_len: 4096,
+            },
+            ..ControlConfig::default()
+        })
+        .expect("control");
+        let gateway = GatewayRuntime::new(
+            crate::gateway::GatewayConfig {
+                io: IOConfig::File {
+                    input_path: None,
+                    output_path: None,
+                    max_frame_len: 4096,
+                },
+                ..crate::gateway::GatewayConfig::default()
+            },
+            instrument(),
+        )
+        .expect("gateway");
+        let market_data = MarketDataRuntime::new(MarketDataFeedConfig {
+            io: IOConfig::File {
+                input_path: None,
+                output_path: Some(market_data_path.clone()),
+                max_frame_len: 4096,
+            },
+        })
+        .expect("market data");
+        let mut runtime = Runtime::new(
+            Mode::Replay { expected_input_seq: 1 },
+            engine_config(),
+            risk_config(10, 1_000_000),
+            control,
+            gateway,
+            market_data,
+        )
+        .expect("runtime");
+
+        let control_progress = runtime.poll_control().expect("poll control");
+        let gateway_progress = runtime.poll_gateway().expect("poll gateway");
+
+        assert!(!control_progress);
+        assert!(!gateway_progress);
+        assert!(!runtime.handle_idle_iteration(control_progress, gateway_progress).expect("idle"));
+
+        let _ = std::fs::remove_file(market_data_path);
+    }
+
+    #[test]
     fn halt_trading_rejects_new_and_replace_before_risk() {
         let Some((mut runtime, mut client, mut gateway_client)) = runtime_with_control_client_and_orders(
             [new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10), replace(2, 1, 1, 1_001, 10)],
@@ -901,8 +1020,12 @@ mod tests {
         };
         let Some(control) = new_control_with_config(ControlConfig {
             heartbeat_timeout_ns: 10,
-            bind_addr: bind_addr.to_string(),
-            ..ControlConfig::default()
+            io: IOConfig::Tcp {
+                bind_addr: bind_addr.to_string(),
+                max_frame_len: 4096,
+                max_pending_write_bytes: 1 << 20,
+                record_path: None,
+            },
         }) else {
             return;
         };

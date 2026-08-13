@@ -1,6 +1,12 @@
 //! Server entry point.
 
-use ignition::{config::ServerConfig, control::ControlRuntime, gateway::GatewayRuntime, market_data::MarketDataRuntime, runtime::Runtime};
+use ignition::{
+    config::ServerConfig,
+    control::ControlRuntime,
+    gateway::GatewayRuntime,
+    market_data::MarketDataRuntime,
+    runtime::{Mode, Runtime},
+};
 
 fn main() {
     match ServerConfig::load("configs/server.yaml") {
@@ -35,10 +41,11 @@ fn run(config: ServerConfig) {
         }
     };
     let control_config = config.validate_control();
+    let mode = Mode::default();
     let control = match ControlRuntime::new(control_config.clone()) {
         Ok(control) => control,
         Err(error) => {
-            eprintln!("failed to open control listener {}: {error:?}", control_config.bind_addr);
+            eprintln!("failed to open control listener: {error:?}");
             std::process::exit(1);
         }
     };
@@ -46,7 +53,7 @@ fn run(config: ServerConfig) {
     let gateway = match GatewayRuntime::new(gateway_config.clone(), instrument) {
         Ok(gateway) => gateway,
         Err(error) => {
-            eprintln!("failed to open trading gateway listener {}: {error:?}", gateway_config.bind_addr);
+            eprintln!("failed to open trading gateway listener: {error:?}");
             std::process::exit(1);
         }
     };
@@ -54,15 +61,12 @@ fn run(config: ServerConfig) {
     let market_data = match MarketDataRuntime::new(market_data_config.clone()) {
         Ok(feed) => feed,
         Err(error) => {
-            eprintln!(
-                "failed to open market-data multicast feed {}: {error:?}",
-                market_data_config.group_addr
-            );
+            eprintln!("failed to open market-data multicast feed: {error:?}");
             std::process::exit(1);
         }
     };
 
-    let mut runtime = match Runtime::new(engine_config, risk_config, control, gateway, market_data) {
+    let mut runtime = match Runtime::new(mode, engine_config, risk_config, control, gateway, market_data) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("failed to construct runtime: {error:?}");
@@ -70,10 +74,7 @@ fn run(config: ServerConfig) {
         }
     };
 
-    println!(
-        "ignition server: gateway listening on {}, control listening on {}, market-data multicast on {}",
-        gateway_config.bind_addr, control_config.bind_addr, market_data_config.group_addr
-    );
+    println!("ignition server: endpoint IO backends configured");
     if let Err(error) = runtime.run() {
         eprintln!("runtime failed: {error:?}");
         std::process::exit(1);

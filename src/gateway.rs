@@ -7,7 +7,7 @@
 //! visible before any new risk-increasing order reaches the book.
 //!
 //! Inbound flow is intentionally allocation-free once the listener is open:
-//! `TcpFrameIo` lends each complete frame to `GatewayRuntime::poll`,
+//! `IORuntime` lends each complete frame to `GatewayRuntime::poll`,
 //! `wire::trading` decodes and normalizes it into a typed `OrderEntry`, and
 //! runtime-owned matching work is invoked immediately through the poll
 //! callback. Protocol decode errors and order-shape rejects are published
@@ -24,7 +24,7 @@ use crate::{
         rd::InstrumentSpec,
         trading::order::{AccountId, ExecType, ExecutionReport, OrdStatus, OrderEntry, OrderId},
     },
-    io::{FramePollError, IoError, TcpFrameIo, TcpFramePublisher},
+    io::{Endpoint, FramePollError, IOConfig, IOPublisher, IORuntime, IoError},
     protocol::{
         ProtocolError,
         wire::{
@@ -43,12 +43,8 @@ use crate::{
 /// Trading gateway runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayConfig {
-    /// TCP address for the trading listener.
-    pub bind_addr: String,
-    /// Maximum accepted SBE frame length including the SBE header.
-    pub max_frame_len: usize,
-    /// Maximum queued outbound bytes before disconnecting the active client.
-    pub max_pending_write_bytes: usize,
+    /// Endpoint IO backend.
+    pub io: IOConfig,
     /// Maximum inbound frames processed in one runtime poll.
     pub max_messages_per_poll: usize,
 }
@@ -56,9 +52,12 @@ pub struct GatewayConfig {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "127.0.0.1:9000".to_owned(),
-            max_frame_len: 4096,
-            max_pending_write_bytes: 1 << 20,
+            io: IOConfig::Tcp {
+                bind_addr: "127.0.0.1:9000".to_owned(),
+                max_frame_len: 4096,
+                max_pending_write_bytes: 1 << 20,
+                record_path: None,
+            },
             max_messages_per_poll: 1024,
         }
     }
@@ -71,7 +70,7 @@ impl Default for GatewayConfig {
 /// frame, which lets runtime-owned order work publish immediately without
 /// taking ownership of the socket or allocating outbound frame storage.
 pub struct GatewayPublisher<'a, 'b> {
-    io: &'a mut TcpFramePublisher<'b>,
+    io: &'a mut IOPublisher<'b>,
     encode_buf: &'a mut Vec<u8>,
     first_error: Option<GatewayError>,
 }
@@ -80,7 +79,7 @@ impl GatewayPublisher<'_, '_> {
     /// Publish one execution report to this gateway's egress sink.
     ///
     /// The encoded bytes are valid only until the next publish because the
-    /// backing buffer is reused. `TcpFrameIo` copies those bytes into its
+    /// backing buffer is reused. `IORuntime` copies those bytes into its
     /// bounded write ring before this method returns.
     pub fn publish_execution_report(&mut self, event: ExecutionReport) -> Result<(), GatewayError> {
         let written = encode_execution_report(event, self.encode_buf)?;
@@ -115,7 +114,7 @@ impl GatewayPublisher<'_, '_> {
     }
 }
 
-/// Live order-entry gateway runtime.
+/// Order-entry gateway runtime.
 ///
 /// This type owns the trading listener, the reusable outbound encode buffer,
 /// the configured instrument used for order-entry normalization, and the
@@ -123,7 +122,7 @@ impl GatewayPublisher<'_, '_> {
 /// are forwarded to the runtime callback during `poll`.
 #[derive(Debug)]
 pub struct GatewayRuntime {
-    io: TcpFrameIo,
+    io: IORuntime,
     encode_buf: Vec<u8>,
     instrument: InstrumentSpec,
     max_messages_per_poll: usize,
@@ -131,20 +130,25 @@ pub struct GatewayRuntime {
 }
 
 impl GatewayRuntime {
-    /// Open the configured live trading listener and preallocate buffers.
+    /// Open the configured trading I/O and preallocate buffers.
     ///
     /// All configurable transport bounds are applied here so the poll path only
     /// reads already-normalized state. The encode buffer is sized once from
     /// `max_frame_len` and reused for every trading event.
     pub fn new(config: GatewayConfig, instrument: InstrumentSpec) -> Result<Self, GatewayError> {
-        let io = TcpFrameIo::bind(&config.bind_addr, config.max_frame_len, config.max_pending_write_bytes)?;
+        let encode_len = config.io.frame_capacity();
+        let io = IORuntime::new(Endpoint::Gateway, config.io)?;
         Ok(Self {
             io,
-            encode_buf: vec![0_u8; config.max_frame_len],
+            encode_buf: vec![0_u8; encode_len],
             instrument,
             max_messages_per_poll: config.max_messages_per_poll.max(1),
             first_error: None,
         })
+    }
+
+    pub fn replay_input_exhausted(&mut self) -> Result<bool, GatewayError> {
+        self.io.replay_input_exhausted().map_err(GatewayError::Io)
     }
 
     /// Poll order-entry input and process each decoded command immediately.
@@ -158,7 +162,12 @@ impl GatewayRuntime {
     /// The returned boolean means forward progress was made by the underlying
     /// transport or frame processing. It is deliberately not a count; callers
     /// should observe state or output streams for behavior-specific assertions.
-    pub fn poll<F, E>(&mut self, sequencer: &mut Sequencer, mut on_order: F) -> Result<bool, GatewayPollError<E>>
+    pub fn poll<F, E>(
+        &mut self,
+        mode: &mut crate::runtime::Mode,
+        sequencer: &mut Sequencer,
+        mut on_order: F,
+    ) -> Result<bool, GatewayPollError<E>>
     where
         F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), E>,
     {
@@ -170,6 +179,7 @@ impl GatewayRuntime {
             handled_frame: false,
         };
         let io_progress = match self.io.poll_bounded(
+            mode,
             |io_publisher, recv_ts, bytes| session.on_frame(io_publisher, recv_ts, bytes),
             self.max_messages_per_poll,
         ) {
@@ -227,7 +237,7 @@ impl<F, E> GatewaySession<'_, F>
 where
     F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), E>,
 {
-    fn on_frame(&mut self, io_publisher: &mut TcpFramePublisher<'_>, recv_ts: RecvTs, bytes: &[u8]) -> Result<(), GatewayPollError<E>> {
+    fn on_frame(&mut self, io_publisher: &mut IOPublisher<'_>, recv_ts: RecvTs, bytes: &[u8]) -> Result<(), GatewayPollError<E>> {
         self.handled_frame = true;
         let mut publisher = GatewayPublisher {
             io: io_publisher,
@@ -388,7 +398,12 @@ mod tests {
     fn live_gateway() -> Option<(GatewayRuntime, SocketAddr)> {
         let bind_addr = reserve_loopback_addr()?;
         let config = GatewayConfig {
-            bind_addr: bind_addr.to_string(),
+            io: IOConfig::Tcp {
+                bind_addr: bind_addr.to_string(),
+                max_frame_len: 4096,
+                max_pending_write_bytes: 1 << 20,
+                record_path: None,
+            },
             ..GatewayConfig::default()
         };
         match GatewayRuntime::new(config, instrument()) {
@@ -438,8 +453,9 @@ mod tests {
     where
         F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), GatewayError> + Copy,
     {
+        let mut mode = crate::runtime::Mode::default();
         for _ in 0..100 {
-            if gateway.poll(sequencer, f).expect("poll") {
+            if gateway.poll(&mut mode, sequencer, f).expect("poll") {
                 return;
             }
             thread::sleep(Duration::from_millis(1));
@@ -500,11 +516,12 @@ mod tests {
         client.set_read_timeout(Some(Duration::from_secs(1))).expect("timeout");
         client.write_all(&new_order_frame(0)).expect("write");
         let mut sequencer = Sequencer::default();
+        let mut mode = crate::runtime::Mode::default();
         let mut callback_seen = false;
 
         for _ in 0..100 {
             if gateway
-                .poll(&mut sequencer, |_, _, _| {
+                .poll(&mut mode, &mut sequencer, |_, _, _| {
                     callback_seen = true;
                     Ok::<(), GatewayError>(())
                 })

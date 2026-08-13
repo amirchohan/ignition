@@ -7,7 +7,7 @@
 //! failure is visible before any new risk-increasing order reaches the book.
 //!
 //! Inbound flow is intentionally allocation-free once the listener is open:
-//! `TcpFrameIo` lends each complete frame to `ControlRuntime::poll`,
+//! `IORuntime` lends each complete frame to `ControlRuntime::poll`,
 //! `wire::control` decodes it into a typed `ControlRequest`, control-owned
 //! state is updated immediately, and control-owned replies are published
 //! immediately through the borrowed `ControlPublisher`.
@@ -17,6 +17,7 @@
 //! control egress, for example snapshot begin/row/end messages, without
 //! staging requests or events in intermediate vectors.
 
+use crate::runtime::Mode;
 use crate::{
     domain::{
         DomainError, ProtocolErrorEvent, RecvTs, RejectReason, Sequencer,
@@ -25,7 +26,7 @@ use crate::{
             KillSwitchAction,
         },
     },
-    io::{FramePollError, IoError, TcpFrameIo, TcpFramePublisher},
+    io::{Endpoint, FramePollError, IOConfig, IOPublisher, IORuntime, IoError},
     protocol::{
         ProtocolError,
         wire::control::{WireDecodeError, decode_control_request, encode_control_event},
@@ -37,21 +38,20 @@ use crate::{
 pub struct ControlConfig {
     /// Nanoseconds allowed between heartbeats. Zero disables heartbeat gating.
     pub heartbeat_timeout_ns: u64,
-    /// TCP address for the control listener.
-    pub bind_addr: String,
-    /// Maximum accepted SBE frame length including the SBE header.
-    pub max_frame_len: usize,
-    /// Maximum queued outbound bytes before disconnecting the active client.
-    pub max_pending_write_bytes: usize,
+    /// Endpoint IO backend.
+    pub io: IOConfig,
 }
 
 impl Default for ControlConfig {
     fn default() -> Self {
         Self {
             heartbeat_timeout_ns: 0,
-            bind_addr: "127.0.0.1:9001".to_owned(),
-            max_frame_len: 4096,
-            max_pending_write_bytes: 1 << 20,
+            io: IOConfig::Tcp {
+                bind_addr: "127.0.0.1:9001".to_owned(),
+                max_frame_len: 4096,
+                max_pending_write_bytes: 1 << 20,
+                record_path: None,
+            },
         }
     }
 }
@@ -63,7 +63,7 @@ impl Default for ControlConfig {
 /// taking ownership of the socket or allocating outbound frame storage.
 #[derive(Debug)]
 pub struct ControlPublisher<'a, 'b> {
-    io: &'a mut TcpFramePublisher<'b>,
+    io: &'a mut IOPublisher<'b>,
     encode_buf: &'a mut Vec<u8>,
 }
 
@@ -71,7 +71,7 @@ impl ControlPublisher<'_, '_> {
     /// Encode and publish one control event through the active control socket.
     ///
     /// The encoded bytes are valid only until the next publish because the
-    /// backing buffer is reused. `TcpFrameIo` copies those bytes into its
+    /// backing buffer is reused. `IORuntime` copies those bytes into its
     /// bounded write ring before this method returns.
     pub fn publish(&mut self, event: ControlEvent) -> Result<(), ControlError> {
         let written = encode_control_event(event, self.encode_buf)?;
@@ -80,7 +80,7 @@ impl ControlPublisher<'_, '_> {
     }
 }
 
-/// Live control-plane runtime.
+/// Control-plane runtime.
 ///
 /// This type owns the control listener, the reusable outbound encode buffer,
 /// and the operational state used by the order path. It does not own
@@ -88,22 +88,23 @@ impl ControlPublisher<'_, '_> {
 /// runtime callback during `poll`.
 #[derive(Debug)]
 pub struct ControlRuntime {
-    io: TcpFrameIo,
+    io: IORuntime,
     encode_buf: Vec<u8>,
     state: ControlState,
 }
 
 impl ControlRuntime {
-    /// Open the configured control listener and preallocate runtime buffers.
+    /// Open the configured control I/O and preallocate runtime buffers.
     ///
     /// All configurable transport bounds are applied here so the poll path only
     /// reads already-normalized state. The encode buffer is sized once from
     /// `max_frame_len` and reused for every control response.
     pub fn new(config: ControlConfig) -> Result<Self, ControlError> {
-        let io = TcpFrameIo::bind(&config.bind_addr, config.max_frame_len, config.max_pending_write_bytes)?;
+        let encode_len = config.io.frame_capacity();
+        let io = IORuntime::new(Endpoint::Control, config.io)?;
         Ok(Self {
             io,
-            encode_buf: vec![0_u8; config.max_frame_len],
+            encode_buf: vec![0_u8; encode_len],
             state: ControlState::new(config.heartbeat_timeout_ns),
         })
     }
@@ -119,7 +120,7 @@ impl ControlRuntime {
     /// The returned boolean means forward progress was made by the underlying
     /// transport or frame processing. It is deliberately not a count; callers
     /// should observe state or output streams for behavior-specific assertions.
-    pub fn poll<F>(&mut self, sequencer: &mut Sequencer, mut on_request: F) -> Result<bool, ControlError>
+    pub fn poll<F>(&mut self, mode: &mut Mode, sequencer: &mut Sequencer, mut on_request: F) -> Result<bool, ControlError>
     where
         F: FnMut(ControlRequest, &mut ControlPublisher<'_, '_>, &mut Sequencer) -> Result<(), ControlError>,
     {
@@ -131,7 +132,7 @@ impl ControlRuntime {
             on_request: &mut on_request,
             shutdown_seen: false,
         };
-        let io_progress = match io.poll(|io_publisher, recv_ts, bytes| session.on_frame(io_publisher, recv_ts, bytes)) {
+        let io_progress = match io.poll(mode, |io_publisher, recv_ts, bytes| session.on_frame(io_publisher, recv_ts, bytes)) {
             Ok(progress) => progress,
             Err(FramePollError::Io(error)) => return Err(error.into()),
             Err(FramePollError::Handler(error)) => return Err(error),
@@ -146,6 +147,10 @@ impl ControlRuntime {
     /// Cancels and mass cancels are intentionally not gated by this reason.
     pub fn reject_reason_for(&self, recv_ts: RecvTs) -> RejectReason {
         self.state.reject_reason_for(recv_ts)
+    }
+
+    pub fn replay_input_exhausted(&mut self) -> Result<bool, ControlError> {
+        self.io.replay_input_exhausted().map_err(ControlError::Io)
     }
 }
 
@@ -225,13 +230,13 @@ impl<F> ControlPollSession<'_, F>
 where
     F: FnMut(ControlRequest, &mut ControlPublisher<'_, '_>, &mut Sequencer) -> Result<(), ControlError>,
 {
-    /// Process one complete wire frame borrowed from `TcpFrameIo`.
+    /// Process one complete wire frame borrowed from `IORuntime`.
     ///
     /// This method is the per-frame hot path. It performs no allocation and
     /// does not retain `bytes`; decode errors are converted to protocol-error
     /// events immediately, while valid requests pass through state mutation and
     /// the runtime callback.
-    fn on_frame(&mut self, io_publisher: &mut TcpFramePublisher<'_>, recv_ts: RecvTs, bytes: &[u8]) -> Result<(), ControlError> {
+    fn on_frame(&mut self, io_publisher: &mut IOPublisher<'_>, recv_ts: RecvTs, bytes: &[u8]) -> Result<(), ControlError> {
         if self.shutdown_seen {
             // Shutdown is terminal for this poll batch. Frames already read
             // after it remain buffered by the transport state but produce no
@@ -372,7 +377,12 @@ mod tests {
     fn test_control_with_addr() -> Option<(ControlRuntime, SocketAddr)> {
         let bind_addr = reserve_loopback_addr()?;
         let config = ControlConfig {
-            bind_addr: bind_addr.to_string(),
+            io: IOConfig::Tcp {
+                bind_addr: bind_addr.to_string(),
+                max_frame_len: 4096,
+                max_pending_write_bytes: 1 << 20,
+                record_path: None,
+            },
             ..ControlConfig::default()
         };
         match ControlRuntime::new(config) {
@@ -419,9 +429,10 @@ mod tests {
 
     fn poll_until_request(control: &mut ControlRuntime, out: &mut Vec<ControlRequest>) {
         let mut sequencer = Sequencer::default();
+        let mut mode = crate::runtime::Mode::default();
         for _ in 0..100 {
             if control
-                .poll(&mut sequencer, |request, _, _| {
+                .poll(&mut mode, &mut sequencer, |request, _, _| {
                     out.push(request);
                     Ok(())
                 })
@@ -491,9 +502,10 @@ mod tests {
         assert_eq!(heartbeat.heartbeat_seq.raw(), 1);
         out.clear();
         let mut sequencer = Sequencer::default();
+        let mut mode = crate::runtime::Mode::default();
         assert!(
             !control
-                .poll(&mut sequencer, |request, _, _| {
+                .poll(&mut mode, &mut sequencer, |request, _, _| {
                     out.push(request);
                     Ok(())
                 })
@@ -509,11 +521,12 @@ mod tests {
         let mut client = TcpStream::connect(bind_addr).expect("connect");
         client.write_all(&new_order_frame()).expect("write");
         let mut sequencer = Sequencer::default();
+        let mut mode = crate::runtime::Mode::default();
         let mut requests = Vec::new();
 
         for _ in 0..100 {
             control
-                .poll(&mut sequencer, |request, _, _| {
+                .poll(&mut mode, &mut sequencer, |request, _, _| {
                     requests.push(request);
                     Ok(())
                 })
@@ -541,11 +554,12 @@ mod tests {
             .write_all(&kill_switch_frame(kill_switch_action::KillSwitchAction::HaltTrading))
             .expect("write");
         let mut sequencer = Sequencer::default();
+        let mut mode = crate::runtime::Mode::default();
         let mut requests = Vec::new();
 
         for _ in 0..100 {
             control
-                .poll(&mut sequencer, |request, _, _| {
+                .poll(&mut mode, &mut sequencer, |request, _, _| {
                     requests.push(request);
                     Ok(())
                 })

@@ -339,12 +339,7 @@ mod tests {
     }
 
     fn market_data_runtime() -> Option<MarketDataRuntime> {
-        match MarketDataRuntime::new(MarketDataFeedConfig {
-            bind_addr: "0.0.0.0:0".to_owned(),
-            group_addr: "239.255.0.1:9002".to_owned(),
-            multicast_loop_v4: true,
-            ..MarketDataFeedConfig::default()
-        }) {
+        match MarketDataRuntime::new(MarketDataFeedConfig::default()) {
             Ok(market_data) => Some(market_data),
             Err(crate::market_data::MarketDataError::Io(crate::io::IoError::Bind(error)))
                 if error.kind() == std::io::ErrorKind::PermissionDenied =>

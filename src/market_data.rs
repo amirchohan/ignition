@@ -13,44 +13,36 @@ use crate::{
             order::{OrderId, Side},
         },
     },
-    io::{IoError, UdpFramePublisher, UdpMulticastConfig},
+    io::{Endpoint, IOConfig, IORuntime, IoError},
     protocol::{ProtocolError, wire::trading::encode_market_data_event},
 };
 
 /// Market-data multicast feed configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarketDataFeedConfig {
-    /// Local UDP bind address.
-    pub bind_addr: String,
-    /// IPv4 multicast destination address.
-    pub group_addr: String,
-    /// IPv4 multicast TTL.
-    pub multicast_ttl: u32,
-    /// Whether multicast loopback is enabled.
-    pub multicast_loop_v4: bool,
-    /// Maximum encoded SBE datagram size.
-    pub max_datagram_len: usize,
-    /// Maximum queued encoded datagram bytes before reporting backpressure.
-    pub max_pending_datagram_bytes: usize,
+    /// Endpoint IO backend.
+    pub io: IOConfig,
 }
 
 impl Default for MarketDataFeedConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "0.0.0.0:0".to_owned(),
-            group_addr: "239.255.0.1:9002".to_owned(),
-            multicast_ttl: 1,
-            multicast_loop_v4: true,
-            max_datagram_len: 4096,
-            max_pending_datagram_bytes: 1 << 20,
+            io: IOConfig::Udp {
+                bind_addr: "0.0.0.0:0".to_owned(),
+                group_addr: "239.255.0.1:9002".to_owned(),
+                multicast_ttl: 1,
+                multicast_loop_v4: true,
+                max_datagram_len: 4096,
+                max_pending_datagram_bytes: 1 << 20,
+            },
         }
     }
 }
 
-/// Live multicast market-data feed runtime.
+/// Market-data feed runtime.
 #[derive(Debug)]
 pub struct MarketDataRuntime {
-    io: UdpFramePublisher,
+    io: IORuntime,
     encode_buf: Vec<u8>,
     sequencer: MarketDataSequencer,
     last_l1: Option<L1Update>,
@@ -61,15 +53,8 @@ pub struct MarketDataRuntime {
 impl MarketDataRuntime {
     /// Open the configured multicast publisher and preallocate encode buffers.
     pub fn new(config: MarketDataFeedConfig) -> Result<Self, MarketDataError> {
-        let encode_len = config.max_datagram_len;
-        let io = UdpFramePublisher::bind_multicast(UdpMulticastConfig {
-            bind_addr: config.bind_addr,
-            group_addr: config.group_addr,
-            multicast_ttl: config.multicast_ttl,
-            multicast_loop_v4: config.multicast_loop_v4,
-            max_datagram_len: config.max_datagram_len,
-            max_pending_datagram_bytes: config.max_pending_datagram_bytes,
-        })?;
+        let encode_len = config.io.frame_capacity();
+        let io = IORuntime::new(Endpoint::MarketData, config.io)?;
         Ok(Self {
             io,
             encode_buf: vec![0_u8; encode_len],
