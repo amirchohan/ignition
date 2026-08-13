@@ -5,7 +5,7 @@ mod commands;
 mod config;
 mod io;
 mod protocol;
-mod source;
+mod synthetic_traffic;
 mod tui;
 
 pub use config::TradingClientConfig;

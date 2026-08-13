@@ -85,7 +85,7 @@ impl IORuntime {
         };
 
         tracing::info!(
-            "{}Runtime started on ingress: {}. egress: {}. Recorder: {}",
+            "{}Runtime started. ingress: {} | egress: {}. Recorder: {}",
             endpoint.runtime_name(),
             startup_log.ingress,
             startup_log.egress,

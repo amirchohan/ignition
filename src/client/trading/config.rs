@@ -9,20 +9,10 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TradingClientConfig {
-    #[serde(default = "default_server_config_path")]
     pub server_config_path: String,
-    #[serde(default = "default_gateway_addr")]
     pub gateway_addr: String,
-    #[serde(default)]
     pub market_data: MarketDataClientConfig,
-    #[serde(default = "default_buy_account")]
-    pub default_buy_account: u32,
-    #[serde(default = "default_sell_account")]
-    pub default_sell_account: u32,
-    #[serde(default)]
-    pub traffic_source: TrafficSourceConfig,
-    #[serde(default)]
-    pub binance: BinanceConfig,
+    pub synthetic_traffic: SyntheticTrafficConfig,
 }
 
 impl TradingClientConfig {
@@ -40,64 +30,23 @@ impl TradingClientConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct MarketDataClientConfig {
-    #[serde(default = "default_md_bind_addr")]
     pub bind_addr: String,
-    #[serde(default = "default_md_group_addr")]
     pub group_addr: String,
 }
 
-impl Default for MarketDataClientConfig {
-    fn default() -> Self {
-        Self {
-            bind_addr: default_md_bind_addr(),
-            group_addr: default_md_group_addr(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct TrafficSourceConfig {
-    #[serde(default)]
-    pub kind: TrafficSourceKind,
-}
-
-impl Default for TrafficSourceConfig {
-    fn default() -> Self {
-        Self {
-            kind: TrafficSourceKind::Noop,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TrafficSourceKind {
-    #[default]
+#[serde(tag = "type")]
+pub enum SyntheticTrafficConfig {
     Noop,
-    Binance,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct BinanceConfig {
-    #[serde(default = "default_binance_symbol")]
-    pub symbol: String,
-    #[serde(default = "default_binance_levels")]
-    pub levels: usize,
-    #[serde(default = "default_binance_speed_ms")]
-    pub speed_ms: u64,
-    #[serde(default = "default_binance_reconnect_backoff_ms")]
-    pub reconnect_backoff_ms: u64,
-}
-
-impl Default for BinanceConfig {
-    fn default() -> Self {
-        Self {
-            symbol: default_binance_symbol(),
-            levels: default_binance_levels(),
-            speed_ms: default_binance_speed_ms(),
-            reconnect_backoff_ms: default_binance_reconnect_backoff_ms(),
-        }
-    }
+    Binance {
+        symbol: String,
+        levels: usize,
+        speed_ms: u64,
+        reconnect_backoff_ms: u64,
+        buys_account_id: u32,
+        sells_account_id: u32,
+    },
 }
 
 #[derive(Debug)]
@@ -119,42 +68,56 @@ impl std::fmt::Display for TradingClientConfigError {
 
 impl std::error::Error for TradingClientConfigError {}
 
-fn default_server_config_path() -> String {
-    "configs/server.yaml".to_owned()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn default_gateway_addr() -> String {
-    "127.0.0.1:19000".to_owned()
-}
+    #[test]
+    fn parses_binance_synthetic_traffic_config() {
+        let config = serde_yaml::from_str::<TradingClientConfig>(
+            r#"
+server_config_path: "configs/server.yaml"
+gateway_addr: "127.0.0.1:19000"
+market_data:
+  bind_addr: "0.0.0.0:19002"
+  group_addr: "239.255.0.1:19002"
+synthetic_traffic:
+  type: binance
+  symbol: "btcusdt"
+  levels: 20
+  speed_ms: 100
+  reconnect_backoff_ms: 1000
+  buys_account_id: 1
+  sells_account_id: 2
+"#,
+        )
+        .expect("config should parse");
 
-fn default_md_bind_addr() -> String {
-    "0.0.0.0:19002".to_owned()
-}
+        assert!(matches!(
+            config.synthetic_traffic,
+            SyntheticTrafficConfig::Binance {
+                buys_account_id: 1,
+                sells_account_id: 2,
+                ..
+            }
+        ));
+    }
 
-fn default_md_group_addr() -> String {
-    "239.255.0.1:19002".to_owned()
-}
+    #[test]
+    fn parses_noop_synthetic_traffic_config() {
+        let config = serde_yaml::from_str::<TradingClientConfig>(
+            r#"
+server_config_path: "configs/server.yaml"
+gateway_addr: "127.0.0.1:19000"
+market_data:
+  bind_addr: "0.0.0.0:19002"
+  group_addr: "239.255.0.1:19002"
+synthetic_traffic:
+  type: noop
+"#,
+        )
+        .expect("config should parse");
 
-const fn default_buy_account() -> u32 {
-    1
-}
-
-const fn default_sell_account() -> u32 {
-    2
-}
-
-fn default_binance_symbol() -> String {
-    "btcusdt".to_owned()
-}
-
-const fn default_binance_levels() -> usize {
-    20
-}
-
-const fn default_binance_speed_ms() -> u64 {
-    100
-}
-
-const fn default_binance_reconnect_backoff_ms() -> u64 {
-    1000
+        assert!(matches!(config.synthetic_traffic, SyntheticTrafficConfig::Noop));
+    }
 }

@@ -22,15 +22,10 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ServerConfig {
     pub reference_data: ReferenceDataConfig,
-    #[serde(default)]
     pub engine: EngineRuntimeConfig,
-    #[serde(default)]
     pub risk: RiskRuntimeConfig,
-    #[serde(default)]
     pub control: ControlRuntimeConfig,
-    #[serde(default)]
     pub gateway: GatewayRuntimeConfig,
-    #[serde(default)]
     pub market_data: MarketDataRuntimeConfig,
 }
 
@@ -117,19 +112,6 @@ pub struct EngineRuntimeConfig {
     pub max_active_pages: u32,
 }
 
-impl Default for EngineRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            storage_min_price: 1,
-            storage_max_price: 1_000_000,
-            page_size: 1024,
-            max_resting_orders: 16_384,
-            max_account_id: 65_535,
-            max_active_pages: 1024,
-        }
-    }
-}
-
 impl EngineRuntimeConfig {
     pub fn validate(self, instrument: &InstrumentSpec) -> DomainResult<EngineConfig> {
         EngineConfig::new(
@@ -153,17 +135,6 @@ pub struct RiskRuntimeConfig {
     pub price_band_bps: u32,
 }
 
-impl Default for RiskRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            max_open_orders_per_account: 1_000,
-            max_open_notional_per_account: 10_000_000_000_000_000,
-            startup_reference_price: 10_000_000,
-            price_band_bps: 1_000,
-        }
-    }
-}
-
 impl RiskRuntimeConfig {
     pub fn validate(self, instrument: &InstrumentSpec) -> DomainResult<RiskConfig> {
         RiskConfig::new(
@@ -178,174 +149,133 @@ impl RiskRuntimeConfig {
 /// Control-plane runtime configuration loaded from YAML.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ControlRuntimeConfig {
-    #[serde(default)]
     pub heartbeat_timeout_ns: u64,
-    #[serde(default = "default_control_bind_addr")]
-    pub bind_addr: String,
-    #[serde(default = "default_control_max_frame_len")]
-    pub max_frame_len: usize,
-    #[serde(default = "default_control_max_pending_write_bytes")]
-    pub max_pending_write_bytes: usize,
-}
-
-impl Default for ControlRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            heartbeat_timeout_ns: 0,
-            bind_addr: default_control_bind_addr(),
-            max_frame_len: default_control_max_frame_len(),
-            max_pending_write_bytes: default_control_max_pending_write_bytes(),
-        }
-    }
+    #[serde(flatten)]
+    pub backend: ControlBackendConfig,
 }
 
 impl ControlRuntimeConfig {
     pub fn validate(&self) -> ControlConfig {
         ControlConfig {
             heartbeat_timeout_ns: self.heartbeat_timeout_ns,
-            io: IOConfig::Tcp {
-                bind_addr: self.bind_addr.clone(),
-                max_frame_len: self.max_frame_len,
-                max_pending_write_bytes: self.max_pending_write_bytes,
-                record_path: None,
-            },
+            io: self.backend.validate(),
         }
     }
 }
 
-fn default_control_bind_addr() -> String {
-    "127.0.0.1:19001".to_owned()
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlBackendConfig {
+    Noop,
+    Tcp {
+        bind_addr: String,
+        max_frame_len: usize,
+        max_pending_write_bytes: usize,
+    },
 }
 
-const fn default_control_max_frame_len() -> usize {
-    4096
-}
-
-const fn default_control_max_pending_write_bytes() -> usize {
-    1 << 20
+impl ControlBackendConfig {
+    fn validate(&self) -> IOConfig {
+        match self {
+            Self::Noop => IOConfig::Noop,
+            Self::Tcp {
+                bind_addr,
+                max_frame_len,
+                max_pending_write_bytes,
+            } => IOConfig::Tcp {
+                bind_addr: bind_addr.clone(),
+                max_frame_len: *max_frame_len,
+                max_pending_write_bytes: *max_pending_write_bytes,
+                record_path: None,
+            },
+        }
+    }
 }
 
 /// Trading gateway runtime configuration loaded from YAML.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct GatewayRuntimeConfig {
-    #[serde(default = "default_gateway_bind_addr")]
-    pub bind_addr: String,
-    #[serde(default = "default_gateway_max_frame_len")]
-    pub max_frame_len: usize,
-    #[serde(default = "default_gateway_max_pending_write_bytes")]
-    pub max_pending_write_bytes: usize,
-    #[serde(default = "default_gateway_max_messages_per_poll")]
     pub max_messages_per_poll: usize,
-}
-
-impl Default for GatewayRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            bind_addr: default_gateway_bind_addr(),
-            max_frame_len: default_gateway_max_frame_len(),
-            max_pending_write_bytes: default_gateway_max_pending_write_bytes(),
-            max_messages_per_poll: default_gateway_max_messages_per_poll(),
-        }
-    }
+    #[serde(flatten)]
+    pub backend: GatewayBackendConfig,
 }
 
 impl GatewayRuntimeConfig {
     pub fn validate(&self) -> GatewayConfig {
         GatewayConfig {
-            io: IOConfig::Tcp {
-                bind_addr: self.bind_addr.clone(),
-                max_frame_len: self.max_frame_len,
-                max_pending_write_bytes: self.max_pending_write_bytes,
-                record_path: None,
-            },
+            io: self.backend.validate(),
             max_messages_per_poll: self.max_messages_per_poll,
         }
     }
 }
 
-fn default_gateway_bind_addr() -> String {
-    "127.0.0.1:19000".to_owned()
-}
-
-const fn default_gateway_max_frame_len() -> usize {
-    4096
-}
-
-const fn default_gateway_max_pending_write_bytes() -> usize {
-    1 << 20
-}
-
-const fn default_gateway_max_messages_per_poll() -> usize {
-    1024
-}
-
-/// Market-data multicast feed runtime configuration loaded from YAML.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct MarketDataRuntimeConfig {
-    #[serde(default = "default_market_data_bind_addr")]
-    pub bind_addr: String,
-    #[serde(default = "default_market_data_group_addr")]
-    pub group_addr: String,
-    #[serde(default = "default_market_data_multicast_ttl")]
-    pub multicast_ttl: u32,
-    #[serde(default = "default_market_data_multicast_loop_v4")]
-    pub multicast_loop_v4: bool,
-    #[serde(default = "default_market_data_max_datagram_len")]
-    pub max_datagram_len: usize,
-    #[serde(default = "default_market_data_max_pending_datagram_bytes")]
-    pub max_pending_datagram_bytes: usize,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum GatewayBackendConfig {
+    Noop,
+    Tcp {
+        bind_addr: String,
+        max_frame_len: usize,
+        max_pending_write_bytes: usize,
+    },
 }
 
-impl Default for MarketDataRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            bind_addr: default_market_data_bind_addr(),
-            group_addr: default_market_data_group_addr(),
-            multicast_ttl: default_market_data_multicast_ttl(),
-            multicast_loop_v4: default_market_data_multicast_loop_v4(),
-            max_datagram_len: default_market_data_max_datagram_len(),
-            max_pending_datagram_bytes: default_market_data_max_pending_datagram_bytes(),
-        }
-    }
-}
-
-impl MarketDataRuntimeConfig {
-    pub fn validate(&self) -> MarketDataFeedConfig {
-        MarketDataFeedConfig {
-            io: IOConfig::Udp {
-                bind_addr: self.bind_addr.clone(),
-                group_addr: self.group_addr.clone(),
-                multicast_ttl: self.multicast_ttl,
-                multicast_loop_v4: self.multicast_loop_v4,
-                max_datagram_len: self.max_datagram_len,
-                max_pending_datagram_bytes: self.max_pending_datagram_bytes,
+impl GatewayBackendConfig {
+    fn validate(&self) -> IOConfig {
+        match self {
+            Self::Noop => IOConfig::Noop,
+            Self::Tcp {
+                bind_addr,
+                max_frame_len,
+                max_pending_write_bytes,
+            } => IOConfig::Tcp {
+                bind_addr: bind_addr.clone(),
+                max_frame_len: *max_frame_len,
+                max_pending_write_bytes: *max_pending_write_bytes,
+                record_path: None,
             },
         }
     }
 }
 
-fn default_market_data_bind_addr() -> String {
-    "0.0.0.0:0".to_owned()
+/// Market-data multicast feed runtime configuration loaded from YAML.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MarketDataRuntimeConfig {
+    Noop,
+    Udp {
+        bind_addr: String,
+        group_addr: String,
+        multicast_ttl: u32,
+        multicast_loop_v4: bool,
+        max_datagram_len: usize,
+        max_pending_datagram_bytes: usize,
+    },
 }
 
-fn default_market_data_group_addr() -> String {
-    "239.255.0.1:19002".to_owned()
-}
-
-const fn default_market_data_multicast_ttl() -> u32 {
-    1
-}
-
-const fn default_market_data_multicast_loop_v4() -> bool {
-    true
-}
-
-const fn default_market_data_max_datagram_len() -> usize {
-    4096
-}
-
-const fn default_market_data_max_pending_datagram_bytes() -> usize {
-    1 << 20
+impl MarketDataRuntimeConfig {
+    pub fn validate(&self) -> MarketDataFeedConfig {
+        MarketDataFeedConfig {
+            io: match self {
+                Self::Noop => IOConfig::Noop,
+                Self::Udp {
+                    bind_addr,
+                    group_addr,
+                    multicast_ttl,
+                    multicast_loop_v4,
+                    max_datagram_len,
+                    max_pending_datagram_bytes,
+                } => IOConfig::Udp {
+                    bind_addr: bind_addr.clone(),
+                    group_addr: group_addr.clone(),
+                    multicast_ttl: *multicast_ttl,
+                    multicast_loop_v4: *multicast_loop_v4,
+                    max_datagram_len: *max_datagram_len,
+                    max_pending_datagram_bytes: *max_pending_datagram_bytes,
+                },
+            },
+        }
+    }
 }
 
 /// Config load/parse/validation errors.
@@ -364,9 +294,50 @@ mod tests {
         serde_yaml::from_str(input).expect("config should parse")
     }
 
+    fn parse_with_required_defaults(input: &str) -> ServerConfig {
+        parse(&format!("{input}{}", required_non_target_config()))
+    }
+
+    fn required_non_target_config() -> &'static str {
+        r#"
+engine:
+  storage_min_price: 1
+  storage_max_price: 1000000
+  page_size: 1024
+  max_resting_orders: 16384
+  max_account_id: 65535
+  max_active_pages: 1024
+risk:
+  max_open_orders_per_account: 1000
+  max_open_notional_per_account: 10000000000000000
+  startup_reference_price: 10000000
+  price_band_bps: 1000
+control:
+  type: tcp
+  bind_addr: "127.0.0.1:19001"
+  heartbeat_timeout_ns: 0
+  max_frame_len: 4096
+  max_pending_write_bytes: 1048576
+gateway:
+  type: tcp
+  bind_addr: "127.0.0.1:19000"
+  max_frame_len: 4096
+  max_pending_write_bytes: 1048576
+  max_messages_per_poll: 1024
+market_data:
+  type: udp
+  bind_addr: "0.0.0.0:0"
+  group_addr: "239.255.0.1:19002"
+  multicast_ttl: 1
+  multicast_loop_v4: true
+  max_datagram_len: 4096
+  max_pending_datagram_bytes: 1048576
+"#
+    }
+
     #[test]
     fn parses_and_validates_reference_data() {
-        let config = parse(
+        let config = parse_with_required_defaults(
             r#"
 reference_data:
   instrument:
@@ -394,7 +365,7 @@ reference_data:
 
     #[test]
     fn rejects_invalid_reference_data() {
-        let config = parse(
+        let config = parse_with_required_defaults(
             r#"
 reference_data:
   instrument:
@@ -413,8 +384,7 @@ reference_data:
 
     #[test]
     fn rejects_reference_data_ids_that_exceed_u16() {
-        let error = serde_yaml::from_str::<ServerConfig>(
-            r#"
+        let mut yaml = r#"
 reference_data:
   instrument:
     instrument_id: 65536
@@ -424,11 +394,32 @@ reference_data:
     qty_decimals: 8
     price_tick: 1
     qty_lot: 1
-"#,
-        )
-        .expect_err("instrument id should exceed u16");
+"#
+        .to_owned();
+        yaml.push_str(required_non_target_config());
+        let error = serde_yaml::from_str::<ServerConfig>(&yaml).expect_err("instrument id should exceed u16");
 
         assert!(error.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn rejects_missing_runtime_config_sections() {
+        let error = serde_yaml::from_str::<ServerConfig>(
+            r#"
+reference_data:
+  instrument:
+    instrument_id: 1001
+    base_asset_id: 1
+    quote_asset_id: 2
+    price_decimals: 2
+    qty_decimals: 8
+    price_tick: 1
+    qty_lot: 1
+"#,
+        )
+        .expect_err("runtime config sections should be required");
+
+        assert!(error.to_string().contains("missing field"));
     }
 
     #[test]
@@ -451,6 +442,31 @@ engine:
   max_resting_orders: 100
   max_account_id: 1000
   max_active_pages: 10
+risk:
+  max_open_orders_per_account: 1000
+  max_open_notional_per_account: 10000000000000000
+  startup_reference_price: 100
+  price_band_bps: 1000
+control:
+  type: tcp
+  bind_addr: "127.0.0.1:19001"
+  heartbeat_timeout_ns: 0
+  max_frame_len: 4096
+  max_pending_write_bytes: 1048576
+gateway:
+  type: tcp
+  bind_addr: "127.0.0.1:19000"
+  max_frame_len: 4096
+  max_pending_write_bytes: 1048576
+  max_messages_per_poll: 1024
+market_data:
+  type: udp
+  bind_addr: "0.0.0.0:0"
+  group_addr: "239.255.0.1:19002"
+  multicast_ttl: 1
+  multicast_loop_v4: true
+  max_datagram_len: 4096
+  max_pending_datagram_bytes: 1048576
 "#,
         );
 
@@ -474,11 +490,38 @@ reference_data:
     qty_decimals: 8
     price_tick: 1
     qty_lot: 1
+engine:
+  storage_min_price: 1
+  storage_max_price: 1000000
+  page_size: 1024
+  max_resting_orders: 16384
+  max_account_id: 65535
+  max_active_pages: 1024
+risk:
+  max_open_orders_per_account: 1000
+  max_open_notional_per_account: 10000000000000000
+  startup_reference_price: 10000000
+  price_band_bps: 1000
 control:
+  type: tcp
   bind_addr: "127.0.0.1:9011"
   heartbeat_timeout_ns: 500
   max_frame_len: 8192
   max_pending_write_bytes: 16384
+gateway:
+  type: tcp
+  bind_addr: "127.0.0.1:19000"
+  max_frame_len: 4096
+  max_pending_write_bytes: 1048576
+  max_messages_per_poll: 1024
+market_data:
+  type: udp
+  bind_addr: "0.0.0.0:0"
+  group_addr: "239.255.0.1:19002"
+  multicast_ttl: 1
+  multicast_loop_v4: true
+  max_datagram_len: 4096
+  max_pending_datagram_bytes: 1048576
 "#,
         );
 
@@ -512,11 +555,38 @@ reference_data:
     qty_decimals: 8
     price_tick: 1
     qty_lot: 1
+engine:
+  storage_min_price: 1
+  storage_max_price: 1000000
+  page_size: 1024
+  max_resting_orders: 16384
+  max_account_id: 65535
+  max_active_pages: 1024
+risk:
+  max_open_orders_per_account: 1000
+  max_open_notional_per_account: 10000000000000000
+  startup_reference_price: 10000000
+  price_band_bps: 1000
+control:
+  type: tcp
+  bind_addr: "127.0.0.1:19001"
+  heartbeat_timeout_ns: 0
+  max_frame_len: 4096
+  max_pending_write_bytes: 1048576
 gateway:
+  type: tcp
   bind_addr: "127.0.0.1:9010"
   max_frame_len: 8192
   max_pending_write_bytes: 32768
   max_messages_per_poll: 64
+market_data:
+  type: udp
+  bind_addr: "0.0.0.0:0"
+  group_addr: "239.255.0.1:19002"
+  multicast_ttl: 1
+  multicast_loop_v4: true
+  max_datagram_len: 4096
+  max_pending_datagram_bytes: 1048576
 "#,
         );
 
@@ -535,5 +605,46 @@ gateway:
         assert_eq!(max_pending_write_bytes, 32768);
         assert_eq!(record_path, None);
         assert_eq!(gateway.max_messages_per_poll, 64);
+    }
+
+    #[test]
+    fn parses_noop_endpoint_backend_types() {
+        let config = parse(
+            r#"
+reference_data:
+  instrument:
+    instrument_id: 1001
+    base_asset_id: 1
+    quote_asset_id: 2
+    price_decimals: 2
+    qty_decimals: 8
+    price_tick: 1
+    qty_lot: 1
+engine:
+  storage_min_price: 1
+  storage_max_price: 1000000
+  page_size: 1024
+  max_resting_orders: 16384
+  max_account_id: 65535
+  max_active_pages: 1024
+risk:
+  max_open_orders_per_account: 1000
+  max_open_notional_per_account: 10000000000000000
+  startup_reference_price: 10000000
+  price_band_bps: 1000
+control:
+  type: noop
+  heartbeat_timeout_ns: 0
+gateway:
+  type: noop
+  max_messages_per_poll: 1024
+market_data:
+  type: noop
+"#,
+        );
+
+        assert!(matches!(config.validate_control().io, IOConfig::Noop));
+        assert!(matches!(config.validate_gateway().io, IOConfig::Noop));
+        assert!(matches!(config.validate_market_data().io, IOConfig::Noop));
     }
 }

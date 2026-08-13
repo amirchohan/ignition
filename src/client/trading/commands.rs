@@ -24,8 +24,6 @@ impl ClientIdSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandContext {
-    pub default_buy_account: u32,
-    pub default_sell_account: u32,
     pub instrument: InstrumentSpec,
 }
 
@@ -86,8 +84,8 @@ fn parse_limit(
     context: CommandContext,
     ids: &mut ClientIdSource,
 ) -> Result<ClientOrderFrame, CommandParseError> {
-    if !(3..=5).contains(&parts.len()) {
-        return Err(CommandParseError::Usage("buy|sell <price> <qty> [gtc|ioc|post] [account]"));
+    if !(4..=5).contains(&parts.len()) {
+        return Err(CommandParseError::Usage("buy|sell <price> <qty> [gtc|ioc|post] <account>"));
     }
     let price = match side {
         Side::Buy => scale_decimal_floor(parts[1], context.instrument.price_decimals, context.instrument.price_tick)?,
@@ -97,8 +95,11 @@ fn parse_limit(
     if price == 0 || qty == 0 {
         return Err(CommandParseError::InvalidScalar);
     }
-    let tif = parts.get(3).map_or(Ok(TimeInForce::Gtc), |value| parse_tif(value))?;
-    let account_id = parts.get(4).map_or(Ok(default_account(side, context)), |value| parse_u32(value))?;
+    let (tif, account_id) = match parts.len() {
+        4 => (TimeInForce::Gtc, parse_u32(parts[3])?),
+        5 => (parse_tif(parts[3])?, parse_u32(parts[4])?),
+        _ => unreachable!("limit command length checked"),
+    };
     Ok(ClientOrderFrame::New(ClientNewOrder {
         client_order_id: ids.next(),
         account_id,
@@ -112,15 +113,15 @@ fn parse_limit(
 }
 
 fn parse_market(parts: &[&str], context: CommandContext, ids: &mut ClientIdSource) -> Result<ClientOrderFrame, CommandParseError> {
-    if !(3..=4).contains(&parts.len()) {
-        return Err(CommandParseError::Usage("market buy|sell <qty> [account]"));
+    if parts.len() != 4 {
+        return Err(CommandParseError::Usage("market buy|sell <qty> <account>"));
     }
     let side = parse_side(parts[1])?;
     let qty = scale_decimal_floor(parts[2], context.instrument.qty_decimals, context.instrument.qty_lot)?;
     if qty == 0 {
         return Err(CommandParseError::InvalidScalar);
     }
-    let account_id = parts.get(3).map_or(Ok(default_account(side, context)), |value| parse_u32(value))?;
+    let account_id = parse_u32(parts[3])?;
     Ok(ClientOrderFrame::New(ClientNewOrder {
         client_order_id: ids.next(),
         account_id,
@@ -133,12 +134,12 @@ fn parse_market(parts: &[&str], context: CommandContext, ids: &mut ClientIdSourc
     }))
 }
 
-fn parse_cancel(parts: &[&str], context: CommandContext, ids: &mut ClientIdSource) -> Result<ClientOrderFrame, CommandParseError> {
-    if !(2..=3).contains(&parts.len()) {
-        return Err(CommandParseError::Usage("cancel <orig_order_id> [account]"));
+fn parse_cancel(parts: &[&str], _context: CommandContext, ids: &mut ClientIdSource) -> Result<ClientOrderFrame, CommandParseError> {
+    if parts.len() != 3 {
+        return Err(CommandParseError::Usage("cancel <orig_order_id> <account>"));
     }
     let orig_client_order_id = parse_u64(parts[1])?;
-    let account_id = parts.get(2).map_or(Ok(context.default_buy_account), |value| parse_u32(value))?;
+    let account_id = parse_u32(parts[2])?;
     Ok(ClientOrderFrame::Cancel(ClientCancelOrder {
         client_order_id: ids.next(),
         account_id,
@@ -148,8 +149,8 @@ fn parse_cancel(parts: &[&str], context: CommandContext, ids: &mut ClientIdSourc
 }
 
 fn parse_replace(parts: &[&str], context: CommandContext, ids: &mut ClientIdSource) -> Result<ClientOrderFrame, CommandParseError> {
-    if !(4..=5).contains(&parts.len()) {
-        return Err(CommandParseError::Usage("replace <orig_order_id> <price> <qty> [account]"));
+    if parts.len() != 5 {
+        return Err(CommandParseError::Usage("replace <orig_order_id> <price> <qty> <account>"));
     }
     let orig_client_order_id = parse_u64(parts[1])?;
     let price = scale_decimal_floor(parts[2], context.instrument.price_decimals, context.instrument.price_tick)?;
@@ -157,7 +158,7 @@ fn parse_replace(parts: &[&str], context: CommandContext, ids: &mut ClientIdSour
     if price == 0 || qty == 0 {
         return Err(CommandParseError::InvalidScalar);
     }
-    let account_id = parts.get(4).map_or(Ok(context.default_buy_account), |value| parse_u32(value))?;
+    let account_id = parse_u32(parts[4])?;
     Ok(ClientOrderFrame::Replace(ClientCancelReplace {
         client_order_id: ids.next(),
         account_id,
@@ -193,13 +194,6 @@ fn parse_side(input: &str) -> Result<Side, CommandParseError> {
         "buy" => Ok(Side::Buy),
         "sell" => Ok(Side::Sell),
         _ => Err(CommandParseError::InvalidSide),
-    }
-}
-
-fn default_account(side: Side, context: CommandContext) -> u32 {
-    match side {
-        Side::Buy => context.default_buy_account,
-        Side::Sell => context.default_sell_account,
     }
 }
 
@@ -260,11 +254,7 @@ mod tests {
     }
 
     fn context() -> CommandContext {
-        CommandContext {
-            default_buy_account: 1,
-            default_sell_account: 2,
-            instrument: instrument(),
-        }
+        CommandContext { instrument: instrument() }
     }
 
     #[test]
@@ -275,9 +265,9 @@ mod tests {
     }
 
     #[test]
-    fn parses_limit_command_with_default_side_account() {
+    fn parses_limit_command_with_explicit_account() {
         let mut ids = ClientIdSource::new(1);
-        let frame = parse_command("buy 100000.00 0.25 post", context(), &mut ids)
+        let frame = parse_command("buy 100000.00 0.25 post 1", context(), &mut ids)
             .expect("parse")
             .expect("frame");
 

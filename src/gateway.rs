@@ -49,20 +49,6 @@ pub struct GatewayConfig {
     pub max_messages_per_poll: usize,
 }
 
-impl Default for GatewayConfig {
-    fn default() -> Self {
-        Self {
-            io: IOConfig::Tcp {
-                bind_addr: "127.0.0.1:19000".to_owned(),
-                max_frame_len: 4096,
-                max_pending_write_bytes: 1 << 20,
-                record_path: None,
-            },
-            max_messages_per_poll: 1024,
-        }
-    }
-}
-
 /// Borrowed trading egress handle for the current order-entry callback.
 ///
 /// `GatewayPublisher` reuses `GatewayRuntime`'s encode buffer and the active
@@ -404,7 +390,7 @@ mod tests {
                 max_pending_write_bytes: 1 << 20,
                 record_path: None,
             },
-            ..GatewayConfig::default()
+            max_messages_per_poll: 1024,
         };
         match GatewayRuntime::new(config, instrument()) {
             Ok(gateway) => Some((gateway, bind_addr)),

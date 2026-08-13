@@ -20,16 +20,22 @@ risk:
   startup_reference_price: 7000000 # $70,000.00 with price_decimals=2
   price_band_bps: 1000 # +/-10%
 control:
+  # type: noop
+  type: tcp
   bind_addr: "127.0.0.1:19001"
   heartbeat_timeout_ns: 0 # disabled by default
   max_frame_len: 4096
   max_pending_write_bytes: 1048576
 gateway:
+  # type: noop
+  type: tcp
   bind_addr: "127.0.0.1:19000"
   max_frame_len: 4096
   max_pending_write_bytes: 1048576
   max_messages_per_poll: 1024
 market_data:
+  # type: noop
+  type: udp
   bind_addr: "0.0.0.0:0"
   group_addr: "239.255.0.1:19002"
   multicast_ttl: 1

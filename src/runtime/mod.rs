@@ -360,7 +360,7 @@ mod tests {
                     max_pending_write_bytes: 1 << 20,
                     record_path: None,
                 },
-                ..crate::gateway::GatewayConfig::default()
+                max_messages_per_poll: 1024,
             },
             instrument(),
         ) {
@@ -389,7 +389,7 @@ mod tests {
                 max_pending_write_bytes: 1 << 20,
                 record_path: None,
             },
-            ..crate::gateway::GatewayConfig::default()
+            max_messages_per_poll: 1024,
         };
         let gateway = match GatewayRuntime::new(gateway_config, instrument()) {
             Ok(gateway) => gateway,
@@ -409,18 +409,18 @@ mod tests {
 
     fn control_config() -> ControlConfig {
         ControlConfig {
+            heartbeat_timeout_ns: 0,
             io: IOConfig::Tcp {
                 bind_addr: "127.0.0.1:0".to_owned(),
                 max_frame_len: 4096,
                 max_pending_write_bytes: 1 << 20,
                 record_path: None,
             },
-            ..ControlConfig::default()
         }
     }
 
     fn new_market_data() -> Option<MarketDataRuntime> {
-        match MarketDataRuntime::new(MarketDataFeedConfig::default()) {
+        match MarketDataRuntime::new(market_data_config()) {
             Ok(feed) => Some(feed),
             Err(crate::market_data::MarketDataError::Io(crate::io::IoError::Bind(error)))
                 if error.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -428,6 +428,19 @@ mod tests {
                 None
             }
             Err(error) => panic!("market-data feed: {error:?}"),
+        }
+    }
+
+    fn market_data_config() -> MarketDataFeedConfig {
+        MarketDataFeedConfig {
+            io: IOConfig::Udp {
+                bind_addr: "0.0.0.0:0".to_owned(),
+                group_addr: "239.255.0.1:19002".to_owned(),
+                multicast_ttl: 1,
+                multicast_loop_v4: true,
+                max_datagram_len: 4096,
+                max_pending_datagram_bytes: 1 << 20,
+            },
         }
     }
 
@@ -472,13 +485,13 @@ mod tests {
     ) -> Option<(Runtime, TcpStream, TcpStream)> {
         let bind_addr = reserve_loopback_addr()?;
         let control = new_control_with_config(ControlConfig {
+            heartbeat_timeout_ns: 0,
             io: IOConfig::Tcp {
                 bind_addr: bind_addr.to_string(),
                 max_frame_len: 4096,
                 max_pending_write_bytes: 1 << 20,
                 record_path: None,
             },
-            ..ControlConfig::default()
         })?;
         let client = TcpStream::connect(bind_addr).expect("connect");
         client.set_read_timeout(Some(Duration::from_secs(1))).expect("timeout");
@@ -928,12 +941,12 @@ mod tests {
     fn empty_replay_with_file_market_data_output_drains_without_progress() {
         let market_data_path = temp_path("replay-market-data-output");
         let control = ControlRuntime::new(ControlConfig {
+            heartbeat_timeout_ns: 0,
             io: IOConfig::File {
                 input_path: None,
                 output_path: None,
                 max_frame_len: 4096,
             },
-            ..ControlConfig::default()
         })
         .expect("control");
         let gateway = GatewayRuntime::new(
@@ -943,7 +956,7 @@ mod tests {
                     output_path: None,
                     max_frame_len: 4096,
                 },
-                ..crate::gateway::GatewayConfig::default()
+                max_messages_per_poll: 1024,
             },
             instrument(),
         )

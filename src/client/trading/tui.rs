@@ -23,30 +23,30 @@ use crate::{domain::rd::InstrumentSpec, protocol::generated::codecs::book_side};
 
 use super::{
     commands::{ClientIdSource, CommandContext, format_scaled, parse_command},
-    config::{TradingClientConfig, TradingClientConfigError, TrafficSourceKind},
+    config::{SyntheticTrafficConfig, TradingClientConfig, TradingClientConfigError},
     io::{GatewayClient, MarketDataClient, TradingClientIoError},
     protocol::{ClientExecutionReport, ClientInboundEvent, ClientOrderFrame, ClientTradePrint},
-    source::TrafficSource,
+    synthetic_traffic::SyntheticTraffic,
 };
 
 pub fn run_trading_client(config: TradingClientConfig) -> Result<(), TradingClientError> {
     let instrument = config.instrument().map_err(TradingClientError::ServerConfig)?;
     let mut gateway = GatewayClient::connect(&config.gateway_addr)?;
     let mut market_data = MarketDataClient::bind(&config.market_data.bind_addr, &config.market_data.group_addr)?;
-    let source_rx = spawn_source(&config, instrument);
+    let synthetic_traffic_rx = spawn_synthetic_traffic(&config, instrument);
 
     let mut terminal = TerminalGuard::enter()?;
     let mut app = TradingClientApp::new(config, instrument);
     let mut events = Vec::with_capacity(256);
-    let mut pending_source = Vec::with_capacity(64);
+    let mut pending_synthetic_traffic = Vec::with_capacity(64);
     let tick = Duration::from_millis(25);
     let mut last_draw = Instant::now();
 
     loop {
-        drain_source(&source_rx, &mut pending_source, &mut app);
-        for frame in pending_source.drain(..) {
+        drain_synthetic_traffic(&synthetic_traffic_rx, &mut pending_synthetic_traffic, &mut app);
+        for frame in pending_synthetic_traffic.drain(..) {
             if let Err(error) = gateway.send(frame) {
-                app.push_status(format!("source send failed: {error}"));
+                app.push_status(format!("synthetic traffic send failed: {error}"));
             }
         }
 
@@ -81,7 +81,6 @@ pub fn run_trading_client(config: TradingClientConfig) -> Result<(), TradingClie
 
 #[derive(Debug)]
 struct TradingClientApp {
-    config: TradingClientConfig,
     instrument: InstrumentSpec,
     input: String,
     statuses: VecDeque<String>,
@@ -94,17 +93,16 @@ struct TradingClientApp {
     asks: BTreeMap<u64, u64>,
     l1: Option<(u64, u64, u64, u64)>,
     ids: ClientIdSource,
-    source_status: String,
+    synthetic_traffic_status: String,
 }
 
 impl TradingClientApp {
     fn new(config: TradingClientConfig, instrument: InstrumentSpec) -> Self {
-        let source_status = match config.traffic_source.kind {
-            TrafficSourceKind::Noop => "source noop".to_owned(),
-            TrafficSourceKind::Binance => "binance starting".to_owned(),
+        let synthetic_traffic_status = match config.synthetic_traffic {
+            SyntheticTrafficConfig::Noop => "synthetic traffic noop".to_owned(),
+            SyntheticTrafficConfig::Binance { .. } => "binance starting".to_owned(),
         };
         Self {
-            config,
             instrument,
             input: String::new(),
             statuses: VecDeque::with_capacity(64),
@@ -117,7 +115,7 @@ impl TradingClientApp {
             asks: BTreeMap::new(),
             l1: None,
             ids: ClientIdSource::new(1),
-            source_status,
+            synthetic_traffic_status,
         }
     }
 
@@ -140,8 +138,6 @@ impl TradingClientApp {
                     return Ok(false);
                 }
                 let context = CommandContext {
-                    default_buy_account: self.config.default_buy_account,
-                    default_sell_account: self.config.default_sell_account,
                     instrument: self.instrument,
                 };
                 match parse_command(&command, context, &mut self.ids) {
@@ -273,7 +269,7 @@ fn draw_status(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TradingClientAp
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::raw(app.source_status.as_str()),
+        Span::raw(app.synthetic_traffic_status.as_str()),
         Span::raw("  "),
         Span::raw(l1),
         Span::raw("  "),
@@ -408,11 +404,11 @@ fn draw_status_log(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TradingClie
 
 fn draw_commands(frame: &mut ratatui::Frame<'_>, area: Rect) {
     let commands = [
-        "buy <price> <qty> [gtc|ioc|post] [account]",
-        "sell <price> <qty> [gtc|ioc|post] [account]",
-        "market buy|sell <qty> [account]",
-        "cancel <orig_order_id> [account]",
-        "replace <orig_order_id> <price> <qty> [account]",
+        "buy <price> <qty> [gtc|ioc|post] <account>",
+        "sell <price> <qty> [gtc|ioc|post] <account>",
+        "market buy|sell <qty> <account>",
+        "cancel <orig_order_id> <account>",
+        "replace <orig_order_id> <price> <qty> <account>",
         "mass-cancel <account>",
     ]
     .join("\n");
@@ -448,29 +444,26 @@ fn display_qty(app: &TradingClientApp, raw: u64) -> String {
     }
 }
 
-fn spawn_source(config: &TradingClientConfig, instrument: InstrumentSpec) -> Option<Receiver<SourceMessage>> {
-    if config.traffic_source.kind == TrafficSourceKind::Noop {
+fn spawn_synthetic_traffic(config: &TradingClientConfig, instrument: InstrumentSpec) -> Option<Receiver<SyntheticTrafficMessage>> {
+    if matches!(config.synthetic_traffic, SyntheticTrafficConfig::Noop) {
         return None;
     }
 
-    let source = TrafficSource::new(
-        config.traffic_source.kind,
-        config.binance.clone(),
-        instrument,
-        config.default_buy_account,
-        config.default_sell_account,
-    );
+    let synthetic_traffic = SyntheticTraffic::new(config.synthetic_traffic.clone(), instrument);
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut source = source;
+        let mut synthetic_traffic = synthetic_traffic;
         let mut frames = Vec::with_capacity(64);
         loop {
             frames.clear();
-            source.poll(&mut frames);
-            if tx.send(SourceMessage::Status(source.status().to_owned())).is_err() {
+            synthetic_traffic.poll(&mut frames);
+            if tx
+                .send(SyntheticTrafficMessage::Status(synthetic_traffic.status().to_owned()))
+                .is_err()
+            {
                 return;
             }
-            if !frames.is_empty() && tx.send(SourceMessage::Frames(frames.clone())).is_err() {
+            if !frames.is_empty() && tx.send(SyntheticTrafficMessage::Frames(frames.clone())).is_err() {
                 return;
             }
             thread::sleep(Duration::from_millis(10));
@@ -479,20 +472,20 @@ fn spawn_source(config: &TradingClientConfig, instrument: InstrumentSpec) -> Opt
     Some(rx)
 }
 
-fn drain_source(rx: &Option<Receiver<SourceMessage>>, out: &mut Vec<ClientOrderFrame>, app: &mut TradingClientApp) {
+fn drain_synthetic_traffic(rx: &Option<Receiver<SyntheticTrafficMessage>>, out: &mut Vec<ClientOrderFrame>, app: &mut TradingClientApp) {
     let Some(rx) = rx else {
         return;
     };
     while let Ok(message) = rx.try_recv() {
         match message {
-            SourceMessage::Status(status) => app.source_status = status,
-            SourceMessage::Frames(mut frames) => out.append(&mut frames),
+            SyntheticTrafficMessage::Status(status) => app.synthetic_traffic_status = status,
+            SyntheticTrafficMessage::Frames(mut frames) => out.append(&mut frames),
         }
     }
 }
 
 #[derive(Debug, Clone)]
-enum SourceMessage {
+enum SyntheticTrafficMessage {
     Status(String),
     Frames(Vec<ClientOrderFrame>),
 }

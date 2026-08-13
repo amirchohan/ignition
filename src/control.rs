@@ -42,19 +42,6 @@ pub struct ControlConfig {
     pub io: IOConfig,
 }
 
-impl Default for ControlConfig {
-    fn default() -> Self {
-        Self {
-            heartbeat_timeout_ns: 0,
-            io: IOConfig::Tcp {
-                bind_addr: "127.0.0.1:19001".to_owned(),
-                max_frame_len: 4096,
-                max_pending_write_bytes: 1 << 20,
-                record_path: None,
-            },
-        }
-    }
-}
 /// Borrowed control egress handle for the current poll callback.
 ///
 /// `ControlPublisher` reuses `ControlRuntime`'s encode buffer and the active
@@ -251,6 +238,7 @@ where
         };
         match decoded {
             Ok(request) => {
+                log_control_request(request);
                 let shutdown = Self::apply_request(self.state, self.sequencer, request, &mut publisher)?;
                 // Runtime owns engine-dependent side effects such as snapshots
                 // and shutdown drains, so it observes every valid request
@@ -323,6 +311,29 @@ where
     }
 }
 
+fn log_control_request(request: ControlRequest) {
+    match request {
+        ControlRequest::KillSwitch(request) => {
+            tracing::info!(
+                target: "control",
+                request_id = request.request_id.raw(),
+                recv_ts = request.recv_ts.raw(),
+                action = ?request.action,
+                "control request"
+            );
+        }
+        ControlRequest::Snapshot(request) => {
+            tracing::info!(
+                target: "control",
+                request_id = request.request_id.raw(),
+                recv_ts = request.recv_ts.raw(),
+                "control snapshot request"
+            );
+        }
+        ControlRequest::Heartbeat(_) => {}
+    }
+}
+
 /// Control runtime failure.
 #[derive(Debug)]
 pub enum ControlError {
@@ -377,13 +388,13 @@ mod tests {
     fn test_control_with_addr() -> Option<(ControlRuntime, SocketAddr)> {
         let bind_addr = reserve_loopback_addr()?;
         let config = ControlConfig {
+            heartbeat_timeout_ns: 0,
             io: IOConfig::Tcp {
                 bind_addr: bind_addr.to_string(),
                 max_frame_len: 4096,
                 max_pending_write_bytes: 1 << 20,
                 record_path: None,
             },
-            ..ControlConfig::default()
         };
         match ControlRuntime::new(config) {
             Ok(control) => Some((control, bind_addr)),

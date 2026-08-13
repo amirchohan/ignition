@@ -10,13 +10,15 @@ use crate::{
 
 use super::{
     commands::{ClientIdSource, scale_decimal_ceil, scale_decimal_floor},
-    config::BinanceConfig,
     protocol::{ClientCancelOrder, ClientCancelReplace, ClientNewOrder, ClientOrderFrame},
 };
 
 #[derive(Debug)]
 pub struct BinanceDepthSource {
-    config: BinanceConfig,
+    symbol: String,
+    levels_count: usize,
+    speed_ms: u64,
+    reconnect_backoff_ms: u64,
     instrument: InstrumentSpec,
     buy_account: u32,
     sell_account: u32,
@@ -27,9 +29,20 @@ pub struct BinanceDepthSource {
 }
 
 impl BinanceDepthSource {
-    pub fn new(config: BinanceConfig, instrument: InstrumentSpec, buy_account: u32, sell_account: u32) -> Self {
+    pub fn new(
+        symbol: String,
+        levels_count: usize,
+        speed_ms: u64,
+        reconnect_backoff_ms: u64,
+        instrument: InstrumentSpec,
+        buy_account: u32,
+        sell_account: u32,
+    ) -> Self {
         Self {
-            config,
+            symbol,
+            levels_count,
+            speed_ms,
+            reconnect_backoff_ms,
             instrument,
             buy_account,
             sell_account,
@@ -69,19 +82,19 @@ impl BinanceDepthSource {
         install_rustls_provider();
         let url = format!(
             "wss://stream.binance.com:9443/ws/{}@depth{}@{}ms",
-            self.config.symbol.to_ascii_lowercase(),
-            self.config.levels,
-            self.config.speed_ms
+            self.symbol.to_ascii_lowercase(),
+            self.levels_count,
+            self.speed_ms
         );
         match connect(&url) {
             Ok((socket, _)) => {
                 self.socket = Some(socket);
-                self.status = format!("binance {}", self.config.symbol);
+                self.status = format!("binance {}", self.symbol);
                 true
             }
             Err(_) => {
                 self.status = "binance connect failed".to_owned();
-                std::thread::sleep(Duration::from_millis(self.config.reconnect_backoff_ms));
+                std::thread::sleep(Duration::from_millis(self.reconnect_backoff_ms));
                 false
             }
         }
@@ -213,7 +226,7 @@ mod tests {
     }
 
     fn source() -> BinanceDepthSource {
-        BinanceDepthSource::new(BinanceConfig::default(), instrument(), 1, 2)
+        BinanceDepthSource::new("btcusdt".to_owned(), 20, 100, 1000, instrument(), 1, 2)
     }
 
     #[test]

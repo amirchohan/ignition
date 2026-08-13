@@ -8,5 +8,8 @@ server:
 trading-client:
     cargo run --bin trading-client
 
+control-client:
+    cargo run --bin control-client
+
 sbe:
     scripts/generate_sbe.sh

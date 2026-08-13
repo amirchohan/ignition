@@ -244,7 +244,10 @@ mod tests {
         rd::InstrumentSpec,
         trading::order::{AccountId, ClientTs, ExecType, ExecutionReport, NewOrder, OrdStatus, OrderId, OrderType, Side, TimeInForce},
     };
-    use crate::market_data::{MarketDataFeedConfig, MarketDataRuntime};
+    use crate::{
+        io::IOConfig,
+        market_data::{MarketDataFeedConfig, MarketDataRuntime},
+    };
 
     type TradingEvent = ExecutionReport;
 
@@ -339,7 +342,7 @@ mod tests {
     }
 
     fn market_data_runtime() -> Option<MarketDataRuntime> {
-        match MarketDataRuntime::new(MarketDataFeedConfig::default()) {
+        match MarketDataRuntime::new(market_data_config()) {
             Ok(market_data) => Some(market_data),
             Err(crate::market_data::MarketDataError::Io(crate::io::IoError::Bind(error)))
                 if error.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -347,6 +350,19 @@ mod tests {
                 None
             }
             Err(error) => panic!("market-data: {error:?}"),
+        }
+    }
+
+    fn market_data_config() -> MarketDataFeedConfig {
+        MarketDataFeedConfig {
+            io: IOConfig::Udp {
+                bind_addr: "0.0.0.0:0".to_owned(),
+                group_addr: "239.255.0.1:19002".to_owned(),
+                multicast_ttl: 1,
+                multicast_loop_v4: true,
+                max_datagram_len: 4096,
+                max_pending_datagram_bytes: 1 << 20,
+            },
         }
     }
 

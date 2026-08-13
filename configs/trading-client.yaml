@@ -3,12 +3,12 @@ gateway_addr: "127.0.0.1:19000"
 market_data:
   bind_addr: "0.0.0.0:19002"
   group_addr: "239.255.0.1:19002"
-default_buy_account: 1
-default_sell_account: 2
-traffic_source:
-  kind: "binance"
-binance:
+synthetic_traffic:
+  # type: noop
+  type: binance
   symbol: "btcusdt"
   levels: 20
   speed_ms: 100
   reconnect_backoff_ms: 1000
+  buys_account_id: 1
+  sells_account_id: 2
