@@ -37,13 +37,11 @@ impl AccountTable {
 
     /// Return immutable matching-engine state for a valid account ID.
     pub(crate) fn get(&self, account_id: AccountId) -> Option<&AccountBookState> {
-        self.contains(account_id)
-            .then(|| &self.accounts[account_id.raw() as usize])
+        self.contains(account_id).then(|| &self.accounts[account_id.raw() as usize])
     }
 
     /// Return mutable matching-engine state for a valid account ID.
     pub(crate) fn get_mut(&mut self, account_id: AccountId) -> Option<&mut AccountBookState> {
-        self.contains(account_id)
-            .then(|| &mut self.accounts[account_id.raw() as usize])
+        self.contains(account_id).then(|| &mut self.accounts[account_id.raw() as usize])
     }
 }

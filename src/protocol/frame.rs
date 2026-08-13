@@ -109,10 +109,7 @@ impl MessageKind {
 
     /// True when this template is accepted on the trading ingress endpoint.
     pub const fn is_order_entry(self) -> bool {
-        matches!(
-            self,
-            Self::NewOrder | Self::CancelOrder | Self::CancelReplace | Self::MassCancel
-        )
+        matches!(self, Self::NewOrder | Self::CancelOrder | Self::CancelReplace | Self::MassCancel)
     }
 }
 
@@ -173,11 +170,10 @@ pub fn decode_header(input: &[u8]) -> ProtocolResult<ProtocolFrame> {
 mod tests {
     use super::*;
     use crate::protocol::generated::codecs::{
-        ReadBuf, WriteBuf, cancel_order_codec, cancel_replace_codec, control_response_codec,
-        execution_report_codec, heartbeat_codec, heartbeat_status_codec, kill_switch_codec,
-        l1_update_codec, l2_update_codec, mass_cancel_codec, message_header_codec, new_order_codec,
-        order_type, protocol_error_codec, side, snapshot_begin_codec, snapshot_codec,
-        snapshot_end_codec, snapshot_order_codec, time_in_force, trade_print_codec,
+        ReadBuf, WriteBuf, cancel_order_codec, cancel_replace_codec, control_response_codec, execution_report_codec, heartbeat_codec,
+        heartbeat_status_codec, kill_switch_codec, l1_update_codec, l2_update_codec, mass_cancel_codec, message_header_codec,
+        new_order_codec, order_type, protocol_error_codec, side, snapshot_begin_codec, snapshot_codec, snapshot_end_codec,
+        snapshot_order_codec, time_in_force, trade_print_codec,
     };
 
     #[test]
@@ -209,10 +205,7 @@ mod tests {
         input[4..6].copy_from_slice(&SCHEMA_ID.to_le_bytes());
         input[6..8].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
 
-        assert_eq!(
-            decode_header(&input),
-            Err(ProtocolError::UnknownTemplate { template_id: 999 })
-        );
+        assert_eq!(decode_header(&input), Err(ProtocolError::UnknownTemplate { template_id: 999 }));
     }
 
     #[test]
@@ -221,44 +214,17 @@ mod tests {
             (MessageKind::KillSwitch, kill_switch_codec::SBE_TEMPLATE_ID),
             (MessageKind::Snapshot, snapshot_codec::SBE_TEMPLATE_ID),
             (MessageKind::Heartbeat, heartbeat_codec::SBE_TEMPLATE_ID),
-            (
-                MessageKind::ControlResponse,
-                control_response_codec::SBE_TEMPLATE_ID,
-            ),
-            (
-                MessageKind::HeartbeatStatus,
-                heartbeat_status_codec::SBE_TEMPLATE_ID,
-            ),
-            (
-                MessageKind::SnapshotBegin,
-                snapshot_begin_codec::SBE_TEMPLATE_ID,
-            ),
-            (
-                MessageKind::SnapshotOrder,
-                snapshot_order_codec::SBE_TEMPLATE_ID,
-            ),
-            (
-                MessageKind::SnapshotEnd,
-                snapshot_end_codec::SBE_TEMPLATE_ID,
-            ),
-            (
-                MessageKind::ProtocolError,
-                protocol_error_codec::SBE_TEMPLATE_ID,
-            ),
+            (MessageKind::ControlResponse, control_response_codec::SBE_TEMPLATE_ID),
+            (MessageKind::HeartbeatStatus, heartbeat_status_codec::SBE_TEMPLATE_ID),
+            (MessageKind::SnapshotBegin, snapshot_begin_codec::SBE_TEMPLATE_ID),
+            (MessageKind::SnapshotOrder, snapshot_order_codec::SBE_TEMPLATE_ID),
+            (MessageKind::SnapshotEnd, snapshot_end_codec::SBE_TEMPLATE_ID),
+            (MessageKind::ProtocolError, protocol_error_codec::SBE_TEMPLATE_ID),
             (MessageKind::NewOrder, new_order_codec::SBE_TEMPLATE_ID),
-            (
-                MessageKind::CancelOrder,
-                cancel_order_codec::SBE_TEMPLATE_ID,
-            ),
-            (
-                MessageKind::CancelReplace,
-                cancel_replace_codec::SBE_TEMPLATE_ID,
-            ),
+            (MessageKind::CancelOrder, cancel_order_codec::SBE_TEMPLATE_ID),
+            (MessageKind::CancelReplace, cancel_replace_codec::SBE_TEMPLATE_ID),
             (MessageKind::MassCancel, mass_cancel_codec::SBE_TEMPLATE_ID),
-            (
-                MessageKind::ExecutionReport,
-                execution_report_codec::SBE_TEMPLATE_ID,
-            ),
+            (MessageKind::ExecutionReport, execution_report_codec::SBE_TEMPLATE_ID),
             (MessageKind::TradePrint, trade_print_codec::SBE_TEMPLATE_ID),
             (MessageKind::L1Update, l1_update_codec::SBE_TEMPLATE_ID),
             (MessageKind::L2Update, l2_update_codec::SBE_TEMPLATE_ID),
@@ -266,10 +232,7 @@ mod tests {
 
         for (kind, template_id) in cases {
             assert_eq!(kind.template_id(), template_id);
-            assert_eq!(
-                MessageKind::from_template_id(template_id).expect("template ID should decode"),
-                kind
-            );
+            assert_eq!(MessageKind::from_template_id(template_id).expect("template ID should decode"), kind);
         }
     }
 
@@ -293,10 +256,7 @@ mod tests {
 
         let decoded_header = decode_header(&bytes[..SBE_HEADER_LEN]).expect("facade header");
         assert_eq!(decoded_header.kind, MessageKind::NewOrder);
-        assert_eq!(
-            decoded_header.block_length,
-            new_order_codec::SBE_BLOCK_LENGTH
-        );
+        assert_eq!(decoded_header.block_length, new_order_codec::SBE_BLOCK_LENGTH);
 
         let read_buf = ReadBuf::new(&bytes);
         let header = message_header_codec::MessageHeaderDecoder::default().wrap(read_buf, 0);

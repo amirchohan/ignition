@@ -92,10 +92,7 @@ impl MarketDataSequencer {
 
     pub fn next_md_seq(&mut self) -> DomainResult<MdSeq> {
         let current = self.next_md_seq;
-        self.next_md_seq = self
-            .next_md_seq
-            .checked_add(1)
-            .ok_or(DomainError::SequenceOverflow)?;
+        self.next_md_seq = self.next_md_seq.checked_add(1).ok_or(DomainError::SequenceOverflow)?;
         Ok(MdSeq(current))
     }
 
@@ -109,10 +106,7 @@ impl MarketDataSequencer {
 
     pub fn next_trade_id(&mut self) -> DomainResult<TradeId> {
         let current = self.next_trade_id;
-        self.next_trade_id = self
-            .next_trade_id
-            .checked_add(1)
-            .ok_or(DomainError::SequenceOverflow)?;
+        self.next_trade_id = self.next_trade_id.checked_add(1).ok_or(DomainError::SequenceOverflow)?;
         Ok(TradeId(current))
     }
 }
@@ -135,15 +129,9 @@ mod tests {
     #[test]
     fn market_data_sequencer_reports_overflow() {
         let mut md = MarketDataSequencer::new(u64::MAX - 1, u64::MAX - 1);
-        assert_eq!(
-            md.next_md_seq().expect("penultimate md").raw(),
-            u64::MAX - 1
-        );
+        assert_eq!(md.next_md_seq().expect("penultimate md").raw(), u64::MAX - 1);
         assert_eq!(md.next_md_seq(), Err(DomainError::SequenceOverflow));
-        assert_eq!(
-            md.next_trade_id().expect("penultimate trade").raw(),
-            u64::MAX - 1
-        );
+        assert_eq!(md.next_trade_id().expect("penultimate trade").raw(), u64::MAX - 1);
         assert_eq!(md.next_trade_id(), Err(DomainError::SequenceOverflow));
     }
 }

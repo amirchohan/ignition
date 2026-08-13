@@ -19,10 +19,10 @@
 
 use crate::{
     domain::{
-        DomainError, EngineSequencer, ProtocolErrorEvent, RecvTs, RejectReason,
+        DomainError, ProtocolErrorEvent, RecvTs, RejectReason, Sequencer,
         control::{
-            ControlEvent, ControlRequest, ControlResponse, ControlResult, Heartbeat, HeartbeatSeq,
-            HeartbeatStatus, KillSwitch, KillSwitchAction,
+            ControlEvent, ControlRequest, ControlResponse, ControlResult, Heartbeat, HeartbeatSeq, HeartbeatStatus, KillSwitch,
+            KillSwitchAction,
         },
     },
     io::{FramePollError, IoError, TcpFrameIo, TcpFramePublisher},
@@ -100,11 +100,7 @@ impl ControlRuntime {
     /// reads already-normalized state. The encode buffer is sized once from
     /// `max_frame_len` and reused for every control response.
     pub fn new(config: ControlConfig) -> Result<Self, ControlError> {
-        let io = TcpFrameIo::bind(
-            &config.bind_addr,
-            config.max_frame_len,
-            config.max_pending_write_bytes,
-        )?;
+        let io = TcpFrameIo::bind(&config.bind_addr, config.max_frame_len, config.max_pending_write_bytes)?;
         Ok(Self {
             io,
             encode_buf: vec![0_u8; config.max_frame_len],
@@ -123,23 +119,11 @@ impl ControlRuntime {
     /// The returned boolean means forward progress was made by the underlying
     /// transport or frame processing. It is deliberately not a count; callers
     /// should observe state or output streams for behavior-specific assertions.
-    pub fn poll<F>(
-        &mut self,
-        sequencer: &mut EngineSequencer,
-        mut on_request: F,
-    ) -> Result<bool, ControlError>
+    pub fn poll<F>(&mut self, sequencer: &mut Sequencer, mut on_request: F) -> Result<bool, ControlError>
     where
-        F: FnMut(
-            ControlRequest,
-            &mut ControlPublisher<'_, '_>,
-            &mut EngineSequencer,
-        ) -> Result<(), ControlError>,
+        F: FnMut(ControlRequest, &mut ControlPublisher<'_, '_>, &mut Sequencer) -> Result<(), ControlError>,
     {
-        let ControlRuntime {
-            io,
-            encode_buf,
-            state,
-        } = self;
+        let ControlRuntime { io, encode_buf, state } = self;
         let mut session = ControlPollSession {
             state,
             encode_buf,
@@ -147,9 +131,7 @@ impl ControlRuntime {
             on_request: &mut on_request,
             shutdown_seen: false,
         };
-        let io_progress = match io
-            .poll(|io_publisher, recv_ts, bytes| session.on_frame(io_publisher, recv_ts, bytes))
-        {
+        let io_progress = match io.poll(|io_publisher, recv_ts, bytes| session.on_frame(io_publisher, recv_ts, bytes)) {
             Ok(progress) => progress,
             Err(FramePollError::Io(error)) => return Err(error.into()),
             Err(FramePollError::Handler(error)) => return Err(error),
@@ -201,9 +183,7 @@ impl ControlState {
         let Some(last_recv_ts) = self.last_heartbeat_recv_ts else {
             return RejectReason::None;
         };
-        if self.heartbeat_timeout_ns != 0
-            && recv_ts.raw().saturating_sub(last_recv_ts.raw()) > self.heartbeat_timeout_ns
-        {
+        if self.heartbeat_timeout_ns != 0 && recv_ts.raw().saturating_sub(last_recv_ts.raw()) > self.heartbeat_timeout_ns {
             return RejectReason::HeartbeatLost;
         }
 
@@ -236,18 +216,14 @@ impl ControlState {
 struct ControlPollSession<'a, F> {
     state: &'a mut ControlState,
     encode_buf: &'a mut Vec<u8>,
-    sequencer: &'a mut EngineSequencer,
+    sequencer: &'a mut Sequencer,
     on_request: &'a mut F,
     shutdown_seen: bool,
 }
 
 impl<F> ControlPollSession<'_, F>
 where
-    F: FnMut(
-        ControlRequest,
-        &mut ControlPublisher<'_, '_>,
-        &mut EngineSequencer,
-    ) -> Result<(), ControlError>,
+    F: FnMut(ControlRequest, &mut ControlPublisher<'_, '_>, &mut Sequencer) -> Result<(), ControlError>,
 {
     /// Process one complete wire frame borrowed from `TcpFrameIo`.
     ///
@@ -255,12 +231,7 @@ where
     /// does not retain `bytes`; decode errors are converted to protocol-error
     /// events immediately, while valid requests pass through state mutation and
     /// the runtime callback.
-    fn on_frame(
-        &mut self,
-        io_publisher: &mut TcpFramePublisher<'_>,
-        recv_ts: RecvTs,
-        bytes: &[u8],
-    ) -> Result<(), ControlError> {
+    fn on_frame(&mut self, io_publisher: &mut TcpFramePublisher<'_>, recv_ts: RecvTs, bytes: &[u8]) -> Result<(), ControlError> {
         if self.shutdown_seen {
             // Shutdown is terminal for this poll batch. Frames already read
             // after it remain buffered by the transport state but produce no
@@ -275,8 +246,7 @@ where
         };
         match decoded {
             Ok(request) => {
-                let shutdown =
-                    Self::apply_request(self.state, self.sequencer, request, &mut publisher)?;
+                let shutdown = Self::apply_request(self.state, self.sequencer, request, &mut publisher)?;
                 // Runtime owns engine-dependent side effects such as snapshots
                 // and shutdown drains, so it observes every valid request
                 // after control has applied its own state transition and
@@ -293,7 +263,7 @@ where
 
     fn apply_request(
         state: &mut ControlState,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         request: ControlRequest,
         publisher: &mut ControlPublisher<'_, '_>,
     ) -> Result<bool, ControlError> {
@@ -320,7 +290,7 @@ where
     }
 
     fn push_ok_response(
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         request: KillSwitch,
         publisher: &mut ControlPublisher<'_, '_>,
     ) -> Result<(), ControlError> {
@@ -335,7 +305,7 @@ where
     }
 
     fn publish_protocol_error(
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         error: WireDecodeError,
         publisher: &mut ControlPublisher<'_, '_>,
     ) -> Result<(), ControlError> {
@@ -380,8 +350,8 @@ mod tests {
     use crate::protocol::{
         MessageKind, SBE_HEADER_LEN, decode_header, encode_header,
         generated::codecs::{
-            WriteBuf, heartbeat_codec, kill_switch_action, kill_switch_codec, new_order_codec,
-            order_type as wire_order_type, side as wire_side, time_in_force as wire_tif,
+            WriteBuf, heartbeat_codec, kill_switch_action, kill_switch_codec, new_order_codec, order_type as wire_order_type,
+            side as wire_side, time_in_force as wire_tif,
         },
     };
     use std::{
@@ -407,56 +377,34 @@ mod tests {
         };
         match ControlRuntime::new(config) {
             Ok(control) => Some((control, bind_addr)),
-            Err(ControlError::Io(IoError::Bind(error)))
-                if error.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                None
-            }
+            Err(ControlError::Io(IoError::Bind(error))) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
             Err(error) => panic!("control runtime: {error:?}"),
         }
     }
 
     fn heartbeat_frame(seq: u32) -> Vec<u8> {
         let mut bytes = vec![0_u8; SBE_HEADER_LEN + heartbeat_codec::SBE_BLOCK_LENGTH as usize];
-        encode_header(
-            &mut bytes,
-            heartbeat_codec::SBE_BLOCK_LENGTH,
-            MessageKind::Heartbeat,
-        )
-        .expect("header");
+        encode_header(&mut bytes, heartbeat_codec::SBE_BLOCK_LENGTH, MessageKind::Heartbeat).expect("header");
         let write_buf = WriteBuf::new(&mut bytes);
-        let mut encoder =
-            heartbeat_codec::HeartbeatEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+        let mut encoder = heartbeat_codec::HeartbeatEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
         encoder.heartbeat_seq(seq);
         bytes
     }
 
     fn kill_switch_frame(action: kill_switch_action::KillSwitchAction) -> Vec<u8> {
         let mut bytes = vec![0_u8; SBE_HEADER_LEN + kill_switch_codec::SBE_BLOCK_LENGTH as usize];
-        encode_header(
-            &mut bytes,
-            kill_switch_codec::SBE_BLOCK_LENGTH,
-            MessageKind::KillSwitch,
-        )
-        .expect("header");
+        encode_header(&mut bytes, kill_switch_codec::SBE_BLOCK_LENGTH, MessageKind::KillSwitch).expect("header");
         let write_buf = WriteBuf::new(&mut bytes);
-        let mut encoder =
-            kill_switch_codec::KillSwitchEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+        let mut encoder = kill_switch_codec::KillSwitchEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
         encoder.request_id(77).action(action);
         bytes
     }
 
     fn new_order_frame() -> Vec<u8> {
         let mut bytes = vec![0_u8; SBE_HEADER_LEN + new_order_codec::SBE_BLOCK_LENGTH as usize];
-        encode_header(
-            &mut bytes,
-            new_order_codec::SBE_BLOCK_LENGTH,
-            MessageKind::NewOrder,
-        )
-        .expect("header");
+        encode_header(&mut bytes, new_order_codec::SBE_BLOCK_LENGTH, MessageKind::NewOrder).expect("header");
         let write_buf = WriteBuf::new(&mut bytes);
-        let mut encoder =
-            new_order_codec::NewOrderEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+        let mut encoder = new_order_codec::NewOrderEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
         encoder
             .client_order_id(11)
             .account_id(22)
@@ -470,7 +418,7 @@ mod tests {
     }
 
     fn poll_until_request(control: &mut ControlRuntime, out: &mut Vec<ControlRequest>) {
-        let mut sequencer = EngineSequencer::default();
+        let mut sequencer = Sequencer::default();
         for _ in 0..100 {
             if control
                 .poll(&mut sequencer, |request, _, _| {
@@ -493,9 +441,7 @@ mod tests {
         let frame_len = SBE_HEADER_LEN + u16::from_le_bytes([header[0], header[1]]) as usize;
         let mut frame = vec![0_u8; frame_len];
         frame[..SBE_HEADER_LEN].copy_from_slice(&header);
-        client
-            .read_exact(&mut frame[SBE_HEADER_LEN..])
-            .expect("read payload");
+        client.read_exact(&mut frame[SBE_HEADER_LEN..]).expect("read payload");
         frame
     }
 
@@ -514,21 +460,16 @@ mod tests {
 
     #[test]
     fn control_request_decode_rejects_wrong_endpoint_template() {
-        let error = decode_control_request(&new_order_frame(), RecvTs::new(55))
-            .expect_err("wrong endpoint");
+        let error = decode_control_request(&new_order_frame(), RecvTs::new(55)).expect_err("wrong endpoint");
         assert_eq!(error.template_id, 100);
-        assert_eq!(
-            error.error_code,
-            crate::domain::ErrorCode::UnsupportedTemplate
-        );
+        assert_eq!(error.error_code, crate::domain::ErrorCode::UnsupportedTemplate);
     }
 
     #[test]
     fn control_request_decode_rejects_null_action() {
         let bytes = kill_switch_frame(kill_switch_action::KillSwitchAction::NullVal);
 
-        let error =
-            decode_control_request(&bytes, RecvTs::new(55)).expect_err("null action should reject");
+        let error = decode_control_request(&bytes, RecvTs::new(55)).expect_err("null action should reject");
         assert_eq!(error.template_id, MessageKind::KillSwitch.template_id());
         assert_eq!(error.error_code, crate::domain::ErrorCode::DecodeError);
     }
@@ -549,7 +490,7 @@ mod tests {
         };
         assert_eq!(heartbeat.heartbeat_seq.raw(), 1);
         out.clear();
-        let mut sequencer = EngineSequencer::default();
+        let mut sequencer = Sequencer::default();
         assert!(
             !control
                 .poll(&mut sequencer, |request, _, _| {
@@ -567,7 +508,7 @@ mod tests {
         };
         let mut client = TcpStream::connect(bind_addr).expect("connect");
         client.write_all(&new_order_frame()).expect("write");
-        let mut sequencer = EngineSequencer::default();
+        let mut sequencer = Sequencer::default();
         let mut requests = Vec::new();
 
         for _ in 0..100 {
@@ -585,9 +526,7 @@ mod tests {
 
         assert!(requests.is_empty());
         assert_eq!(
-            decode_header(&read_control_frame(&mut client))
-                .expect("header")
-                .kind,
+            decode_header(&read_control_frame(&mut client)).expect("header").kind,
             MessageKind::ProtocolError
         );
     }
@@ -599,11 +538,9 @@ mod tests {
         };
         let mut client = TcpStream::connect(bind_addr).expect("connect");
         client
-            .write_all(&kill_switch_frame(
-                kill_switch_action::KillSwitchAction::HaltTrading,
-            ))
+            .write_all(&kill_switch_frame(kill_switch_action::KillSwitchAction::HaltTrading))
             .expect("write");
-        let mut sequencer = EngineSequencer::default();
+        let mut sequencer = Sequencer::default();
         let mut requests = Vec::new();
 
         for _ in 0..100 {
@@ -621,14 +558,9 @@ mod tests {
 
         assert!(matches!(requests[0], ControlRequest::KillSwitch(_)));
         assert_eq!(
-            decode_header(&read_control_frame(&mut client))
-                .expect("header")
-                .kind,
+            decode_header(&read_control_frame(&mut client)).expect("header").kind,
             MessageKind::ControlResponse
         );
-        assert_eq!(
-            control.reject_reason_for(RecvTs::new(2)),
-            RejectReason::KillSwitchActive
-        );
+        assert_eq!(control.reject_reason_for(RecvTs::new(2)), RejectReason::KillSwitchActive);
     }
 }

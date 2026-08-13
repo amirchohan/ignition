@@ -3,23 +3,21 @@ use crate::{
         DomainResult, Price, Qty, RecvTs,
         rd::InstrumentSpec,
         trading::order::{
-            AccountId, CancelOrder, CancelReplace, ClientTs, ExecutionReport, MassCancel, NewOrder,
-            OrderEntry, OrderId, OrderType,
+            AccountId, CancelOrder, CancelReplace, ClientTs, ExecutionReport, MassCancel, NewOrder, OrderEntry, OrderId, OrderType,
         },
     },
     protocol::{
         MessageKind, ProtocolResult, SBE_HEADER_LEN, decode_header, encode_header,
         generated::codecs::{
-            ReadBuf, WriteBuf, cancel_order_codec, cancel_replace_codec, execution_report_codec,
-            mass_cancel_codec, new_order_codec, order_type, side, time_in_force,
+            ReadBuf, WriteBuf, cancel_order_codec, cancel_replace_codec, execution_report_codec, mass_cancel_codec, new_order_codec,
+            order_type, side, time_in_force,
         },
     },
 };
 
 use super::super::{
-    InboundDecodeError, ensure_complete, ensure_out, normalize_order_type, normalize_side,
-    normalize_tif, to_wire_exec_type, to_wire_ord_status, to_wire_reject_reason,
-    unexpected_template,
+    InboundDecodeError, ensure_complete, ensure_out, normalize_order_type, normalize_side, normalize_tif, to_wire_exec_type,
+    to_wire_ord_status, to_wire_reject_reason, unexpected_template,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,12 +76,7 @@ pub fn decode_order_entry(input: &[u8]) -> ProtocolResult<WireOrderEntry> {
     let read_buf = ReadBuf::new(input);
     match frame.kind {
         MessageKind::NewOrder => {
-            let decoder = new_order_codec::NewOrderDecoder::default().wrap(
-                read_buf,
-                SBE_HEADER_LEN,
-                frame.block_length,
-                frame.version,
-            );
+            let decoder = new_order_codec::NewOrderDecoder::default().wrap(read_buf, SBE_HEADER_LEN, frame.block_length, frame.version);
             Ok(WireOrderEntry::NewOrder(WireNewOrder {
                 client_order_id: decoder.client_order_id(),
                 account_id: decoder.account_id(),
@@ -96,12 +89,8 @@ pub fn decode_order_entry(input: &[u8]) -> ProtocolResult<WireOrderEntry> {
             }))
         }
         MessageKind::CancelOrder => {
-            let decoder = cancel_order_codec::CancelOrderDecoder::default().wrap(
-                read_buf,
-                SBE_HEADER_LEN,
-                frame.block_length,
-                frame.version,
-            );
+            let decoder =
+                cancel_order_codec::CancelOrderDecoder::default().wrap(read_buf, SBE_HEADER_LEN, frame.block_length, frame.version);
             Ok(WireOrderEntry::CancelOrder(WireCancelOrder {
                 client_order_id: decoder.client_order_id(),
                 account_id: decoder.account_id(),
@@ -110,12 +99,8 @@ pub fn decode_order_entry(input: &[u8]) -> ProtocolResult<WireOrderEntry> {
             }))
         }
         MessageKind::CancelReplace => {
-            let decoder = cancel_replace_codec::CancelReplaceDecoder::default().wrap(
-                read_buf,
-                SBE_HEADER_LEN,
-                frame.block_length,
-                frame.version,
-            );
+            let decoder =
+                cancel_replace_codec::CancelReplaceDecoder::default().wrap(read_buf, SBE_HEADER_LEN, frame.block_length, frame.version);
             Ok(WireOrderEntry::CancelReplace(WireCancelReplace {
                 client_order_id: decoder.client_order_id(),
                 account_id: decoder.account_id(),
@@ -126,12 +111,7 @@ pub fn decode_order_entry(input: &[u8]) -> ProtocolResult<WireOrderEntry> {
             }))
         }
         MessageKind::MassCancel => {
-            let decoder = mass_cancel_codec::MassCancelDecoder::default().wrap(
-                read_buf,
-                SBE_HEADER_LEN,
-                frame.block_length,
-                frame.version,
-            );
+            let decoder = mass_cancel_codec::MassCancelDecoder::default().wrap(read_buf, SBE_HEADER_LEN, frame.block_length, frame.version);
             Ok(WireOrderEntry::MassCancel(WireMassCancel {
                 client_order_id: decoder.client_order_id(),
                 account_id: decoder.account_id(),
@@ -142,11 +122,7 @@ pub fn decode_order_entry(input: &[u8]) -> ProtocolResult<WireOrderEntry> {
     }
 }
 
-pub fn normalize_order_entry(
-    message: WireOrderEntry,
-    recv_ts: RecvTs,
-    instrument: &InstrumentSpec,
-) -> DomainResult<OrderEntry> {
+pub fn normalize_order_entry(message: WireOrderEntry, recv_ts: RecvTs, instrument: &InstrumentSpec) -> DomainResult<OrderEntry> {
     match message {
         WireOrderEntry::NewOrder(message) => {
             let order_type = normalize_order_type(message.order_type)?;
@@ -207,8 +183,7 @@ pub fn encode_execution_report(event: ExecutionReport, out: &mut [u8]) -> Protoc
     encode_header(out, block_len, MessageKind::ExecutionReport)?;
 
     let write_buf = WriteBuf::new(out);
-    let mut encoder =
-        execution_report_codec::ExecutionReportEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    let mut encoder = execution_report_codec::ExecutionReportEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
     encoder
         .engine_seq(event.engine_seq.raw())
         .client_order_id(event.client_order_id.raw())
@@ -233,10 +208,7 @@ mod tests {
         },
         protocol::{
             ProtocolError,
-            generated::codecs::{
-                kill_switch_action as wire_kill_switch_action, kill_switch_codec,
-                message_header_codec,
-            },
+            generated::codecs::{kill_switch_action as wire_kill_switch_action, kill_switch_codec, message_header_codec},
         },
     };
 
@@ -247,16 +219,10 @@ mod tests {
     fn encode_new_order(order_type: order_type::OrderType, price: u64, qty: u64) -> Vec<u8> {
         let len = SBE_HEADER_LEN + new_order_codec::SBE_BLOCK_LENGTH as usize;
         let mut bytes = vec![0_u8; len];
-        encode_header(
-            &mut bytes,
-            new_order_codec::SBE_BLOCK_LENGTH,
-            MessageKind::NewOrder,
-        )
-        .expect("header");
+        encode_header(&mut bytes, new_order_codec::SBE_BLOCK_LENGTH, MessageKind::NewOrder).expect("header");
 
         let write_buf = WriteBuf::new(&mut bytes);
-        let mut encoder =
-            new_order_codec::NewOrderEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+        let mut encoder = new_order_codec::NewOrderEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
         encoder
             .client_order_id(11)
             .account_id(22)
@@ -272,16 +238,10 @@ mod tests {
     fn encode_kill_switch() -> Vec<u8> {
         let len = SBE_HEADER_LEN + kill_switch_codec::SBE_BLOCK_LENGTH as usize;
         let mut bytes = vec![0_u8; len];
-        encode_header(
-            &mut bytes,
-            kill_switch_codec::SBE_BLOCK_LENGTH,
-            MessageKind::KillSwitch,
-        )
-        .expect("header");
+        encode_header(&mut bytes, kill_switch_codec::SBE_BLOCK_LENGTH, MessageKind::KillSwitch).expect("header");
 
         let write_buf = WriteBuf::new(&mut bytes);
-        let mut encoder =
-            kill_switch_codec::KillSwitchEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+        let mut encoder = kill_switch_codec::KillSwitchEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
         encoder
             .request_id(77)
             .action(wire_kill_switch_action::KillSwitchAction::HaltTrading);
@@ -291,8 +251,7 @@ mod tests {
     #[test]
     fn order_entry_normalizes_limit_order() {
         let bytes = encode_new_order(order_type::OrderType::Limit, 6_725_123, 125_000_000);
-        let request = decode_and_normalize_order_entry(&bytes, RecvTs::new(900), &instrument())
-            .expect("order entry");
+        let request = decode_and_normalize_order_entry(&bytes, RecvTs::new(900), &instrument()).expect("order entry");
 
         let OrderEntry::NewOrder(order) = request else {
             panic!("expected new order");
@@ -312,8 +271,7 @@ mod tests {
     #[test]
     fn order_entry_ignores_market_order_price() {
         let bytes = encode_new_order(order_type::OrderType::Market, 99, 100);
-        let request = decode_and_normalize_order_entry(&bytes, RecvTs::new(1), &instrument())
-            .expect("market order");
+        let request = decode_and_normalize_order_entry(&bytes, RecvTs::new(1), &instrument()).expect("market order");
 
         let OrderEntry::NewOrder(order) = request else {
             panic!("expected new order");
@@ -370,16 +328,9 @@ mod tests {
         let mut bytes = [0_u8; SBE_HEADER_LEN + execution_report_codec::SBE_BLOCK_LENGTH as usize];
         let written = encode_execution_report(event, &mut bytes).expect("encode");
         assert_eq!(written, bytes.len());
-        assert_eq!(
-            decode_header(&bytes).expect("header").kind,
-            MessageKind::ExecutionReport
-        );
+        assert_eq!(decode_header(&bytes).expect("header").kind, MessageKind::ExecutionReport);
 
-        let decoder =
-            message_header_codec::MessageHeaderDecoder::default().wrap(ReadBuf::new(&bytes), 0);
-        assert_eq!(
-            decoder.template_id(),
-            MessageKind::ExecutionReport.template_id()
-        );
+        let decoder = message_header_codec::MessageHeaderDecoder::default().wrap(ReadBuf::new(&bytes), 0);
+        assert_eq!(decoder.template_id(), MessageKind::ExecutionReport.template_id());
     }
 }

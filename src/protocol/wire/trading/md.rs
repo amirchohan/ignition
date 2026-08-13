@@ -8,9 +8,7 @@ use crate::{
     },
     protocol::{
         MessageKind, ProtocolResult, SBE_HEADER_LEN, encode_header,
-        generated::codecs::{
-            WriteBuf, book_side, l1_update_codec, l2_update_codec, trade_print_codec,
-        },
+        generated::codecs::{WriteBuf, book_side, l1_update_codec, l2_update_codec, trade_print_codec},
     },
 };
 
@@ -22,8 +20,7 @@ pub fn encode_trade_print(event: TradePrint, out: &mut [u8]) -> ProtocolResult<u
     encode_header(out, block_len, MessageKind::TradePrint)?;
 
     let write_buf = WriteBuf::new(out);
-    let mut encoder =
-        trade_print_codec::TradePrintEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    let mut encoder = trade_print_codec::TradePrintEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
     encoder
         .md_seq(event.md_seq.raw())
         .trade_id(event.trade_id.raw())
@@ -108,8 +105,7 @@ mod tests {
 
     #[test]
     fn trade_print_encodes_expected_template() {
-        let instrument =
-            crate::domain::rd::InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 1).expect("instrument");
+        let instrument = crate::domain::rd::InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 1).expect("instrument");
         let event = TradePrint {
             md_seq: MdSeq::new(12),
             trade_id: TradeId::new(13),
@@ -130,8 +126,7 @@ mod tests {
 
     #[test]
     fn l2_update_encodes_absolute_level() {
-        let instrument =
-            crate::domain::rd::InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 1).expect("instrument");
+        let instrument = crate::domain::rd::InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 1).expect("instrument");
         let event = L2Update {
             md_seq: MdSeq::new(20),
             prev_md_seq: MdSeq::new(19),

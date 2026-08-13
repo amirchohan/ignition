@@ -16,8 +16,7 @@ use crate::{
     protocol::{
         MessageKind, ProtocolError, ProtocolFrame, ProtocolResult, SBE_HEADER_LEN, encode_header,
         generated::codecs::{
-            WriteBuf, control_result, error_code, exec_type, ord_status, protocol_error_codec,
-            reject_reason, side, time_in_force,
+            WriteBuf, control_result, error_code, exec_type, ord_status, protocol_error_codec, reject_reason, side, time_in_force,
         },
     },
 };
@@ -54,9 +53,7 @@ pub(crate) fn unexpected_template(kind: MessageKind) -> ProtocolError {
 
 pub(crate) fn protocol_error_code(error: ProtocolError) -> ErrorCode {
     match error {
-        ProtocolError::UnexpectedTemplate { .. } | ProtocolError::UnknownTemplate { .. } => {
-            ErrorCode::UnsupportedTemplate
-        }
+        ProtocolError::UnexpectedTemplate { .. } | ProtocolError::UnknownTemplate { .. } => ErrorCode::UnsupportedTemplate,
         ProtocolError::UnsupportedVersion { .. } => ErrorCode::UnsupportedVersion,
         _ => ErrorCode::DecodeError,
     }
@@ -69,17 +66,13 @@ pub(crate) fn template_id(input: &[u8]) -> u16 {
     u16::from_le_bytes([input[2], input[3]])
 }
 
-pub(crate) fn encode_protocol_error(
-    event: ProtocolErrorEvent,
-    out: &mut [u8],
-) -> ProtocolResult<usize> {
+pub(crate) fn encode_protocol_error(event: ProtocolErrorEvent, out: &mut [u8]) -> ProtocolResult<usize> {
     let block_len = protocol_error_codec::SBE_BLOCK_LENGTH;
     ensure_out(out, block_len)?;
     encode_header(out, block_len, MessageKind::ProtocolError)?;
 
     let write_buf = WriteBuf::new(out);
-    let mut encoder =
-        protocol_error_codec::ProtocolErrorEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    let mut encoder = protocol_error_codec::ProtocolErrorEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
     encoder
         .engine_seq(event.engine_seq.raw())
         .template_id(event.template_id)
@@ -103,15 +96,11 @@ pub(crate) fn to_wire_side(value: Side) -> side::Side {
     }
 }
 
-pub(crate) fn normalize_order_type(
-    value: crate::protocol::generated::codecs::order_type::OrderType,
-) -> DomainResult<OrderType> {
+pub(crate) fn normalize_order_type(value: crate::protocol::generated::codecs::order_type::OrderType) -> DomainResult<OrderType> {
     match value {
         crate::protocol::generated::codecs::order_type::OrderType::Limit => Ok(OrderType::Limit),
         crate::protocol::generated::codecs::order_type::OrderType::Market => Ok(OrderType::Market),
-        crate::protocol::generated::codecs::order_type::OrderType::NullVal => {
-            Err(DomainError::Malformed)
-        }
+        crate::protocol::generated::codecs::order_type::OrderType::NullVal => Err(DomainError::Malformed),
     }
 }
 

@@ -136,9 +136,7 @@ struct MonotonicRecvTs {
 
 impl Default for MonotonicRecvTs {
     fn default() -> Self {
-        Self {
-            start: Instant::now(),
-        }
+        Self { start: Instant::now() }
     }
 }
 
@@ -165,11 +163,7 @@ pub struct TcpFrameIo {
 }
 
 impl TcpFrameIo {
-    pub fn bind(
-        bind_addr: &str,
-        max_frame_len: usize,
-        max_pending_write_bytes: usize,
-    ) -> Result<Self, IoError> {
+    pub fn bind(bind_addr: &str, max_frame_len: usize, max_pending_write_bytes: usize) -> Result<Self, IoError> {
         let listener = TcpListener::bind(bind_addr).map_err(IoError::Bind)?;
         listener.set_nonblocking(true).map_err(IoError::Configure)?;
         Ok(Self {
@@ -211,11 +205,7 @@ impl TcpFrameIo {
         }
     }
 
-    fn read_available<F, E>(
-        &mut self,
-        mut on_frame: F,
-        max_frames: Option<usize>,
-    ) -> Result<bool, FramePollError<E>>
+    fn read_available<F, E>(&mut self, mut on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
@@ -226,7 +216,10 @@ impl TcpFrameIo {
         let mut made_progress = false;
         let mut buf = [0_u8; 4096];
         loop {
-            let read_result = self.active.as_mut().expect("active stream").read(&mut buf);
+            let read_result = match self.active.as_mut() {
+                Some(stream) => stream.read(&mut buf),
+                None => return Ok(made_progress),
+            };
             match read_result {
                 Ok(0) => {
                     self.disconnect_active();
@@ -253,11 +246,7 @@ impl TcpFrameIo {
         }
     }
 
-    fn drain_complete_frames<F, E>(
-        &mut self,
-        on_frame: &mut F,
-        max_frames: Option<usize>,
-    ) -> Result<bool, FramePollError<E>>
+    fn drain_complete_frames<F, E>(&mut self, on_frame: &mut F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
@@ -281,8 +270,7 @@ impl TcpFrameIo {
             if read_buf.len() - *read_start < SBE_HEADER_LEN {
                 return Ok(false);
             }
-            let block_len =
-                u16::from_le_bytes([read_buf[*read_start], read_buf[*read_start + 1]]) as usize;
+            let block_len = u16::from_le_bytes([read_buf[*read_start], read_buf[*read_start + 1]]) as usize;
             let frame_len = SBE_HEADER_LEN + block_len;
             if frame_len > *max_frame_len {
                 *active = None;
@@ -310,8 +298,7 @@ impl TcpFrameIo {
                 write_len,
                 max_pending_write_bytes: *max_pending_write_bytes,
             };
-            on_frame(&mut publisher, recv_ts, &read_buf[frame_start..frame_end])
-                .map_err(FramePollError::Handler)?;
+            on_frame(&mut publisher, recv_ts, &read_buf[frame_start..frame_end]).map_err(FramePollError::Handler)?;
             frames += 1;
         }
     }
@@ -385,22 +372,14 @@ impl TcpFrameIo {
         self.poll_inner(on_frame, None)
     }
 
-    pub fn poll_bounded<F, E>(
-        &mut self,
-        on_frame: F,
-        max_frames: usize,
-    ) -> Result<bool, FramePollError<E>>
+    pub fn poll_bounded<F, E>(&mut self, on_frame: F, max_frames: usize) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
         self.poll_inner(on_frame, Some(max_frames))
     }
 
-    fn poll_inner<F, E>(
-        &mut self,
-        on_frame: F,
-        max_frames: Option<usize>,
-    ) -> Result<bool, FramePollError<E>>
+    fn poll_inner<F, E>(&mut self, on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
@@ -455,9 +434,7 @@ mod tests {
     fn tcp_io() -> Option<TcpFrameIo> {
         match TcpFrameIo::bind("127.0.0.1:0", 128, 1024) {
             Ok(io) => Some(io),
-            Err(IoError::Bind(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
-                None
-            }
+            Err(IoError::Bind(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
             Err(error) => panic!("tcp io: {error:?}"),
         }
     }
@@ -538,14 +515,11 @@ mod tests {
         };
         let addr = io.local_addr().expect("addr");
         let mut client = TcpStream::connect(addr).expect("connect");
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("timeout");
+        client.set_read_timeout(Some(Duration::from_secs(1))).expect("timeout");
         let output = frame(MessageKind::HeartbeatStatus, &[9, 8, 7, 6]);
 
         for _ in 0..100 {
-            io.poll(|_, _, _| Ok::<(), std::convert::Infallible>(()))
-                .expect("accept");
+            io.poll(|_, _, _| Ok::<(), std::convert::Infallible>(())).expect("accept");
             if io.active.is_some() {
                 break;
             }

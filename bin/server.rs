@@ -1,9 +1,6 @@
 //! Server entry point.
 
-use ignition::{
-    config::ServerConfig, control::ControlRuntime, gateway::GatewayRuntime,
-    market_data::MarketDataRuntime, runtime::Runtime,
-};
+use ignition::{config::ServerConfig, control::ControlRuntime, gateway::GatewayRuntime, market_data::MarketDataRuntime, runtime::Runtime};
 
 fn main() {
     match ServerConfig::load("configs/server.yaml") {
@@ -41,10 +38,7 @@ fn run(config: ServerConfig) {
     let control = match ControlRuntime::new(control_config.clone()) {
         Ok(control) => control,
         Err(error) => {
-            eprintln!(
-                "failed to open control listener {}: {error:?}",
-                control_config.bind_addr
-            );
+            eprintln!("failed to open control listener {}: {error:?}", control_config.bind_addr);
             std::process::exit(1);
         }
     };
@@ -52,10 +46,7 @@ fn run(config: ServerConfig) {
     let gateway = match GatewayRuntime::new(gateway_config.clone(), instrument) {
         Ok(gateway) => gateway,
         Err(error) => {
-            eprintln!(
-                "failed to open trading gateway listener {}: {error:?}",
-                gateway_config.bind_addr
-            );
+            eprintln!("failed to open trading gateway listener {}: {error:?}", gateway_config.bind_addr);
             std::process::exit(1);
         }
     };
@@ -71,8 +62,7 @@ fn run(config: ServerConfig) {
         }
     };
 
-    let mut runtime = match Runtime::new(engine_config, risk_config, control, gateway, market_data)
-    {
+    let mut runtime = match Runtime::new(engine_config, risk_config, control, gateway, market_data) {
         Ok(runtime) => runtime,
         Err(error) => {
             eprintln!("failed to construct runtime: {error:?}");

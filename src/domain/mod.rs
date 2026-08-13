@@ -96,27 +96,24 @@ impl EngineSeq {
 
 /// Deterministic sequence allocator for execution/control streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EngineSequencer {
+pub struct Sequencer {
     next: u64,
 }
 
-impl Default for EngineSequencer {
+impl Default for Sequencer {
     fn default() -> Self {
         Self { next: 1 }
     }
 }
 
-impl EngineSequencer {
+impl Sequencer {
     pub const fn new(next: u64) -> Self {
         Self { next }
     }
 
     pub fn next_engine_seq(&mut self) -> DomainResult<EngineSeq> {
         let current = self.next;
-        self.next = self
-            .next
-            .checked_add(1)
-            .ok_or(DomainError::SequenceOverflow)?;
+        self.next = self.next.checked_add(1).ok_or(DomainError::SequenceOverflow)?;
         Ok(EngineSeq(current))
     }
 }
@@ -172,10 +169,7 @@ impl DomainError {
         match self {
             Self::InvalidPrice => RejectReason::InvalidPrice,
             Self::InvalidQuantity => RejectReason::InvalidQuantity,
-            Self::Malformed
-            | Self::InvalidInstrumentSpec
-            | Self::UnsupportedMessage
-            | Self::SequenceOverflow => RejectReason::Malformed,
+            Self::Malformed | Self::InvalidInstrumentSpec | Self::UnsupportedMessage | Self::SequenceOverflow => RejectReason::Malformed,
         }
     }
 }
@@ -185,20 +179,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn engine_sequencer_is_monotonic() {
-        let mut engine = EngineSequencer::default();
+    fn sequencer_is_monotonic() {
+        let mut sequencer = Sequencer::default();
 
-        assert_eq!(engine.next_engine_seq().expect("seq").raw(), 1);
-        assert_eq!(engine.next_engine_seq().expect("seq").raw(), 2);
+        assert_eq!(sequencer.next_engine_seq().expect("seq").raw(), 1);
+        assert_eq!(sequencer.next_engine_seq().expect("seq").raw(), 2);
     }
 
     #[test]
-    fn engine_sequencer_reports_overflow() {
-        let mut engine = EngineSequencer::new(u64::MAX - 1);
-        assert_eq!(
-            engine.next_engine_seq().expect("penultimate seq").raw(),
-            u64::MAX - 1
-        );
-        assert_eq!(engine.next_engine_seq(), Err(DomainError::SequenceOverflow));
+    fn sequencer_reports_overflow() {
+        let mut sequencer = Sequencer::new(u64::MAX - 1);
+        assert_eq!(sequencer.next_engine_seq().expect("penultimate seq").raw(), u64::MAX - 1);
+        assert_eq!(sequencer.next_engine_seq(), Err(DomainError::SequenceOverflow));
     }
 }

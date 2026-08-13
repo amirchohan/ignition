@@ -20,7 +20,7 @@
 
 use crate::{
     domain::{
-        DomainError, EngineSequencer, ProtocolErrorEvent, RecvTs, RejectReason,
+        DomainError, ProtocolErrorEvent, RecvTs, RejectReason, Sequencer,
         rd::InstrumentSpec,
         trading::order::{AccountId, ExecType, ExecutionReport, OrdStatus, OrderEntry, OrderId},
     },
@@ -32,8 +32,8 @@ use crate::{
             trading::{
                 encode_execution_report,
                 order::{
-                    WireCancelOrder, WireCancelReplace, WireMassCancel, WireNewOrder,
-                    WireOrderEntry, decode_order_entry, normalize_order_entry,
+                    WireCancelOrder, WireCancelReplace, WireMassCancel, WireNewOrder, WireOrderEntry, decode_order_entry,
+                    normalize_order_entry,
                 },
             },
         },
@@ -88,18 +88,15 @@ impl GatewayPublisher<'_, '_> {
         Ok(())
     }
 
-    /// Return the first deferred egress failure recorded by sink-style emission.
-    pub fn finish(&mut self) -> Result<(), GatewayError> {
+    /// Return the first egress failure deferred by sink-style emission.
+    pub fn check_deferred_error(&mut self) -> Result<(), GatewayError> {
         match self.first_error.take() {
             Some(error) => Err(error),
             None => Ok(()),
         }
     }
 
-    fn publish_protocol_error_event(
-        &mut self,
-        event: ProtocolErrorEvent,
-    ) -> Result<(), GatewayError> {
+    fn publish_protocol_error_event(&mut self, event: ProtocolErrorEvent) -> Result<(), GatewayError> {
         let written = encode_protocol_error(event, self.encode_buf)?;
         self.io.queue_frame(&self.encode_buf[..written])?;
         Ok(())
@@ -107,7 +104,7 @@ impl GatewayPublisher<'_, '_> {
 }
 
 impl GatewayPublisher<'_, '_> {
-    /// Queue one execution report and defer the first egress failure until `finish`.
+    /// Queue one execution report and defer the first egress failure until checked.
     pub fn emit_execution_report(&mut self, report: ExecutionReport) {
         if self.first_error.is_some() {
             return;
@@ -140,11 +137,7 @@ impl GatewayRuntime {
     /// reads already-normalized state. The encode buffer is sized once from
     /// `max_frame_len` and reused for every trading event.
     pub fn new(config: GatewayConfig, instrument: InstrumentSpec) -> Result<Self, GatewayError> {
-        let io = TcpFrameIo::bind(
-            &config.bind_addr,
-            config.max_frame_len,
-            config.max_pending_write_bytes,
-        )?;
+        let io = TcpFrameIo::bind(&config.bind_addr, config.max_frame_len, config.max_pending_write_bytes)?;
         Ok(Self {
             io,
             encode_buf: vec![0_u8; config.max_frame_len],
@@ -165,13 +158,9 @@ impl GatewayRuntime {
     /// The returned boolean means forward progress was made by the underlying
     /// transport or frame processing. It is deliberately not a count; callers
     /// should observe state or output streams for behavior-specific assertions.
-    pub fn poll<F, E>(
-        &mut self,
-        sequencer: &mut EngineSequencer,
-        mut on_order: F,
-    ) -> Result<bool, GatewayPollError<E>>
+    pub fn poll<F, E>(&mut self, sequencer: &mut Sequencer, mut on_order: F) -> Result<bool, GatewayPollError<E>>
     where
-        F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut EngineSequencer) -> Result<(), E>,
+        F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), E>,
     {
         let mut session = GatewaySession {
             encode_buf: &mut self.encode_buf,
@@ -199,8 +188,8 @@ impl GatewayRuntime {
         self.io.flush_pending().map_err(GatewayError::Io)
     }
 
-    /// Return the first deferred egress failure recorded by sink-style emission.
-    pub fn finish(&mut self) -> Result<(), GatewayError> {
+    /// Return the first egress failure deferred by sink-style emission.
+    pub fn check_deferred_error(&mut self) -> Result<(), GatewayError> {
         match self.first_error.take() {
             Some(error) => Err(error),
             None => Ok(()),
@@ -215,7 +204,7 @@ impl GatewayRuntime {
 }
 
 impl GatewayRuntime {
-    /// Queue one execution report and defer the first egress failure until `finish`.
+    /// Queue one execution report and defer the first egress failure until checked.
     pub fn emit_execution_report(&mut self, report: ExecutionReport) {
         if self.first_error.is_some() {
             return;
@@ -229,21 +218,16 @@ impl GatewayRuntime {
 struct GatewaySession<'a, F> {
     encode_buf: &'a mut Vec<u8>,
     instrument: InstrumentSpec,
-    sequencer: &'a mut EngineSequencer,
+    sequencer: &'a mut Sequencer,
     on_order: &'a mut F,
     handled_frame: bool,
 }
 
 impl<F, E> GatewaySession<'_, F>
 where
-    F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut EngineSequencer) -> Result<(), E>,
+    F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), E>,
 {
-    fn on_frame(
-        &mut self,
-        io_publisher: &mut TcpFramePublisher<'_>,
-        recv_ts: RecvTs,
-        bytes: &[u8],
-    ) -> Result<(), GatewayPollError<E>> {
+    fn on_frame(&mut self, io_publisher: &mut TcpFramePublisher<'_>, recv_ts: RecvTs, bytes: &[u8]) -> Result<(), GatewayPollError<E>> {
         self.handled_frame = true;
         let mut publisher = GatewayPublisher {
             io: io_publisher,
@@ -253,26 +237,18 @@ where
 
         let result = match decode_order_entry(bytes) {
             Ok(wire) => match normalize_order_entry(wire, recv_ts, &self.instrument) {
-                Ok(entry) => (self.on_order)(entry, &mut publisher, self.sequencer)
-                    .map_err(GatewayPollError::Handler),
-                Err(error) => publish_order_shape_reject(
-                    self.sequencer,
-                    wire,
-                    error.reject_reason(),
-                    &mut publisher,
-                ),
+                Ok(entry) => (self.on_order)(entry, &mut publisher, self.sequencer).map_err(GatewayPollError::Handler),
+                Err(error) => publish_order_shape_reject(self.sequencer, wire, error.reject_reason(), &mut publisher),
             },
-            Err(error) => {
-                publish_protocol_error(self.sequencer, error, bytes, recv_ts, &mut publisher)
-            }
+            Err(error) => publish_protocol_error(self.sequencer, error, bytes, recv_ts, &mut publisher),
         };
         result?;
-        publisher.finish().map_err(GatewayPollError::Gateway)
+        publisher.check_deferred_error().map_err(GatewayPollError::Gateway)
     }
 }
 
 fn publish_order_shape_reject<E>(
-    sequencer: &mut EngineSequencer,
+    sequencer: &mut Sequencer,
     wire: WireOrderEntry,
     reason: RejectReason,
     publisher: &mut GatewayPublisher<'_, '_>,
@@ -280,14 +256,12 @@ fn publish_order_shape_reject<E>(
     let reject = reject_report(sequencer, wire, reason)
         .map_err(GatewayError::Domain)
         .map_err(GatewayPollError::Gateway)?;
-    publisher
-        .publish_execution_report(reject)
-        .map_err(GatewayPollError::Gateway)?;
+    publisher.publish_execution_report(reject).map_err(GatewayPollError::Gateway)?;
     Ok(())
 }
 
 fn publish_protocol_error<E>(
-    sequencer: &mut EngineSequencer,
+    sequencer: &mut Sequencer,
     error: ProtocolError,
     bytes: &[u8],
     recv_ts: RecvTs,
@@ -307,11 +281,7 @@ fn publish_protocol_error<E>(
         .map_err(GatewayPollError::Gateway)
 }
 
-fn reject_report(
-    sequencer: &mut EngineSequencer,
-    wire: WireOrderEntry,
-    reason: RejectReason,
-) -> Result<ExecutionReport, DomainError> {
+fn reject_report(sequencer: &mut Sequencer, wire: WireOrderEntry, reason: RejectReason) -> Result<ExecutionReport, DomainError> {
     let (client_order_id, account_id, remaining_qty) = match wire {
         WireOrderEntry::NewOrder(WireNewOrder {
             client_order_id,
@@ -391,9 +361,8 @@ mod tests {
         protocol::{
             MessageKind, SBE_HEADER_LEN, SCHEMA_VERSION, decode_header, encode_header,
             generated::codecs::{
-                ReadBuf, WriteBuf, execution_report_codec, kill_switch_action, kill_switch_codec,
-                new_order_codec, order_type as wire_order_type,
-                reject_reason as wire_reject_reason, side as wire_side, time_in_force as wire_tif,
+                ReadBuf, WriteBuf, execution_report_codec, kill_switch_action, kill_switch_codec, new_order_codec,
+                order_type as wire_order_type, reject_reason as wire_reject_reason, side as wire_side, time_in_force as wire_tif,
             },
         },
     };
@@ -424,26 +393,16 @@ mod tests {
         };
         match GatewayRuntime::new(config, instrument()) {
             Ok(gateway) => Some((gateway, bind_addr)),
-            Err(GatewayError::Io(IoError::Bind(error)))
-                if error.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                None
-            }
+            Err(GatewayError::Io(IoError::Bind(error))) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
             Err(error) => panic!("gateway: {error:?}"),
         }
     }
 
     fn new_order_frame(qty: u64) -> Vec<u8> {
         let mut bytes = vec![0_u8; SBE_HEADER_LEN + new_order_codec::SBE_BLOCK_LENGTH as usize];
-        encode_header(
-            &mut bytes,
-            new_order_codec::SBE_BLOCK_LENGTH,
-            MessageKind::NewOrder,
-        )
-        .expect("header");
+        encode_header(&mut bytes, new_order_codec::SBE_BLOCK_LENGTH, MessageKind::NewOrder).expect("header");
         let write_buf = WriteBuf::new(&mut bytes);
-        let mut encoder =
-            new_order_codec::NewOrderEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+        let mut encoder = new_order_codec::NewOrderEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
         encoder
             .client_order_id(11)
             .account_id(22)
@@ -458,18 +417,10 @@ mod tests {
 
     fn kill_switch_frame() -> Vec<u8> {
         let mut bytes = vec![0_u8; SBE_HEADER_LEN + kill_switch_codec::SBE_BLOCK_LENGTH as usize];
-        encode_header(
-            &mut bytes,
-            kill_switch_codec::SBE_BLOCK_LENGTH,
-            MessageKind::KillSwitch,
-        )
-        .expect("header");
+        encode_header(&mut bytes, kill_switch_codec::SBE_BLOCK_LENGTH, MessageKind::KillSwitch).expect("header");
         let write_buf = WriteBuf::new(&mut bytes);
-        let mut encoder =
-            kill_switch_codec::KillSwitchEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
-        encoder
-            .request_id(1)
-            .action(kill_switch_action::KillSwitchAction::HaltTrading);
+        let mut encoder = kill_switch_codec::KillSwitchEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+        encoder.request_id(1).action(kill_switch_action::KillSwitchAction::HaltTrading);
         bytes
     }
 
@@ -479,20 +430,13 @@ mod tests {
         let frame_len = SBE_HEADER_LEN + u16::from_le_bytes([header[0], header[1]]) as usize;
         let mut frame = vec![0_u8; frame_len];
         frame[..SBE_HEADER_LEN].copy_from_slice(&header);
-        client
-            .read_exact(&mut frame[SBE_HEADER_LEN..])
-            .expect("read payload");
+        client.read_exact(&mut frame[SBE_HEADER_LEN..]).expect("read payload");
         frame
     }
 
-    fn poll_until_progress<F>(gateway: &mut GatewayRuntime, sequencer: &mut EngineSequencer, f: F)
+    fn poll_until_progress<F>(gateway: &mut GatewayRuntime, sequencer: &mut Sequencer, f: F)
     where
-        F: FnMut(
-                OrderEntry,
-                &mut GatewayPublisher<'_, '_>,
-                &mut EngineSequencer,
-            ) -> Result<(), GatewayError>
-            + Copy,
+        F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), GatewayError> + Copy,
     {
         for _ in 0..100 {
             if gateway.poll(sequencer, f).expect("poll") {
@@ -523,28 +467,19 @@ mod tests {
             return;
         };
         let mut client = TcpStream::connect(bind_addr).expect("connect");
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("timeout");
+        client.set_read_timeout(Some(Duration::from_secs(1))).expect("timeout");
         client.write_all(&new_order_frame(10)).expect("write");
-        let mut sequencer = EngineSequencer::default();
+        let mut sequencer = Sequencer::default();
 
-        poll_until_progress(
-            &mut gateway,
-            &mut sequencer,
-            |entry, publisher, sequencer| {
-                let OrderEntry::NewOrder(order) = entry else {
-                    panic!("new order");
-                };
-                publisher.publish_execution_report(ack_report(order, sequencer.next_engine_seq()?))
-            },
-        );
+        poll_until_progress(&mut gateway, &mut sequencer, |entry, publisher, sequencer| {
+            let OrderEntry::NewOrder(order) = entry else {
+                panic!("new order");
+            };
+            publisher.publish_execution_report(ack_report(order, sequencer.next_engine_seq()?))
+        });
 
         let frame = read_gateway_frame(&mut client);
-        assert_eq!(
-            decode_header(&frame).expect("header").kind,
-            MessageKind::ExecutionReport
-        );
+        assert_eq!(decode_header(&frame).expect("header").kind, MessageKind::ExecutionReport);
         let decoder = execution_report_codec::ExecutionReportDecoder::default().wrap(
             ReadBuf::new(&frame),
             SBE_HEADER_LEN,
@@ -562,11 +497,9 @@ mod tests {
             return;
         };
         let mut client = TcpStream::connect(bind_addr).expect("connect");
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("timeout");
+        client.set_read_timeout(Some(Duration::from_secs(1))).expect("timeout");
         client.write_all(&new_order_frame(0)).expect("write");
-        let mut sequencer = EngineSequencer::default();
+        let mut sequencer = Sequencer::default();
         let mut callback_seen = false;
 
         for _ in 0..100 {
@@ -584,10 +517,7 @@ mod tests {
 
         assert!(!callback_seen);
         let frame = read_gateway_frame(&mut client);
-        assert_eq!(
-            decode_header(&frame).expect("header").kind,
-            MessageKind::ExecutionReport
-        );
+        assert_eq!(decode_header(&frame).expect("header").kind, MessageKind::ExecutionReport);
         let decoder = execution_report_codec::ExecutionReportDecoder::default().wrap(
             ReadBuf::new(&frame),
             SBE_HEADER_LEN,
@@ -595,10 +525,7 @@ mod tests {
             SCHEMA_VERSION,
         );
         assert_eq!(decoder.client_order_id(), 11);
-        assert_eq!(
-            decoder.reject_reason(),
-            wire_reject_reason::RejectReason::InvalidQuantity
-        );
+        assert_eq!(decoder.reject_reason(), wire_reject_reason::RejectReason::InvalidQuantity);
     }
 
     #[test]
@@ -607,20 +534,15 @@ mod tests {
             return;
         };
         let mut client = TcpStream::connect(bind_addr).expect("connect");
-        client
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .expect("timeout");
+        client.set_read_timeout(Some(Duration::from_secs(1))).expect("timeout");
         client.write_all(&kill_switch_frame()).expect("write");
-        let mut sequencer = EngineSequencer::default();
+        let mut sequencer = Sequencer::default();
 
         poll_until_progress(&mut gateway, &mut sequencer, |_, _, _| {
             panic!("wrong endpoint should not reach callback")
         });
 
         let frame = read_gateway_frame(&mut client);
-        assert_eq!(
-            decode_header(&frame).expect("header").kind,
-            MessageKind::ProtocolError
-        );
+        assert_eq!(decode_header(&frame).expect("header").kind, MessageKind::ProtocolError);
     }
 }

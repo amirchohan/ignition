@@ -102,9 +102,7 @@ impl<'a> ReadBuf<'a> {
 
     #[inline]
     pub(crate) fn get_bytes_at<const N: usize>(slice: &[u8], index: usize) -> [u8; N] {
-        slice[index..index + N]
-            .try_into()
-            .expect("slice with incorrect length")
+        slice[index..index + N].try_into().expect("slice with incorrect length")
     }
 
     #[inline]

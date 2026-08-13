@@ -2,24 +2,22 @@ use crate::{
     domain::{
         ErrorCode, RecvTs,
         control::{
-            ControlEvent, ControlRequest, ControlResponse, Heartbeat, HeartbeatSeq,
-            HeartbeatStatus, KillSwitch, KillSwitchAction, RequestId, Snapshot, SnapshotBegin,
-            SnapshotEnd, SnapshotOrder,
+            ControlEvent, ControlRequest, ControlResponse, Heartbeat, HeartbeatSeq, HeartbeatStatus, KillSwitch, KillSwitchAction,
+            RequestId, Snapshot, SnapshotBegin, SnapshotEnd, SnapshotOrder,
         },
     },
     protocol::{
         MessageKind, ProtocolError, ProtocolResult, SBE_HEADER_LEN, decode_header, encode_header,
         generated::codecs::{
-            ReadBuf, WriteBuf, control_response_codec, heartbeat_codec, heartbeat_status_codec,
-            kill_switch_action, kill_switch_codec, snapshot_begin_codec, snapshot_codec,
-            snapshot_end_codec, snapshot_order_codec,
+            ReadBuf, WriteBuf, control_response_codec, heartbeat_codec, heartbeat_status_codec, kill_switch_action, kill_switch_codec,
+            snapshot_begin_codec, snapshot_codec, snapshot_end_codec, snapshot_order_codec,
         },
     },
 };
 
 use super::{
-    encode_protocol_error, ensure_complete, ensure_out, protocol_error_code, template_id,
-    to_wire_control_result, to_wire_reject_reason, to_wire_side, unexpected_template,
+    encode_protocol_error, ensure_complete, ensure_out, protocol_error_code, template_id, to_wire_control_result, to_wire_reject_reason,
+    to_wire_side, unexpected_template,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,44 +45,25 @@ impl WireDecodeError {
     }
 }
 
-pub fn decode_control_request(
-    input: &[u8],
-    recv_ts: RecvTs,
-) -> Result<ControlRequest, WireDecodeError> {
-    let frame =
-        decode_header(input).map_err(|error| WireDecodeError::protocol(error, input, recv_ts))?;
-    ensure_complete(input, frame)
-        .map_err(|error| WireDecodeError::protocol(error, input, recv_ts))?;
+pub fn decode_control_request(input: &[u8], recv_ts: RecvTs) -> Result<ControlRequest, WireDecodeError> {
+    let frame = decode_header(input).map_err(|error| WireDecodeError::protocol(error, input, recv_ts))?;
+    ensure_complete(input, frame).map_err(|error| WireDecodeError::protocol(error, input, recv_ts))?;
 
     if !frame.kind.is_control_request() {
-        return Err(WireDecodeError::protocol(
-            unexpected_template(frame.kind),
-            input,
-            recv_ts,
-        ));
+        return Err(WireDecodeError::protocol(unexpected_template(frame.kind), input, recv_ts));
     }
 
     let read_buf = ReadBuf::new(input);
     match frame.kind {
         MessageKind::KillSwitch => {
-            let decoder = kill_switch_codec::KillSwitchDecoder::default().wrap(
-                read_buf,
-                SBE_HEADER_LEN,
-                frame.block_length,
-                frame.version,
-            );
+            let decoder = kill_switch_codec::KillSwitchDecoder::default().wrap(read_buf, SBE_HEADER_LEN, frame.block_length, frame.version);
             Ok(ControlRequest::KillSwitch(KillSwitch {
-                request_id: RequestId::new(decoder.request_id())
-                    .map_err(|_| WireDecodeError::domain(input, recv_ts))?,
+                request_id: RequestId::new(decoder.request_id()).map_err(|_| WireDecodeError::domain(input, recv_ts))?,
                 recv_ts,
                 action: match decoder.action() {
-                    kill_switch_action::KillSwitchAction::HaltTrading => {
-                        KillSwitchAction::HaltTrading
-                    }
+                    kill_switch_action::KillSwitchAction::HaltTrading => KillSwitchAction::HaltTrading,
                     kill_switch_action::KillSwitchAction::Shutdown => KillSwitchAction::Shutdown,
-                    kill_switch_action::KillSwitchAction::ResumeTrading => {
-                        KillSwitchAction::ResumeTrading
-                    }
+                    kill_switch_action::KillSwitchAction::ResumeTrading => KillSwitchAction::ResumeTrading,
                     kill_switch_action::KillSwitchAction::NullVal => {
                         return Err(WireDecodeError::domain(input, recv_ts));
                     }
@@ -92,28 +71,16 @@ pub fn decode_control_request(
             }))
         }
         MessageKind::Snapshot => {
-            let decoder = snapshot_codec::SnapshotDecoder::default().wrap(
-                read_buf,
-                SBE_HEADER_LEN,
-                frame.block_length,
-                frame.version,
-            );
+            let decoder = snapshot_codec::SnapshotDecoder::default().wrap(read_buf, SBE_HEADER_LEN, frame.block_length, frame.version);
             Ok(ControlRequest::Snapshot(Snapshot {
-                request_id: RequestId::new(decoder.request_id())
-                    .map_err(|_| WireDecodeError::domain(input, recv_ts))?,
+                request_id: RequestId::new(decoder.request_id()).map_err(|_| WireDecodeError::domain(input, recv_ts))?,
                 recv_ts,
             }))
         }
         MessageKind::Heartbeat => {
-            let decoder = heartbeat_codec::HeartbeatDecoder::default().wrap(
-                read_buf,
-                SBE_HEADER_LEN,
-                frame.block_length,
-                frame.version,
-            );
+            let decoder = heartbeat_codec::HeartbeatDecoder::default().wrap(read_buf, SBE_HEADER_LEN, frame.block_length, frame.version);
             Ok(ControlRequest::Heartbeat(Heartbeat {
-                heartbeat_seq: HeartbeatSeq::new(decoder.heartbeat_seq())
-                    .map_err(|_| WireDecodeError::domain(input, recv_ts))?,
+                heartbeat_seq: HeartbeatSeq::new(decoder.heartbeat_seq()).map_err(|_| WireDecodeError::domain(input, recv_ts))?,
                 recv_ts,
             }))
         }
@@ -138,8 +105,7 @@ fn encode_control_response(event: ControlResponse, out: &mut [u8]) -> ProtocolRe
     encode_header(out, block_len, MessageKind::ControlResponse)?;
 
     let write_buf = WriteBuf::new(out);
-    let mut encoder =
-        control_response_codec::ControlResponseEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    let mut encoder = control_response_codec::ControlResponseEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
     encoder
         .engine_seq(event.engine_seq.raw())
         .request_id(event.request_id.raw())
@@ -155,8 +121,7 @@ fn encode_heartbeat_status(event: HeartbeatStatus, out: &mut [u8]) -> ProtocolRe
     encode_header(out, block_len, MessageKind::HeartbeatStatus)?;
 
     let write_buf = WriteBuf::new(out);
-    let mut encoder =
-        heartbeat_status_codec::HeartbeatStatusEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    let mut encoder = heartbeat_status_codec::HeartbeatStatusEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
     encoder
         .engine_seq(event.engine_seq.raw())
         .heartbeat_seq(event.heartbeat_seq.raw())
@@ -171,8 +136,7 @@ fn encode_snapshot_begin(event: SnapshotBegin, out: &mut [u8]) -> ProtocolResult
     encode_header(out, block_len, MessageKind::SnapshotBegin)?;
 
     let write_buf = WriteBuf::new(out);
-    let mut encoder =
-        snapshot_begin_codec::SnapshotBeginEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    let mut encoder = snapshot_begin_codec::SnapshotBeginEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
     encoder
         .engine_seq(event.engine_seq.raw())
         .request_id(event.request_id.raw())
@@ -194,8 +158,7 @@ fn encode_snapshot_order(event: SnapshotOrder, out: &mut [u8]) -> ProtocolResult
     encode_header(out, block_len, MessageKind::SnapshotOrder)?;
 
     let write_buf = WriteBuf::new(out);
-    let mut encoder =
-        snapshot_order_codec::SnapshotOrderEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    let mut encoder = snapshot_order_codec::SnapshotOrderEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
     encoder
         .engine_seq(event.engine_seq.raw())
         .request_id(event.request_id.raw())
@@ -214,8 +177,7 @@ fn encode_snapshot_end(event: SnapshotEnd, out: &mut [u8]) -> ProtocolResult<usi
     encode_header(out, block_len, MessageKind::SnapshotEnd)?;
 
     let write_buf = WriteBuf::new(out);
-    let mut encoder =
-        snapshot_end_codec::SnapshotEndEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
+    let mut encoder = snapshot_end_codec::SnapshotEndEncoder::default().wrap(write_buf, SBE_HEADER_LEN);
     encoder
         .engine_seq(event.engine_seq.raw())
         .request_id(event.request_id.raw())
@@ -232,18 +194,15 @@ mod tests {
     use crate::{
         domain::{
             EngineSeq, ErrorCode, Price, ProtocolErrorEvent, RecvTs, RejectReason,
-            control::{
-                ControlResult, HeartbeatSeq, HeartbeatStatus, RequestId, SnapshotBegin,
-                SnapshotEnd, SnapshotOrder,
-            },
+            control::{ControlResult, HeartbeatSeq, HeartbeatStatus, RequestId, SnapshotBegin, SnapshotEnd, SnapshotOrder},
             rd::InstrumentSpec,
             trading::order::{AccountId, OrderId, Side},
         },
         protocol::{
             SCHEMA_VERSION, decode_header,
             generated::codecs::{
-                ReadBuf, message_header_codec, protocol_error_codec, side as wire_side,
-                snapshot_begin_codec, snapshot_end_codec, snapshot_order_codec,
+                ReadBuf, message_header_codec, protocol_error_codec, side as wire_side, snapshot_begin_codec, snapshot_end_codec,
+                snapshot_order_codec,
             },
         },
     };
@@ -270,13 +229,9 @@ mod tests {
         )
         .expect("encode heartbeat status");
         assert_eq!(written, bytes.len());
-        assert_eq!(
-            decode_header(&bytes).expect("header").kind,
-            MessageKind::HeartbeatStatus
-        );
+        assert_eq!(decode_header(&bytes).expect("header").kind, MessageKind::HeartbeatStatus);
 
-        let mut error_bytes =
-            [0_u8; SBE_HEADER_LEN + protocol_error_codec::SBE_BLOCK_LENGTH as usize];
+        let mut error_bytes = [0_u8; SBE_HEADER_LEN + protocol_error_codec::SBE_BLOCK_LENGTH as usize];
         encode_control_event(
             ControlEvent::ProtocolError(ProtocolErrorEvent {
                 engine_seq: EngineSeq::new(8),
@@ -288,20 +243,15 @@ mod tests {
         )
         .expect("encode protocol error");
 
-        let decoder = message_header_codec::MessageHeaderDecoder::default()
-            .wrap(ReadBuf::new(&error_bytes), 0);
-        assert_eq!(
-            decoder.template_id(),
-            MessageKind::ProtocolError.template_id()
-        );
+        let decoder = message_header_codec::MessageHeaderDecoder::default().wrap(ReadBuf::new(&error_bytes), 0);
+        assert_eq!(decoder.template_id(), MessageKind::ProtocolError.template_id());
     }
 
     #[test]
     fn control_event_encodes_snapshot_messages() {
         let request_id = RequestId::new(99).expect("request");
 
-        let mut begin_bytes =
-            [0_u8; SBE_HEADER_LEN + snapshot_begin_codec::SBE_BLOCK_LENGTH as usize];
+        let mut begin_bytes = [0_u8; SBE_HEADER_LEN + snapshot_begin_codec::SBE_BLOCK_LENGTH as usize];
         encode_control_event(
             ControlEvent::SnapshotBegin(SnapshotBegin {
                 engine_seq: EngineSeq::new(1),
@@ -319,10 +269,7 @@ mod tests {
             &mut begin_bytes,
         )
         .expect("encode begin");
-        assert_eq!(
-            decode_header(&begin_bytes).expect("header").kind,
-            MessageKind::SnapshotBegin
-        );
+        assert_eq!(decode_header(&begin_bytes).expect("header").kind, MessageKind::SnapshotBegin);
         let begin = snapshot_begin_codec::SnapshotBeginDecoder::default().wrap(
             ReadBuf::new(&begin_bytes),
             SBE_HEADER_LEN,
@@ -333,8 +280,7 @@ mod tests {
         assert_eq!(begin.ask_price(), 0);
         assert_eq!(begin.last_md_seq(), 44);
 
-        let mut row_bytes =
-            [0_u8; SBE_HEADER_LEN + snapshot_order_codec::SBE_BLOCK_LENGTH as usize];
+        let mut row_bytes = [0_u8; SBE_HEADER_LEN + snapshot_order_codec::SBE_BLOCK_LENGTH as usize];
         encode_control_event(
             ControlEvent::SnapshotOrder(SnapshotOrder {
                 engine_seq: EngineSeq::new(2),
@@ -371,9 +317,6 @@ mod tests {
             &mut end_bytes,
         )
         .expect("encode end");
-        assert_eq!(
-            decode_header(&end_bytes).expect("header").kind,
-            MessageKind::SnapshotEnd
-        );
+        assert_eq!(decode_header(&end_bytes).expect("header").kind, MessageKind::SnapshotEnd);
     }
 }

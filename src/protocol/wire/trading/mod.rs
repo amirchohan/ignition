@@ -119,10 +119,7 @@ mod tests {
 
         let mut bytes = [0_u8; 128];
         let written = encode_execution_report(report, &mut bytes).expect("encode");
-        assert_eq!(
-            decode_header(&bytes[..written]).expect("header").kind,
-            MessageKind::ExecutionReport
-        );
+        assert_eq!(decode_header(&bytes[..written]).expect("header").kind, MessageKind::ExecutionReport);
 
         for (event, kind) in market_data {
             let mut bytes = [0_u8; 128];

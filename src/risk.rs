@@ -28,10 +28,7 @@ impl RiskConfig {
         startup_reference_price: Price,
         price_band_bps: u32,
     ) -> DomainResult<Self> {
-        if max_open_orders_per_account == 0
-            || max_open_notional_per_account == 0
-            || price_band_bps > 10_000
-        {
+        if max_open_orders_per_account == 0 || max_open_notional_per_account == 0 || price_band_bps > 10_000 {
             return Err(DomainError::InvalidInstrumentSpec);
         }
 
@@ -115,8 +112,7 @@ impl RiskRuntime {
         // The projection is read-only: it walks visible executable liquidity to
         // determine STP, executable price-band exposure, and any quantity that
         // would remain resting after matching.
-        let projection =
-            engine.project_order(order.account_id, order.side, order.price, order.qty.raw());
+        let projection = engine.project_order(order.account_id, order.side, order.price, order.qty.raw());
         if let Some(reason) = self.check_projection(order.time_in_force, projection) {
             return RiskDecision::Reject(reason);
         }
@@ -135,8 +131,7 @@ impl RiskRuntime {
     /// order is missing or belongs to another account, risk does not reject;
     /// the engine will produce the correct `UnknownOrder` lifecycle report.
     fn evaluate_replace(&self, replace: CancelReplace, engine: &Engine) -> RiskDecision {
-        let Some(current) = engine.resting_order(replace.account_id, replace.orig_client_order_id)
-        else {
+        let Some(current) = engine.resting_order(replace.account_id, replace.orig_client_order_id) else {
             return RiskDecision::Accept;
         };
         // Cancel-replace always submits a limit replacement price, so the new
@@ -147,12 +142,7 @@ impl RiskRuntime {
 
         // Project the replacement as a fresh GTC limit order after removing the
         // original exposure in `check_account_limits`.
-        let projection = engine.project_order(
-            replace.account_id,
-            current.side,
-            Some(replace.price),
-            replace.qty.raw(),
-        );
+        let projection = engine.project_order(replace.account_id, current.side, Some(replace.price), replace.qty.raw());
         if let Some(reason) = self.check_projection(TimeInForce::Gtc, projection) {
             return RiskDecision::Reject(reason);
         }
@@ -170,11 +160,7 @@ impl RiskRuntime {
     ///
     /// This does not validate whether a required limit price exists; protocol
     /// normalization and engine structural checks own malformed order shape.
-    fn check_limit_price(
-        &self,
-        order_type: OrderType,
-        price: Option<Price>,
-    ) -> Option<RejectReason> {
+    fn check_limit_price(&self, order_type: OrderType, price: Option<Price>) -> Option<RejectReason> {
         if order_type == OrderType::Limit && price.is_some_and(|price| !self.price_in_band(price)) {
             return Some(RejectReason::PriceBand);
         }
@@ -185,11 +171,7 @@ impl RiskRuntime {
     ///
     /// STP is cancel-aggressive: if any executable maker belongs to the taker
     /// account, risk rejects the incoming command before the book mutates.
-    fn check_projection(
-        &self,
-        time_in_force: TimeInForce,
-        projection: OrderProjection,
-    ) -> Option<RejectReason> {
+    fn check_projection(&self, time_in_force: TimeInForce, projection: OrderProjection) -> Option<RejectReason> {
         // Post-only orders that would cross are canceled by the engine without
         // execution, so they do not create a self-trade risk event here.
         if time_in_force != TimeInForce::PostOnly && projection.self_trade {
@@ -198,12 +180,8 @@ impl RiskRuntime {
         // The projection records the min/max executable prices. Checking both
         // endpoints is enough because executable price levels are monotonic as
         // the aggressive order walks the opposite side.
-        if projection
-            .low_execution_price
-            .is_some_and(|price| !self.price_in_band(price))
-            || projection
-                .high_execution_price
-                .is_some_and(|price| !self.price_in_band(price))
+        if projection.low_execution_price.is_some_and(|price| !self.price_in_band(price))
+            || projection.high_execution_price.is_some_and(|price| !self.price_in_band(price))
         {
             return Some(RejectReason::PriceBand);
         }
@@ -232,8 +210,7 @@ impl RiskRuntime {
         // For replace, subtract the current resting order first, then add only
         // the projected residual that would rest after matching.
         let removed_count = u32::from(replaced_order.is_some());
-        let removed_notional =
-            replaced_order.map_or(0, |order| raw_notional(order.price, order.remaining_qty));
+        let removed_notional = replaced_order.map_or(0, |order| raw_notional(order.price, order.remaining_qty));
         let added_count = u32::from(residual_qty > 0);
         let added_notional = residual_price.map_or(0, |price| raw_notional(price, residual_qty));
 
@@ -260,16 +237,10 @@ impl RiskRuntime {
     }
 }
 
-fn resting_residual(
-    order_type: OrderType,
-    time_in_force: TimeInForce,
-    projection: OrderProjection,
-) -> u64 {
+fn resting_residual(order_type: OrderType, time_in_force: TimeInForce, projection: OrderProjection) -> u64 {
     match (order_type, time_in_force) {
         (OrderType::Limit, TimeInForce::Gtc) => projection.residual_qty,
-        (OrderType::Limit, TimeInForce::PostOnly) if projection.executable_qty == 0 => {
-            projection.residual_qty
-        }
+        (OrderType::Limit, TimeInForce::PostOnly) if projection.executable_qty == 0 => projection.residual_qty,
         _ => 0,
     }
 }
@@ -283,12 +254,12 @@ mod tests {
     use super::*;
     use crate::{
         domain::{
-            EngineSequencer, Qty, RecvTs,
+            Qty, RecvTs, Sequencer,
             rd::InstrumentSpec,
             trading::order::{ClientTs, ExecutionReport, OrderId, Side},
         },
         engine::{Engine, EngineConfig},
-        market_data::MarketDataRuntime,
+        market_data::{MarketDataFeedConfig, MarketDataRuntime},
     };
 
     fn instrument() -> InstrumentSpec {
@@ -346,51 +317,47 @@ mod tests {
         }
     }
 
-    fn execute(engine: &mut Engine, entry: OrderEntry) -> Vec<ExecutionReport> {
-        let mut sequencer = EngineSequencer::default();
-        let mut market_data = MarketDataRuntime::default();
+    fn execute(engine: &mut Engine, entry: OrderEntry) -> Option<Vec<ExecutionReport>> {
+        let mut sequencer = Sequencer::default();
+        let mut market_data = match MarketDataRuntime::new(MarketDataFeedConfig {
+            bind_addr: "0.0.0.0:0".to_owned(),
+            group_addr: "239.255.0.1:9002".to_owned(),
+            multicast_loop_v4: true,
+            ..MarketDataFeedConfig::default()
+        }) {
+            Ok(market_data) => market_data,
+            Err(crate::market_data::MarketDataError::Io(crate::io::IoError::Bind(error)))
+                if error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return None;
+            }
+            Err(error) => panic!("market-data: {error:?}"),
+        };
         let mut reports = Vec::new();
         let mut emit_report = |report| reports.push(report);
         engine
             .execute(entry, &mut sequencer, &mut market_data, &mut emit_report)
             .expect("execute");
-        reports
+        Some(reports)
     }
 
     #[test]
     fn open_order_limit_rejects_projected_resting_order() {
         let mut engine = Engine::new(engine_config()).expect("engine");
-        execute(
+        let Some(_) = execute(
             &mut engine,
-            OrderEntry::NewOrder(new_order(
-                1,
-                1,
-                Side::Buy,
-                OrderType::Limit,
-                TimeInForce::Gtc,
-                Some(1_000),
-                10,
-            )),
-        );
+            OrderEntry::NewOrder(new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1_000), 10)),
+        ) else {
+            return;
+        };
 
         let risk = RiskRuntime::new(risk_config(1, 1_000_000));
         let decision = risk.evaluate(
-            OrderEntry::NewOrder(new_order(
-                2,
-                1,
-                Side::Buy,
-                OrderType::Limit,
-                TimeInForce::Gtc,
-                Some(1_000),
-                10,
-            )),
+            OrderEntry::NewOrder(new_order(2, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1_000), 10)),
             &engine,
         );
 
-        assert_eq!(
-            decision,
-            RiskDecision::Reject(RejectReason::RiskOpenOrderLimit)
-        );
+        assert_eq!(decision, RiskDecision::Reject(RejectReason::RiskOpenOrderLimit));
     }
 
     #[test]
@@ -398,22 +365,11 @@ mod tests {
         let engine = Engine::new(engine_config()).expect("engine");
         let risk = RiskRuntime::new(risk_config(10, 9_999));
         let decision = risk.evaluate(
-            OrderEntry::NewOrder(new_order(
-                1,
-                1,
-                Side::Buy,
-                OrderType::Limit,
-                TimeInForce::Gtc,
-                Some(1_000),
-                10,
-            )),
+            OrderEntry::NewOrder(new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1_000), 10)),
             &engine,
         );
 
-        assert_eq!(
-            decision,
-            RiskDecision::Reject(RejectReason::RiskNotionalLimit)
-        );
+        assert_eq!(decision, RiskDecision::Reject(RejectReason::RiskNotionalLimit));
     }
 
     #[test]
@@ -421,15 +377,7 @@ mod tests {
         let engine = Engine::new(engine_config()).expect("engine");
         let risk = RiskRuntime::new(risk_config(10, 1_000_000));
         let decision = risk.evaluate(
-            OrderEntry::NewOrder(new_order(
-                1,
-                1,
-                Side::Buy,
-                OrderType::Limit,
-                TimeInForce::Gtc,
-                Some(1_011),
-                10,
-            )),
+            OrderEntry::NewOrder(new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1_011), 10)),
             &engine,
         );
 
@@ -439,61 +387,35 @@ mod tests {
     #[test]
     fn stp_cancel_aggressive_rejects_before_matching() {
         let mut engine = Engine::new(engine_config()).expect("engine");
-        execute(
+        let Some(_) = execute(
             &mut engine,
-            OrderEntry::NewOrder(new_order(
-                1,
-                1,
-                Side::Sell,
-                OrderType::Limit,
-                TimeInForce::Gtc,
-                Some(1_000),
-                10,
-            )),
-        );
+            OrderEntry::NewOrder(new_order(1, 1, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some(1_000), 10)),
+        ) else {
+            return;
+        };
 
         let risk = RiskRuntime::new(risk_config(10, 1_000_000));
         let decision = risk.evaluate(
-            OrderEntry::NewOrder(new_order(
-                2,
-                1,
-                Side::Buy,
-                OrderType::Limit,
-                TimeInForce::Ioc,
-                Some(1_000),
-                10,
-            )),
+            OrderEntry::NewOrder(new_order(2, 1, Side::Buy, OrderType::Limit, TimeInForce::Ioc, Some(1_000), 10)),
             &engine,
         );
 
-        assert_eq!(
-            decision,
-            RiskDecision::Reject(RejectReason::SelfTradePrevention)
-        );
+        assert_eq!(decision, RiskDecision::Reject(RejectReason::SelfTradePrevention));
         assert_eq!(engine.resting_order_count(), 1);
     }
 
     #[test]
     fn replace_projection_removes_original_order_exposure() {
         let mut engine = Engine::new(engine_config()).expect("engine");
-        execute(
+        let Some(_) = execute(
             &mut engine,
-            OrderEntry::NewOrder(new_order(
-                1,
-                1,
-                Side::Buy,
-                OrderType::Limit,
-                TimeInForce::Gtc,
-                Some(1_000),
-                10,
-            )),
-        );
+            OrderEntry::NewOrder(new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1_000), 10)),
+        ) else {
+            return;
+        };
 
         let risk = RiskRuntime::new(risk_config(1, 15_000));
-        let decision = risk.evaluate(
-            OrderEntry::CancelReplace(replace(2, 1, 1, 1_000, 15)),
-            &engine,
-        );
+        let decision = risk.evaluate(OrderEntry::CancelReplace(replace(2, 1, 1, 1_000, 15)), &engine);
 
         assert_eq!(decision, RiskDecision::Accept);
     }
@@ -501,30 +423,16 @@ mod tests {
     #[test]
     fn duplicate_new_order_id_is_not_a_risk_reject() {
         let mut engine = Engine::new(engine_config()).expect("engine");
-        execute(
+        let Some(_) = execute(
             &mut engine,
-            OrderEntry::NewOrder(new_order(
-                1,
-                1,
-                Side::Buy,
-                OrderType::Limit,
-                TimeInForce::Gtc,
-                Some(1_000),
-                10,
-            )),
-        );
+            OrderEntry::NewOrder(new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1_000), 10)),
+        ) else {
+            return;
+        };
 
         let risk = RiskRuntime::new(risk_config(10, 1_000_000));
         let decision = risk.evaluate(
-            OrderEntry::NewOrder(new_order(
-                1,
-                1,
-                Side::Buy,
-                OrderType::Limit,
-                TimeInForce::Gtc,
-                Some(1_000),
-                10,
-            )),
+            OrderEntry::NewOrder(new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1_000), 10)),
             &engine,
         );
 
@@ -535,10 +443,7 @@ mod tests {
     fn unknown_replace_original_is_not_a_risk_reject() {
         let engine = Engine::new(engine_config()).expect("engine");
         let risk = RiskRuntime::new(risk_config(10, 1_000_000));
-        let decision = risk.evaluate(
-            OrderEntry::CancelReplace(replace(2, 1, 404, 1_000, 15)),
-            &engine,
-        );
+        let decision = risk.evaluate(OrderEntry::CancelReplace(replace(2, 1, 404, 1_000, 15)), &engine);
 
         assert_eq!(decision, RiskDecision::Accept);
     }

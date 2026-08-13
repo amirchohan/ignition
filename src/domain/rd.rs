@@ -91,26 +91,14 @@ mod tests {
 
     #[test]
     fn instrument_rejects_invalid_reference_data() {
-        assert_eq!(
-            InstrumentSpec::new(0, 1, 2, 2, 8, 1, 1),
-            Err(DomainError::InvalidInstrumentSpec)
-        );
-        assert_eq!(
-            InstrumentSpec::new(1001, 1, 1, 2, 8, 1, 1),
-            Err(DomainError::InvalidInstrumentSpec)
-        );
+        assert_eq!(InstrumentSpec::new(0, 1, 2, 2, 8, 1, 1), Err(DomainError::InvalidInstrumentSpec));
+        assert_eq!(InstrumentSpec::new(1001, 1, 1, 2, 8, 1, 1), Err(DomainError::InvalidInstrumentSpec));
         assert_eq!(
             InstrumentSpec::new(1001, 1, 2, 19, 8, 1, 1),
             Err(DomainError::InvalidInstrumentSpec)
         );
-        assert_eq!(
-            InstrumentSpec::new(1001, 1, 2, 2, 8, 0, 1),
-            Err(DomainError::InvalidInstrumentSpec)
-        );
-        assert_eq!(
-            InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 0),
-            Err(DomainError::InvalidInstrumentSpec)
-        );
+        assert_eq!(InstrumentSpec::new(1001, 1, 2, 2, 8, 0, 1), Err(DomainError::InvalidInstrumentSpec));
+        assert_eq!(InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 0), Err(DomainError::InvalidInstrumentSpec));
     }
 
     #[test]

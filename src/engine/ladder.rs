@@ -189,8 +189,7 @@ pub(crate) struct SideLadder {
 impl SideLadder {
     /// Create an empty side ladder from validated engine config.
     pub(crate) fn new(side: Side, config: EngineConfig) -> DomainResult<Self> {
-        let tick_span = (config.storage_max_price().raw() - config.storage_min_price().raw())
-            / config.instrument().price_tick;
+        let tick_span = (config.storage_max_price().raw() - config.storage_min_price().raw()) / config.instrument().price_tick;
         let page_count = (tick_span as usize + 1).div_ceil(config.page_size() as usize);
 
         if page_count == 0 {
@@ -205,10 +204,7 @@ impl SideLadder {
             page_size: config.page_size() as usize,
             page_slots: vec![None; page_count],
             occupied_pages: Bitmap::new(page_count),
-            page_pool: PagePool::new(
-                config.max_active_pages() as usize,
-                config.page_size() as usize,
-            ),
+            page_pool: PagePool::new(config.max_active_pages() as usize, config.page_size() as usize),
             best: None,
         })
     }
@@ -222,11 +218,7 @@ impl SideLadder {
         let tick = (price.raw() - self.storage_min_price.raw()) / self.tick_size;
         let page_index = tick as usize / self.page_size;
         let offset = tick as usize % self.page_size;
-        Ok(LevelKey {
-            page_index,
-            offset,
-            price,
-        })
+        Ok(LevelKey { page_index, offset, price })
     }
 
     /// Return a level only if its page is currently active.
@@ -236,16 +228,10 @@ impl SideLadder {
     }
 
     /// Return a mutable level, activating its page from the pool if needed.
-    pub(crate) fn get_level_mut_or_activate(
-        &mut self,
-        key: LevelKey,
-    ) -> DomainResult<&mut PriceLevel> {
+    pub(crate) fn get_level_mut_or_activate(&mut self, key: LevelKey) -> DomainResult<&mut PriceLevel> {
         if self.page_slots[key.page_index].is_none() {
             // Page activation is bounded by the preallocated active-page pool.
-            let page_handle = self
-                .page_pool
-                .activate()
-                .ok_or(DomainError::InvalidInstrumentSpec)?;
+            let page_handle = self.page_pool.activate().ok_or(DomainError::InvalidInstrumentSpec)?;
             self.page_slots[key.page_index] = Some(page_handle);
         }
 
@@ -301,9 +287,7 @@ impl SideLadder {
     pub(crate) fn occupied_before(&self, current: LevelKey) -> Option<LevelKey> {
         if current.offset > 0
             && let Some(page_handle) = self.page_slots[current.page_index]
-            && let Some(offset) = self.page_pool.pages[page_handle]
-                .occupied
-                .prev_set_from(current.offset - 1)
+            && let Some(offset) = self.page_pool.pages[page_handle].occupied.prev_set_from(current.offset - 1)
         {
             return self.key_from_page_offset(current.page_index, offset);
         }
@@ -311,9 +295,7 @@ impl SideLadder {
         let page_index = current.page_index.checked_sub(1)?;
         let page_index = self.occupied_pages.prev_set_from(page_index)?;
         let page_handle = self.page_slots[page_index]?;
-        let offset = self.page_pool.pages[page_handle]
-            .occupied
-            .prev_set_from(self.page_size - 1)?;
+        let offset = self.page_pool.pages[page_handle].occupied.prev_set_from(self.page_size - 1)?;
         self.key_from_page_offset(page_index, offset)
     }
 
@@ -321,9 +303,7 @@ impl SideLadder {
     pub(crate) fn occupied_after(&self, current: LevelKey) -> Option<LevelKey> {
         if current.offset + 1 < self.page_size
             && let Some(page_handle) = self.page_slots[current.page_index]
-            && let Some(offset) = self.page_pool.pages[page_handle]
-                .occupied
-                .next_set_from(current.offset + 1)
+            && let Some(offset) = self.page_pool.pages[page_handle].occupied.next_set_from(current.offset + 1)
         {
             return self.key_from_page_offset(current.page_index, offset);
         }
@@ -331,9 +311,7 @@ impl SideLadder {
         let page_index = current.page_index.checked_add(1)?;
         let page_index = self.occupied_pages.next_set_from(page_index)?;
         let page_handle = self.page_slots[page_index]?;
-        let offset = self.page_pool.pages[page_handle]
-            .occupied
-            .next_set_from(0)?;
+        let offset = self.page_pool.pages[page_handle].occupied.next_set_from(0)?;
         self.key_from_page_offset(page_index, offset)
     }
 
@@ -355,18 +333,14 @@ impl SideLadder {
                 let start = self.page_slots.len().checked_sub(1)?;
                 let page_index = self.occupied_pages.prev_set_from(start)?;
                 let page_handle = self.page_slots[page_index]?;
-                let offset = self.page_pool.pages[page_handle]
-                    .occupied
-                    .prev_set_from(self.page_size - 1)?;
+                let offset = self.page_pool.pages[page_handle].occupied.prev_set_from(self.page_size - 1)?;
                 self.key_from_page_offset(page_index, offset)
             }
             Side::Sell => {
                 // Asks choose the lowest occupied page and lowest occupied offset.
                 let page_index = self.occupied_pages.next_set_from(0)?;
                 let page_handle = self.page_slots[page_index]?;
-                let offset = self.page_pool.pages[page_handle]
-                    .occupied
-                    .next_set_from(0)?;
+                let offset = self.page_pool.pages[page_handle].occupied.next_set_from(0)?;
                 self.key_from_page_offset(page_index, offset)
             }
         }
@@ -374,13 +348,8 @@ impl SideLadder {
 
     /// Convert a page and offset back into an absolute price-level key.
     fn key_from_page_offset(&self, page_index: usize, offset: usize) -> Option<LevelKey> {
-        let tick = page_index
-            .checked_mul(self.page_size)?
-            .checked_add(offset)? as u64;
-        let raw = self
-            .storage_min_price
-            .raw()
-            .checked_add(tick.checked_mul(self.tick_size)?)?;
+        let tick = page_index.checked_mul(self.page_size)?.checked_add(offset)? as u64;
+        let raw = self.storage_min_price.raw().checked_add(tick.checked_mul(self.tick_size)?)?;
         if raw > self.storage_max_price.raw() {
             return None;
         }
@@ -416,32 +385,20 @@ mod tests {
     fn ladder_tracks_best_bid_and_ask_with_bitmaps() {
         let instrument = config().instrument();
         let mut bids = SideLadder::new(Side::Buy, config()).expect("bids");
-        let bid_100 = bids
-            .key_for_price(Price::new(100, &instrument).expect("price"))
-            .expect("key");
-        let bid_1200 = bids
-            .key_for_price(Price::new(1200, &instrument).expect("price"))
-            .expect("key");
-        bids.get_level_mut_or_activate(bid_100)
-            .expect("level")
-            .order_count = 1;
+        let bid_100 = bids.key_for_price(Price::new(100, &instrument).expect("price")).expect("key");
+        let bid_1200 = bids.key_for_price(Price::new(1200, &instrument).expect("price")).expect("key");
+        bids.get_level_mut_or_activate(bid_100).expect("level").order_count = 1;
         bids.mark_occupied(bid_100);
-        bids.get_level_mut_or_activate(bid_1200)
-            .expect("level")
-            .order_count = 1;
+        bids.get_level_mut_or_activate(bid_1200).expect("level").order_count = 1;
         bids.mark_occupied(bid_1200);
         assert_eq!(bids.best_key().expect("best").price.raw(), 1200);
         bids.mark_empty(bid_1200);
         assert_eq!(bids.best_key().expect("best").price.raw(), 100);
 
         let mut asks = SideLadder::new(Side::Sell, config()).expect("asks");
-        asks.get_level_mut_or_activate(bid_1200)
-            .expect("level")
-            .order_count = 1;
+        asks.get_level_mut_or_activate(bid_1200).expect("level").order_count = 1;
         asks.mark_occupied(bid_1200);
-        asks.get_level_mut_or_activate(bid_100)
-            .expect("level")
-            .order_count = 1;
+        asks.get_level_mut_or_activate(bid_100).expect("level").order_count = 1;
         asks.mark_occupied(bid_100);
         assert_eq!(asks.best_key().expect("best").price.raw(), 100);
     }

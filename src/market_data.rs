@@ -50,19 +50,17 @@ impl Default for MarketDataFeedConfig {
 /// Live multicast market-data feed runtime.
 #[derive(Debug)]
 pub struct MarketDataRuntime {
-    io: Option<UdpFramePublisher>,
+    io: UdpFramePublisher,
     encode_buf: Vec<u8>,
     sequencer: MarketDataSequencer,
     last_l1: Option<L1Update>,
     pending_reference_price: Option<Price>,
-    first_error: Option<MarketDataFeedError>,
-    #[cfg(test)]
-    queued_frames: Vec<u8>,
+    first_error: Option<MarketDataError>,
 }
 
 impl MarketDataRuntime {
     /// Open the configured multicast publisher and preallocate encode buffers.
-    pub fn new(config: MarketDataFeedConfig) -> Result<Self, MarketDataFeedError> {
+    pub fn new(config: MarketDataFeedConfig) -> Result<Self, MarketDataError> {
         let encode_len = config.max_datagram_len;
         let io = UdpFramePublisher::bind_multicast(UdpMulticastConfig {
             bind_addr: config.bind_addr,
@@ -73,14 +71,12 @@ impl MarketDataRuntime {
             max_pending_datagram_bytes: config.max_pending_datagram_bytes,
         })?;
         Ok(Self {
-            io: Some(io),
+            io,
             encode_buf: vec![0_u8; encode_len],
             sequencer: MarketDataSequencer::default(),
             last_l1: None,
             pending_reference_price: None,
             first_error: None,
-            #[cfg(test)]
-            queued_frames: Vec::new(),
         })
     }
 
@@ -124,21 +120,14 @@ impl MarketDataRuntime {
     }
 
     /// Emit one L1 top-of-book update only when the top state changed.
-    pub fn publish_l1_update_if_changed(
-        &mut self,
-        best_bid: Option<(Price, u64)>,
-        best_ask: Option<(Price, u64)>,
-    ) -> DomainResult<()> {
+    pub fn publish_l1_update_if_changed(&mut self, best_bid: Option<(Price, u64)>, best_ask: Option<(Price, u64)>) -> DomainResult<()> {
         let bid_price = best_bid.map(|(price, _)| price);
         let bid_qty = best_bid.map_or(0, |(_, qty)| qty);
         let ask_price = best_ask.map(|(price, _)| price);
         let ask_qty = best_ask.map_or(0, |(_, qty)| qty);
 
         if self.last_l1.is_some_and(|last| {
-            last.bid_price == bid_price
-                && last.bid_qty == bid_qty
-                && last.ask_price == ask_price
-                && last.ask_qty == ask_qty
+            last.bid_price == bid_price && last.bid_qty == bid_qty && last.ask_price == ask_price && last.ask_qty == ask_qty
         }) {
             return Ok(());
         }
@@ -171,7 +160,7 @@ impl MarketDataRuntime {
         self.pending_reference_price.take()
     }
 
-    /// Queue one market-data event and defer the first egress failure until `finish`.
+    /// Queue one market-data event and defer the first egress failure until checked.
     fn emit_market_data(&mut self, event: MarketDataEvent) {
         if self.first_error.is_some() {
             return;
@@ -179,97 +168,32 @@ impl MarketDataRuntime {
         let written = match encode_market_data_event(event, &mut self.encode_buf) {
             Ok(written) => written,
             Err(error) => {
-                self.first_error = Some(MarketDataFeedError::Encode(error));
+                self.first_error = Some(MarketDataError::Encode(error));
                 return;
             }
         };
 
-        if let Some(io) = self.io.as_mut() {
-            if let Err(error) = io.queue_frame(&self.encode_buf[..written]) {
-                self.first_error = Some(MarketDataFeedError::Io(error));
-            }
-        } else {
-            #[cfg(test)]
-            {
-                self.queued_frames
-                    .extend_from_slice(&(written as u16).to_le_bytes());
-                self.queued_frames
-                    .extend_from_slice(&self.encode_buf[..written]);
-            }
+        if let Err(error) = self.io.queue_frame(&self.encode_buf[..written]) {
+            self.first_error = Some(MarketDataError::Io(error));
         }
     }
 
     /// Flush queued multicast datagrams.
-    pub fn flush_pending(&mut self) -> Result<bool, MarketDataFeedError> {
-        match self.io.as_mut() {
-            Some(io) => io.flush_pending().map_err(MarketDataFeedError::Io),
-            None => Ok(false),
-        }
+    pub fn flush_pending(&mut self) -> Result<bool, MarketDataError> {
+        self.io.flush_pending().map_err(MarketDataError::Io)
     }
 
-    /// Return the first deferred egress failure recorded by sink-style emission.
-    pub fn finish(&mut self) -> Result<(), MarketDataFeedError> {
+    /// Poll market-data egress.
+    pub fn poll(&mut self) -> Result<bool, MarketDataError> {
+        self.flush_pending()
+    }
+
+    /// Return the first egress failure deferred by sink-style emission.
+    pub fn check_deferred_error(&mut self) -> Result<(), MarketDataError> {
         match self.first_error.take() {
             Some(error) => Err(error),
             None => Ok(()),
         }
-    }
-
-    /// Return encoded market-data frames queued by tests before UDP flush.
-    #[cfg(test)]
-    pub fn queued_frames(&self) -> EncodedMarketDataFrames<'_> {
-        EncodedMarketDataFrames {
-            bytes: &self.queued_frames,
-            cursor: 0,
-        }
-    }
-
-    /// Clear encoded market-data frames queued by tests.
-    #[cfg(test)]
-    pub fn clear_queued_frames(&mut self) {
-        self.queued_frames.clear();
-    }
-}
-
-#[cfg(test)]
-impl Default for MarketDataRuntime {
-    fn default() -> Self {
-        let config = MarketDataFeedConfig::default();
-        Self {
-            io: None,
-            encode_buf: vec![0_u8; config.max_datagram_len],
-            sequencer: MarketDataSequencer::default(),
-            last_l1: None,
-            pending_reference_price: None,
-            first_error: None,
-            queued_frames: Vec::new(),
-        }
-    }
-}
-
-#[cfg(test)]
-pub struct EncodedMarketDataFrames<'a> {
-    bytes: &'a [u8],
-    cursor: usize,
-}
-
-#[cfg(test)]
-impl<'a> Iterator for EncodedMarketDataFrames<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.bytes.len().saturating_sub(self.cursor) < 2 {
-            return None;
-        }
-        let len =
-            u16::from_le_bytes([self.bytes[self.cursor], self.bytes[self.cursor + 1]]) as usize;
-        let frame_start = self.cursor + 2;
-        let frame_end = frame_start + len;
-        if self.bytes.len() < frame_end {
-            return None;
-        }
-        self.cursor = frame_end;
-        Some(&self.bytes[frame_start..frame_end])
     }
 }
 
@@ -282,18 +206,18 @@ pub struct MarketDataSnapshot {
 
 /// Market-data feed failure.
 #[derive(Debug)]
-pub enum MarketDataFeedError {
+pub enum MarketDataError {
     Io(IoError),
     Encode(ProtocolError),
 }
 
-impl From<IoError> for MarketDataFeedError {
+impl From<IoError> for MarketDataError {
     fn from(error: IoError) -> Self {
         Self::Io(error)
     }
 }
 
-impl From<ProtocolError> for MarketDataFeedError {
+impl From<ProtocolError> for MarketDataError {
     fn from(error: ProtocolError) -> Self {
         Self::Encode(error)
     }

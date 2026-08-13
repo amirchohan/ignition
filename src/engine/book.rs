@@ -2,18 +2,18 @@ use std::collections::HashMap;
 
 use crate::{
     domain::{
-        DomainError, DomainResult, EngineSequencer, Price, RejectReason,
+        DomainError, DomainResult, Price, RejectReason, Sequencer,
         trading::order::{
-            AccountId, CancelOrder, CancelReplace, ExecType, ExecutionReport, MassCancel, NewOrder,
-            OrdStatus, OrderEntry, OrderId, OrderType, Side, TimeInForce,
+            AccountId, CancelOrder, CancelReplace, ExecType, ExecutionReport, MassCancel, NewOrder, OrdStatus, OrderEntry, OrderId,
+            OrderType, Side, TimeInForce,
         },
     },
     market_data::MarketDataRuntime,
 };
 
 use super::{
-    EngineConfig, OrderProjection, RestingOrderView, accounts::AccountTable, ladder::SideLadder,
-    orders::OrderArena, orders::OrderHandle, orders::RestingOrder, structural_reject_reason,
+    EngineConfig, OrderProjection, RestingOrderView, accounts::AccountTable, ladder::SideLadder, orders::OrderArena, orders::OrderHandle,
+    orders::RestingOrder, structural_reject_reason,
 };
 
 /// Single-symbol order book with side ladders and resting-order indexes.
@@ -58,23 +58,15 @@ impl OrderBook {
     pub(crate) fn execute(
         &mut self,
         entry: OrderEntry,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         market_data: &mut MarketDataRuntime,
         emit_report: &mut impl FnMut(ExecutionReport),
     ) -> DomainResult<()> {
         match entry {
-            OrderEntry::NewOrder(order) => {
-                self.on_new_order(order, sequencer, market_data, emit_report)
-            }
-            OrderEntry::CancelOrder(cancel) => {
-                self.on_cancel_order(cancel, sequencer, market_data, emit_report)
-            }
-            OrderEntry::CancelReplace(replace) => {
-                self.on_cancel_replace(replace, sequencer, market_data, emit_report)
-            }
-            OrderEntry::MassCancel(cancel) => {
-                self.on_mass_cancel(cancel, sequencer, market_data, emit_report)
-            }
+            OrderEntry::NewOrder(order) => self.on_new_order(order, sequencer, market_data, emit_report),
+            OrderEntry::CancelOrder(cancel) => self.on_cancel_order(cancel, sequencer, market_data, emit_report),
+            OrderEntry::CancelReplace(replace) => self.on_cancel_replace(replace, sequencer, market_data, emit_report),
+            OrderEntry::MassCancel(cancel) => self.on_mass_cancel(cancel, sequencer, market_data, emit_report),
         }
     }
 
@@ -100,24 +92,16 @@ impl OrderBook {
 
     /// Return the account's current open resting order count.
     pub(crate) fn account_open_order_count(&self, account_id: AccountId) -> Option<u32> {
-        self.accounts
-            .get(account_id)
-            .map(|account| account.open_order_count)
+        self.accounts.get(account_id).map(|account| account.open_order_count)
     }
 
     /// Return the account's current raw open resting notional.
     pub(crate) fn account_open_notional(&self, account_id: AccountId) -> Option<u128> {
-        self.accounts
-            .get(account_id)
-            .map(|account| account.open_notional)
+        self.accounts.get(account_id).map(|account| account.open_notional)
     }
 
     /// Return a read-only view of one resting order if it belongs to the account.
-    pub(crate) fn resting_order(
-        &self,
-        account_id: AccountId,
-        order_id: OrderId,
-    ) -> Option<RestingOrderView> {
+    pub(crate) fn resting_order(&self, account_id: AccountId, order_id: OrderId) -> Option<RestingOrderView> {
         let handle = self.order_index.get(&order_id).copied()?;
         let order = self.orders.get(handle).copied()?;
         (order.account_id == account_id).then_some(RestingOrderView {
@@ -130,13 +114,7 @@ impl OrderBook {
     }
 
     /// Project an incoming order against visible opposite liquidity without mutation.
-    pub(crate) fn project_order(
-        &self,
-        account_id: AccountId,
-        side: Side,
-        limit_price: Option<Price>,
-        qty: u64,
-    ) -> OrderProjection {
+    pub(crate) fn project_order(&self, account_id: AccountId, side: Side, limit_price: Option<Price>, qty: u64) -> OrderProjection {
         let mut remaining_qty = qty;
         let mut executable_qty = 0;
         let mut low_execution_price = None;
@@ -165,14 +143,8 @@ impl OrderBook {
                     let fill_qty = remaining_qty.min(order.remaining_qty);
                     remaining_qty -= fill_qty;
                     executable_qty += fill_qty;
-                    low_execution_price = Some(
-                        low_execution_price
-                            .map_or(order.price, |price: Price| price.min(order.price)),
-                    );
-                    high_execution_price = Some(
-                        high_execution_price
-                            .map_or(order.price, |price: Price| price.max(order.price)),
-                    );
+                    low_execution_price = Some(low_execution_price.map_or(order.price, |price: Price| price.min(order.price)));
+                    high_execution_price = Some(high_execution_price.map_or(order.price, |price: Price| price.max(order.price)));
                     self_trade |= order.account_id == account_id;
                     current = order.level_next;
                 }
@@ -190,16 +162,16 @@ impl OrderBook {
         }
     }
 
-    /// Append resting orders in deterministic book order.
-    pub(crate) fn snapshot_orders(&self, out: &mut Vec<RestingOrderView>) {
-        self.snapshot_side_orders(Side::Buy, out);
-        self.snapshot_side_orders(Side::Sell, out);
+    /// Visit resting orders in deterministic book order.
+    pub(crate) fn try_for_each_resting_order<E>(&self, mut visit: impl FnMut(RestingOrderView) -> Result<(), E>) -> Result<(), E> {
+        self.try_for_each_side_order(Side::Buy, &mut visit)?;
+        self.try_for_each_side_order(Side::Sell, &mut visit)
     }
 
     /// Cancel every resting order in deterministic book order.
     pub(crate) fn drain_all(
         &mut self,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         market_data: &mut MarketDataRuntime,
         emit_report: &mut impl FnMut(ExecutionReport),
     ) -> DomainResult<()> {
@@ -236,7 +208,7 @@ impl OrderBook {
     fn on_new_order(
         &mut self,
         order: NewOrder,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         market_data: &mut MarketDataRuntime,
         emit_report: &mut impl FnMut(ExecutionReport),
     ) -> DomainResult<()> {
@@ -260,8 +232,7 @@ impl OrderBook {
         }
 
         // if it's a PostOnly order ensure that it doesn't cross the book
-        if order.time_in_force == TimeInForce::PostOnly && self.would_cross(order.side, order.price)
-        {
+        if order.time_in_force == TimeInForce::PostOnly && self.would_cross(order.side, order.price) {
             self.push_report(
                 sequencer,
                 emit_report,
@@ -294,11 +265,7 @@ impl OrderBook {
 
         // order completely filled - happy path
         if remaining_qty == 0 {
-            self.emit_pending_taker_report(
-                sequencer,
-                emit_report,
-                match_outcome.pending_taker_report,
-            )?;
+            self.emit_pending_taker_report(sequencer, emit_report, match_outcome.pending_taker_report)?;
             return Ok(());
         }
 
@@ -328,13 +295,7 @@ impl OrderBook {
             (OrderType::Limit, TimeInForce::Gtc | TimeInForce::PostOnly) => {
                 // rest any unfilled passive quantity after the aggressive walk.
                 let price = order.price.ok_or(DomainError::InvalidPrice)?;
-                let level_qty = self.rest_order(
-                    order.client_order_id,
-                    order.account_id,
-                    order.side,
-                    price,
-                    remaining_qty,
-                )?;
+                let level_qty = self.rest_order(order.client_order_id, order.account_id, order.side, price, remaining_qty)?;
                 self.publish_book_update(order.side, price, level_qty, market_data)?;
                 // distinguish a pure add from an order that traded before resting.
                 if match_outcome.filled_qty == 0 {
@@ -353,11 +314,7 @@ impl OrderBook {
                         },
                     )
                 } else {
-                    self.emit_pending_taker_report(
-                        sequencer,
-                        emit_report,
-                        match_outcome.pending_taker_report,
-                    )
+                    self.emit_pending_taker_report(sequencer, emit_report, match_outcome.pending_taker_report)
                 }
             }
         }
@@ -367,7 +324,7 @@ impl OrderBook {
     fn on_cancel_order(
         &mut self,
         cancel: CancelOrder,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         market_data: &mut MarketDataRuntime,
         emit_report: &mut impl FnMut(ExecutionReport),
     ) -> DomainResult<()> {
@@ -403,59 +360,32 @@ impl OrderBook {
     fn on_cancel_replace(
         &mut self,
         replace: CancelReplace,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         market_data: &mut MarketDataRuntime,
         emit_report: &mut impl FnMut(ExecutionReport),
     ) -> DomainResult<()> {
         if !self.price_in_storage(replace.price) {
-            return self.reject_replace(
-                replace,
-                RejectReason::InvalidPrice,
-                sequencer,
-                emit_report,
-            );
+            return self.reject_replace(replace, RejectReason::InvalidPrice, sequencer, emit_report);
         }
-        if self.order_index.contains_key(&replace.client_order_id)
-            && replace.client_order_id != replace.orig_client_order_id
-        {
+        if self.order_index.contains_key(&replace.client_order_id) && replace.client_order_id != replace.orig_client_order_id {
             return self.reject_replace(replace, RejectReason::Malformed, sequencer, emit_report);
         }
 
         let Some(handle) = self.order_index.get(&replace.orig_client_order_id).copied() else {
-            return self.reject_replace(
-                replace,
-                RejectReason::UnknownOrder,
-                sequencer,
-                emit_report,
-            );
+            return self.reject_replace(replace, RejectReason::UnknownOrder, sequencer, emit_report);
         };
         let Some(current) = self.orders.get(handle).copied() else {
-            return self.reject_replace(
-                replace,
-                RejectReason::UnknownOrder,
-                sequencer,
-                emit_report,
-            );
+            return self.reject_replace(replace, RejectReason::UnknownOrder, sequencer, emit_report);
         };
         if current.account_id != replace.account_id {
-            return self.reject_replace(
-                replace,
-                RejectReason::UnknownOrder,
-                sequencer,
-                emit_report,
-            );
+            return self.reject_replace(replace, RejectReason::UnknownOrder, sequencer, emit_report);
         }
 
         if current.price == replace.price && replace.qty.raw() <= current.remaining_qty {
             // Same-price reductions stay in the existing FIFO position.
             self.preserve_priority_replace(handle, replace, current.remaining_qty)?;
             if replace.qty.raw() != current.remaining_qty {
-                self.publish_book_update(
-                    current.side,
-                    current.price,
-                    replace.qty.raw(),
-                    market_data,
-                )?;
+                self.publish_book_update(current.side, current.price, replace.qty.raw(), market_data)?;
             }
             self.push_report(
                 sequencer,
@@ -516,7 +446,7 @@ impl OrderBook {
     fn on_mass_cancel(
         &mut self,
         cancel: MassCancel,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         market_data: &mut MarketDataRuntime,
         emit_report: &mut impl FnMut(ExecutionReport),
     ) -> DomainResult<()> {
@@ -524,19 +454,11 @@ impl OrderBook {
             return self.push_report(
                 sequencer,
                 emit_report,
-                ReportSpec::new_reject(
-                    cancel.client_order_id,
-                    cancel.account_id,
-                    RejectReason::Malformed,
-                    0,
-                ),
+                ReportSpec::new_reject(cancel.client_order_id, cancel.account_id, RejectReason::Malformed, 0),
             );
         }
 
-        let mut current = self
-            .accounts
-            .get(cancel.account_id)
-            .and_then(|account| account.head);
+        let mut current = self.accounts.get(cancel.account_id).and_then(|account| account.head);
         while let Some(handle) = current {
             // Capture the next account link before unlinking frees this slot.
             current = self.orders.get(handle).and_then(|order| order.account_next);
@@ -585,7 +507,7 @@ impl OrderBook {
         side: Side,
         limit_price: Option<Price>,
         remaining_qty: &mut u64,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         market_data: &mut MarketDataRuntime,
         emit_report: &mut impl FnMut(ExecutionReport),
     ) -> DomainResult<MatchOutcome> {
@@ -610,34 +532,21 @@ impl OrderBook {
                 continue;
             };
 
-            self.emit_pending_taker_report(
-                sequencer,
-                emit_report,
-                outcome.pending_taker_report.take(),
-            )?;
+            self.emit_pending_taker_report(sequencer, emit_report, outcome.pending_taker_report.take())?;
             // one execution trades the smaller of taker leaves quantity and maker leaves quantity.
             let fill_qty = (*remaining_qty).min(maker.remaining_qty);
             *remaining_qty -= fill_qty;
             outcome.filled_qty += fill_qty;
             // apply book state first so all following events describe post-fill state.
-            self.apply_fill(maker_handle, best_key, fill_qty);
-            let maker_remaining = self
-                .orders
-                .get(maker_handle)
-                .map_or(0, |order| order.remaining_qty);
+            self.apply_fill(maker_handle, best_key, fill_qty)?;
+            let maker_remaining = self.orders.get(maker_handle).map_or(0, |order| order.remaining_qty);
             if maker_remaining == 0 {
                 // fully filled makers leave both intrusive lists and the ID index now.
                 self.unlink_and_free(maker_handle);
             }
 
             // market-data output is sequenced immediately after the deterministic state change.
-            market_data.publish_trade(
-                maker.order_id,
-                taker_order_id,
-                maker.price,
-                fill_qty,
-                &self.config.instrument(),
-            )?;
+            market_data.publish_trade(maker.order_id, taker_order_id, maker.price, fill_qty, &self.config.instrument())?;
             self.publish_book_update(maker.side, maker.price, maker_remaining, market_data)?;
 
             // maker report reflects this fill and the maker's remaining book quantity.
@@ -683,7 +592,7 @@ impl OrderBook {
     /// Mark the final taker fill report terminal when residual liquidity expires.
     fn expire_taker_residual(
         &mut self,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         emit_report: &mut impl FnMut(ExecutionReport),
         outcome: MatchOutcome,
     ) -> DomainResult<()> {
@@ -697,7 +606,7 @@ impl OrderBook {
 
     fn emit_pending_taker_report(
         &mut self,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         emit_report: &mut impl FnMut(ExecutionReport),
         spec: Option<ReportSpec>,
     ) -> DomainResult<()> {
@@ -708,44 +617,24 @@ impl OrderBook {
     }
 
     /// Apply a fill to one maker order and its price-level aggregate.
-    fn apply_fill(
-        &mut self,
-        maker_handle: OrderHandle,
-        key: super::ladder::LevelKey,
-        fill_qty: u64,
-    ) {
-        let filled_notional = self
-            .orders
-            .get(maker_handle)
-            .map_or(0, |order| raw_notional(order.price, fill_qty));
+    fn apply_fill(&mut self, maker_handle: OrderHandle, key: super::ladder::LevelKey, fill_qty: u64) -> DomainResult<()> {
+        let filled_notional = self.orders.get(maker_handle).map_or(0, |order| raw_notional(order.price, fill_qty));
         if let Some(order) = self.orders.get_mut(maker_handle) {
             order.remaining_qty -= fill_qty;
         }
-        let side = self
-            .orders
-            .get(maker_handle)
-            .map_or(Side::Sell, |order| order.side);
+        let side = self.orders.get(maker_handle).map_or(Side::Sell, |order| order.side);
         if let Some(order) = self.orders.get(maker_handle).copied()
             && let Some(account) = self.accounts.get_mut(order.account_id)
         {
             account.open_notional -= filled_notional;
         }
-        let level = self
-            .side_mut(side)
-            .get_level_mut_or_activate(key)
-            .expect("maker level exists");
+        let level = self.side_mut(side).get_level_mut_or_activate(key)?;
         level.total_qty -= fill_qty;
+        Ok(())
     }
 
     /// Insert an order into the resting indexes.
-    fn rest_order(
-        &mut self,
-        order_id: OrderId,
-        account_id: AccountId,
-        side: Side,
-        price: Price,
-        remaining_qty: u64,
-    ) -> DomainResult<u64> {
+    fn rest_order(&mut self, order_id: OrderId, account_id: AccountId, side: Side, price: Price, remaining_qty: u64) -> DomainResult<u64> {
         let key = self.side(side).key_for_price(price)?;
         let order = RestingOrder {
             order_id,
@@ -758,10 +647,7 @@ impl OrderBook {
             account_prev: None,
             account_next: None,
         };
-        let handle = self
-            .orders
-            .allocate(order)
-            .ok_or(DomainError::InvalidInstrumentSpec)?;
+        let handle = self.orders.allocate(order).ok_or(DomainError::InvalidInstrumentSpec)?;
 
         // a resting order is visible through price, account, and client-order indexes.
         let level_qty = self.append_to_level(side, key, handle)?;
@@ -771,12 +657,7 @@ impl OrderBook {
     }
 
     /// Append an order to the FIFO chain at a price level.
-    fn append_to_level(
-        &mut self,
-        side: Side,
-        key: super::ladder::LevelKey,
-        handle: OrderHandle,
-    ) -> DomainResult<u64> {
+    fn append_to_level(&mut self, side: Side, key: super::ladder::LevelKey, handle: OrderHandle) -> DomainResult<u64> {
         let tail = {
             let level = self.side_mut(side).get_level_mut_or_activate(key)?;
             level.tail
@@ -802,21 +683,14 @@ impl OrderBook {
     }
 
     /// Append an order to its account's active-order chain.
-    fn append_to_account(
-        &mut self,
-        account_id: AccountId,
-        handle: OrderHandle,
-    ) -> DomainResult<()> {
+    fn append_to_account(&mut self, account_id: AccountId, handle: OrderHandle) -> DomainResult<()> {
         let order_notional = self
             .orders
             .get(handle)
             .map(|order| raw_notional(order.price, order.remaining_qty))
             .ok_or(DomainError::Malformed)?;
         let tail = {
-            let account = self
-                .accounts
-                .get_mut(account_id)
-                .ok_or(DomainError::Malformed)?;
+            let account = self.accounts.get_mut(account_id).ok_or(DomainError::Malformed)?;
             let tail = account.tail;
             if account.head.is_none() {
                 account.head = Some(handle);
@@ -829,27 +703,15 @@ impl OrderBook {
 
         // Keep a second intrusive list so mass cancel never scans unrelated accounts.
         if let Some(tail) = tail {
-            self.orders
-                .get_mut(tail)
-                .expect("account tail")
-                .account_next = Some(handle);
+            self.orders.get_mut(tail).expect("account tail").account_next = Some(handle);
             self.orders.get_mut(handle).expect("order").account_prev = Some(tail);
         }
         Ok(())
     }
 
     /// Update an existing order in place without changing FIFO priority.
-    fn preserve_priority_replace(
-        &mut self,
-        handle: OrderHandle,
-        replace: CancelReplace,
-        old_qty: u64,
-    ) -> DomainResult<()> {
-        let current = self
-            .orders
-            .get(handle)
-            .copied()
-            .ok_or(DomainError::Malformed)?;
+    fn preserve_priority_replace(&mut self, handle: OrderHandle, replace: CancelReplace, old_qty: u64) -> DomainResult<()> {
+        let current = self.orders.get(handle).copied().ok_or(DomainError::Malformed)?;
         let key = self.side(current.side).key_for_price(current.price)?;
         let order = self.orders.get_mut(handle).ok_or(DomainError::Malformed)?;
         order.order_id = replace.client_order_id;
@@ -890,16 +752,10 @@ impl OrderBook {
             next_order.level_prev = order.level_prev;
         }
 
-        let key = self
-            .side(order.side)
-            .key_for_price(order.price)
-            .expect("stored price");
+        let key = self.side(order.side).key_for_price(order.price).expect("stored price");
         let emptied = {
             // Update level aggregates before possibly clearing ladder occupancy.
-            let level = self
-                .side_mut(order.side)
-                .get_level_mut_or_activate(key)
-                .expect("stored level");
+            let level = self.side_mut(order.side).get_level_mut_or_activate(key).expect("stored level");
             if level.head == Some(handle) {
                 level.head = order.level_next;
             }
@@ -942,11 +798,7 @@ impl OrderBook {
     }
 
     /// Return the next occupied price key behind `current` on one side of the book.
-    fn next_occupied_key(
-        &self,
-        side: Side,
-        current: super::ladder::LevelKey,
-    ) -> Option<super::ladder::LevelKey> {
+    fn next_occupied_key(&self, side: Side, current: super::ladder::LevelKey) -> Option<super::ladder::LevelKey> {
         match side {
             Side::Buy => self.side(side).occupied_before(current),
             Side::Sell => self.side(side).occupied_after(current),
@@ -985,13 +837,7 @@ impl OrderBook {
     }
 
     /// Emit market data for a visible book-level mutation.
-    fn publish_book_update(
-        &mut self,
-        side: Side,
-        price: Price,
-        level_qty: u64,
-        market_data: &mut MarketDataRuntime,
-    ) -> DomainResult<()> {
+    fn publish_book_update(&mut self, side: Side, price: Price, level_qty: u64, market_data: &mut MarketDataRuntime) -> DomainResult<()> {
         let best_bid = self.best_bid();
         let best_ask = self.best_ask();
         market_data.publish_l2_update(side, price, level_qty)?;
@@ -1003,13 +849,11 @@ impl OrderBook {
         let Ok(key) = self.side(side).key_for_price(price) else {
             return 0;
         };
-        self.side(side)
-            .get_level(key)
-            .map_or(0, |level| level.total_qty)
+        self.side(side).get_level(key).map_or(0, |level| level.total_qty)
     }
 
-    /// Append one side in price-time priority order.
-    fn snapshot_side_orders(&self, side: Side, out: &mut Vec<RestingOrderView>) {
+    /// Visit one side in price-time priority order.
+    fn try_for_each_side_order<E>(&self, side: Side, visit: &mut impl FnMut(RestingOrderView) -> Result<(), E>) -> Result<(), E> {
         let mut cursor = self.side(side).best_level().map(|(key, _)| key);
         while let Some(key) = cursor {
             if let Some(level) = self.side(side).get_level(key) {
@@ -1018,18 +862,19 @@ impl OrderBook {
                     let Some(order) = self.orders.get(handle) else {
                         break;
                     };
-                    out.push(RestingOrderView {
+                    visit(RestingOrderView {
                         order_id: order.order_id,
                         account_id: order.account_id,
                         side: order.side,
                         price: order.price,
                         remaining_qty: order.remaining_qty,
-                    });
+                    })?;
                     current = order.level_next;
                 }
             }
             cursor = self.next_occupied_key(side, key);
         }
+        Ok(())
     }
 
     /// Capture handles before drain mutation so traversal remains stable.
@@ -1071,18 +916,13 @@ impl OrderBook {
         &mut self,
         order: NewOrder,
         reason: RejectReason,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         emit_report: &mut impl FnMut(ExecutionReport),
     ) -> DomainResult<()> {
         self.push_report(
             sequencer,
             emit_report,
-            ReportSpec::new_reject(
-                order.client_order_id,
-                order.account_id,
-                reason,
-                order.qty.raw(),
-            ),
+            ReportSpec::new_reject(order.client_order_id, order.account_id, reason, order.qty.raw()),
         )
     }
 
@@ -1091,7 +931,7 @@ impl OrderBook {
         &mut self,
         cancel: CancelOrder,
         reason: RejectReason,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         emit_report: &mut impl FnMut(ExecutionReport),
     ) -> DomainResult<()> {
         self.push_report(
@@ -1106,25 +946,20 @@ impl OrderBook {
         &mut self,
         replace: CancelReplace,
         reason: RejectReason,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         emit_report: &mut impl FnMut(ExecutionReport),
     ) -> DomainResult<()> {
         self.push_report(
             sequencer,
             emit_report,
-            ReportSpec::new_reject(
-                replace.client_order_id,
-                replace.account_id,
-                reason,
-                replace.qty.raw(),
-            ),
+            ReportSpec::new_reject(replace.client_order_id, replace.account_id, reason, replace.qty.raw()),
         )
     }
 
     /// Emit one deterministic execution report to the output sink.
     fn push_report(
         &mut self,
-        sequencer: &mut EngineSequencer,
+        sequencer: &mut Sequencer,
         emit_report: &mut impl FnMut(ExecutionReport),
         spec: ReportSpec,
     ) -> DomainResult<()> {
@@ -1164,12 +999,7 @@ struct ReportSpec {
 }
 
 impl ReportSpec {
-    const fn new_reject(
-        client_order_id: OrderId,
-        account_id: AccountId,
-        reject_reason: RejectReason,
-        remaining_qty: u64,
-    ) -> Self {
+    const fn new_reject(client_order_id: OrderId, account_id: AccountId, reject_reason: RejectReason, remaining_qty: u64) -> Self {
         Self {
             client_order_id,
             account_id,
