@@ -43,6 +43,7 @@ pub struct IORuntime {
 impl IORuntime {
     /// Build an endpoint IO adapter from a mode, endpoint, and backend config.
     pub fn new(endpoint: Endpoint, config: IOConfig) -> Result<Self, IoError> {
+        let startup_log = IOStartupLog::from_config(&config);
         let (backend, recorder) = match config {
             IOConfig::Noop => (IOBackend::Noop, None),
             IOConfig::Tcp {
@@ -82,6 +83,14 @@ impl IORuntime {
                 max_frame_len,
             } => (IOBackend::File(FileFrameIo::open(input_path, output_path, max_frame_len)?), None),
         };
+
+        tracing::info!(
+            "{}Runtime started on ingress: {}. egress: {}. Recorder: {}",
+            endpoint.runtime_name(),
+            startup_log.ingress,
+            startup_log.egress,
+            startup_log.recorder
+        );
 
         Ok(Self {
             endpoint,
@@ -357,6 +366,61 @@ impl Endpoint {
             _ => Err(IoError::InvalidEndpoint(value)),
         }
     }
+
+    const fn runtime_name(self) -> &'static str {
+        match self {
+            Self::Control => "Control",
+            Self::Gateway => "Gateway",
+            Self::MarketData => "MarketData",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct IOStartupLog {
+    ingress: String,
+    egress: String,
+    recorder: String,
+}
+
+impl IOStartupLog {
+    fn from_config(config: &IOConfig) -> Self {
+        match config {
+            IOConfig::Noop => Self {
+                ingress: "None".to_owned(),
+                egress: "None".to_owned(),
+                recorder: "disabled".to_owned(),
+            },
+            IOConfig::Tcp {
+                bind_addr, record_path, ..
+            } => {
+                let backend = format!("TCP({bind_addr})");
+                Self {
+                    ingress: backend.clone(),
+                    egress: backend,
+                    recorder: record_path
+                        .as_ref()
+                        .map_or_else(|| "disabled".to_owned(), |path| format!("File({})", path.display())),
+                }
+            }
+            IOConfig::Udp { group_addr, .. } => Self {
+                ingress: "None".to_owned(),
+                egress: format!("UDP({group_addr})"),
+                recorder: "disabled".to_owned(),
+            },
+            IOConfig::File {
+                input_path, output_path, ..
+            } => Self {
+                ingress: optional_file_descriptor(input_path.as_ref()),
+                egress: optional_file_descriptor(output_path.as_ref()),
+                recorder: "disabled".to_owned(),
+            },
+        }
+    }
+}
+
+fn optional_file_descriptor(path: Option<&PathBuf>) -> String {
+    path.map_or_else(|| "None".to_owned(), |path| format!("File({})", path.display()))
 }
 
 #[derive(Debug)]

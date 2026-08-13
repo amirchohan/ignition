@@ -16,6 +16,13 @@ impl Default for Mode {
 }
 
 impl Mode {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Live { .. } => "live",
+            Self::Replay { .. } => "replay",
+        }
+    }
+
     pub const fn is_replay(self) -> bool {
         matches!(self, Self::Replay { .. })
     }

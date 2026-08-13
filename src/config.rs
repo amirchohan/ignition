@@ -214,7 +214,7 @@ impl ControlRuntimeConfig {
 }
 
 fn default_control_bind_addr() -> String {
-    "127.0.0.1:9001".to_owned()
+    "127.0.0.1:19001".to_owned()
 }
 
 const fn default_control_max_frame_len() -> usize {
@@ -264,7 +264,7 @@ impl GatewayRuntimeConfig {
 }
 
 fn default_gateway_bind_addr() -> String {
-    "127.0.0.1:9000".to_owned()
+    "127.0.0.1:19000".to_owned()
 }
 
 const fn default_gateway_max_frame_len() -> usize {
@@ -329,7 +329,7 @@ fn default_market_data_bind_addr() -> String {
 }
 
 fn default_market_data_group_addr() -> String {
-    "239.255.0.1:9002".to_owned()
+    "239.255.0.1:19002".to_owned()
 }
 
 const fn default_market_data_multicast_ttl() -> u32 {

@@ -17,21 +17,21 @@ engine:
 risk:
   max_open_orders_per_account: 1000
   max_open_notional_per_account: 100000000000000000
-  startup_reference_price: 10000000 # $100,000.00 with price_decimals=2
+  startup_reference_price: 7000000 # $70,000.00 with price_decimals=2
   price_band_bps: 1000 # +/-10%
 control:
-  bind_addr: "127.0.0.1:9001"
+  bind_addr: "127.0.0.1:19001"
   heartbeat_timeout_ns: 0 # disabled by default
   max_frame_len: 4096
   max_pending_write_bytes: 1048576
 gateway:
-  bind_addr: "127.0.0.1:9000"
+  bind_addr: "127.0.0.1:19000"
   max_frame_len: 4096
   max_pending_write_bytes: 1048576
   max_messages_per_poll: 1024
 market_data:
   bind_addr: "0.0.0.0:0"
-  group_addr: "239.255.0.1:9002"
+  group_addr: "239.255.0.1:19002"
   multicast_ttl: 1
   multicast_loop_v4: true
   max_datagram_len: 4096

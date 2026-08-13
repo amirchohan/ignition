@@ -47,7 +47,7 @@ impl Default for ControlConfig {
         Self {
             heartbeat_timeout_ns: 0,
             io: IOConfig::Tcp {
-                bind_addr: "127.0.0.1:9001".to_owned(),
+                bind_addr: "127.0.0.1:19001".to_owned(),
                 max_frame_len: 4096,
                 max_pending_write_bytes: 1 << 20,
                 record_path: None,

@@ -3,6 +3,7 @@
 //! Milestone 1 establishes the architecture and protocol contract. Later
 //! milestones fill in matching, risk, market-data, replay, and client behavior.
 
+pub mod client;
 pub mod config;
 pub mod control;
 pub mod domain;

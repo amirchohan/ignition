@@ -56,6 +56,7 @@ impl Runtime {
         gateway: GatewayRuntime,
         market_data: MarketDataRuntime,
     ) -> Result<Self, RuntimeError> {
+        tracing::info!("runtime setup in {} mode", mode.label());
         Ok(Self {
             mode,
             control,
@@ -70,6 +71,7 @@ impl Runtime {
 
     /// Run the deterministic control-then-gateway phase loop until shutdown completes.
     pub fn run(&mut self) -> Result<(), RuntimeError> {
+        tracing::info!("starting matching engine loop");
         loop {
             if self.terminal {
                 return Ok(());

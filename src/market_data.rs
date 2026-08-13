@@ -29,7 +29,7 @@ impl Default for MarketDataFeedConfig {
         Self {
             io: IOConfig::Udp {
                 bind_addr: "0.0.0.0:0".to_owned(),
-                group_addr: "239.255.0.1:9002".to_owned(),
+                group_addr: "239.255.0.1:19002".to_owned(),
                 multicast_ttl: 1,
                 multicast_loop_v4: true,
                 max_datagram_len: 4096,

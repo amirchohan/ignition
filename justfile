@@ -5,5 +5,8 @@ fix:
 server:
     cargo run --bin server
 
+trading-client:
+    cargo run --bin trading-client
+
 sbe:
     scripts/generate_sbe.sh
