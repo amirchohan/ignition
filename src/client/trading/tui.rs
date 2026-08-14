@@ -327,6 +327,7 @@ fn draw_book(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TradingClientApp)
 fn draw_trades(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TradingClientApp) {
     let rows = app.trades.iter().rev().take(area.height.saturating_sub(3) as usize).map(|trade| {
         Row::new(vec![
+            Cell::from(trade.engine_seq.to_string()),
             Cell::from(trade.trade_id.to_string()),
             Cell::from(display_price(app, trade.price)),
             Cell::from(display_qty(app, trade.qty)),
@@ -334,9 +335,14 @@ fn draw_trades(frame: &mut ratatui::Frame<'_>, area: Rect, app: &TradingClientAp
     });
     let table = Table::new(
         rows,
-        [Constraint::Length(10), Constraint::Percentage(45), Constraint::Percentage(45)],
+        [
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Percentage(40),
+            Constraint::Percentage(40),
+        ],
     )
-    .header(Row::new(["trade", "price", "qty"]).style(Style::default().add_modifier(Modifier::BOLD)))
+    .header(Row::new(["seq", "trade", "price", "qty"]).style(Style::default().add_modifier(Modifier::BOLD)))
     .block(Block::default().title("Recent Trades").borders(Borders::ALL));
     frame.render_widget(table, area);
 }

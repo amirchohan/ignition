@@ -74,8 +74,8 @@ template. Unknown template IDs are still rejected as unknown templates.
 
 ## Market Data
 
-`TradePrint` reports each execution with a market-data sequence, trade ID,
-maker order ID, taker order ID, price, and quantity.
+`TradePrint` reports each execution with a market-data sequence, global engine
+sequence, trade ID, maker order ID, taker order ID, price, and quantity.
 
 `L1Update` is the top-of-book change stream. It carries the current best bid
 price and aggregate quantity plus the current best ask price and aggregate
@@ -89,7 +89,9 @@ every visible level mutation. `qty = 0` means the level is deleted.
 Outbound trading events do not currently carry timestamps. `mdSeq` is strictly
 monotonic across `TradePrint`, `L1Update`, and `L2Update`. `prevMdSeq` on
 `L1Update` and `L2Update` carries the previous market-data sequence for simple
-gap detection.
+gap detection. `engineSeq` is allocated from the same deterministic sequencer
+used by execution reports, control responses, snapshots, and protocol errors,
+so it is strictly monotonic across all logical outbound engine events.
 
 ## Control Snapshots
 
@@ -144,8 +146,8 @@ quantity. If no quantity fills, the report is `Expired` / `Expired`.
 - Message header fields remain `uint16`: block length, template ID, schema ID,
   and schema version.
 - `accountId`, control `requestId`, and `heartbeatSeq` are `uint32`.
-- `clientOrderId`, `origClientOrderId`, engine sequence, market-data sequence,
-  trade ID, timestamps, prices, and quantities are `uint64`.
+- `clientOrderId`, `origClientOrderId`, global engine sequence, market-data
+  sequence, trade ID, timestamps, prices, and quantities are `uint64`.
 - Price fields are `uint64`; negative prices are impossible on the wire.
 - Quantity fields are `uint64`.
 

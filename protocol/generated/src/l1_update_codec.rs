@@ -7,7 +7,7 @@ pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 48;
+pub const SBE_BLOCK_LENGTH: u16 = 56;
 pub const SBE_TEMPLATE_ID: u16 = 201;
 
 pub mod encoder {
@@ -66,7 +66,7 @@ pub mod encoder {
             header
         }
 
-        /// primitive field 'mdSeq'
+        /// primitive field 'engineSeq'
         /// - min value: 0
         /// - max value: -2
         /// - null value: 0xffffffffffffffff_u64
@@ -76,8 +76,24 @@ pub mod encoder {
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
-        pub fn md_seq(&mut self, value: u64) -> &mut Self {
+        pub fn engine_seq(&mut self, value: u64) -> &mut Self {
             let offset = self.offset;
+            self.get_buf_mut().put_u64_at(offset, value);
+            self
+        }
+
+        /// primitive field 'mdSeq'
+        /// - min value: 0
+        /// - max value: -2
+        /// - null value: 0xffffffffffffffff_u64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 8
+        /// - encodedLength: 8
+        /// - version: 0
+        #[inline]
+        pub fn md_seq(&mut self, value: u64) -> &mut Self {
+            let offset = self.offset + 8;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -88,12 +104,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 8
+        /// - encodedOffset: 16
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn prev_md_seq(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 8;
+            let offset = self.offset + 16;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -104,12 +120,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 16
+        /// - encodedOffset: 24
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn bid_price(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 16;
+            let offset = self.offset + 24;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -120,12 +136,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 24
+        /// - encodedOffset: 32
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn bid_qty(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 24;
+            let offset = self.offset + 32;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -136,12 +152,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 32
+        /// - encodedOffset: 40
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn ask_price(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 32;
+            let offset = self.offset + 40;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -152,12 +168,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 40
+        /// - encodedOffset: 48
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn ask_qty(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 40;
+            let offset = self.offset + 48;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -237,38 +253,44 @@ pub mod decoder {
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn md_seq(&self) -> u64 {
+        pub fn engine_seq(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn prev_md_seq(&self) -> u64 {
+        pub fn md_seq(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset + 8)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn bid_price(&self) -> u64 {
+        pub fn prev_md_seq(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset + 16)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn bid_qty(&self) -> u64 {
+        pub fn bid_price(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset + 24)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn ask_price(&self) -> u64 {
+        pub fn bid_qty(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset + 32)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn ask_qty(&self) -> u64 {
+        pub fn ask_price(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset + 40)
+        }
+
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn ask_qty(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 48)
         }
     }
 } // end decoder

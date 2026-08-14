@@ -240,7 +240,7 @@ impl Engine {
                 continue;
             };
             let level_qty = self.current_level_qty(removed.side, removed.price);
-            self.publish_book_update(removed.side, removed.price, level_qty, market_data)?;
+            self.publish_book_update(removed.side, removed.price, level_qty, sequencer, market_data)?;
             self.push_report(
                 sequencer,
                 emit_report,
@@ -352,7 +352,7 @@ impl Engine {
                 // rest any unfilled passive quantity after the aggressive walk.
                 let price = order.price.ok_or(DomainError::InvalidPrice)?;
                 let level_qty = self.rest_order(order.client_order_id, order.account_id, order.side, price, remaining_qty)?;
-                self.publish_book_update(order.side, price, level_qty, market_data)?;
+                self.publish_book_update(order.side, price, level_qty, sequencer, market_data)?;
                 // distinguish a pure add from an order that traded before resting.
                 if match_outcome.filled_qty == 0 {
                     self.push_report(
@@ -394,7 +394,7 @@ impl Engine {
         let removed = self.unlink_and_free(handle);
         if let Some(order) = removed {
             let level_qty = self.current_level_qty(order.side, order.price);
-            self.publish_book_update(order.side, order.price, level_qty, market_data)?;
+            self.publish_book_update(order.side, order.price, level_qty, sequencer, market_data)?;
         }
         self.push_report(
             sequencer,
@@ -441,7 +441,7 @@ impl Engine {
             // Same-price reductions stay in the existing FIFO position.
             self.preserve_priority_replace(handle, replace, current.remaining_qty)?;
             if replace.qty.raw() != current.remaining_qty {
-                self.publish_book_update(current.side, current.price, replace.qty.raw(), market_data)?;
+                self.publish_book_update(current.side, current.price, replace.qty.raw(), sequencer, market_data)?;
             }
             self.push_report(
                 sequencer,
@@ -463,7 +463,7 @@ impl Engine {
         // Price changes and quantity increases lose priority and re-enter as new.
         if let Some(removed) = self.unlink_and_free(handle) {
             let level_qty = self.current_level_qty(removed.side, removed.price);
-            self.publish_book_update(removed.side, removed.price, level_qty, market_data)?;
+            self.publish_book_update(removed.side, removed.price, level_qty, sequencer, market_data)?;
         }
         self.push_report(
             sequencer,
@@ -520,7 +520,7 @@ impl Engine {
             current = self.orders.get(handle).and_then(|order| order.account_next);
             if let Some(removed) = self.unlink_and_free(handle) {
                 let level_qty = self.current_level_qty(removed.side, removed.price);
-                self.publish_book_update(removed.side, removed.price, level_qty, market_data)?;
+                self.publish_book_update(removed.side, removed.price, level_qty, sequencer, market_data)?;
                 self.push_report(
                     sequencer,
                     emit_report,
@@ -602,9 +602,16 @@ impl Engine {
             }
 
             // market-data output is sequenced immediately after the deterministic state change.
-            market_data.publish_trade(maker.order_id, taker_order_id, maker.price, fill_qty, &self.config.instrument())?;
+            market_data.publish_trade(
+                sequencer,
+                maker.order_id,
+                taker_order_id,
+                maker.price,
+                fill_qty,
+                &self.config.instrument(),
+            )?;
             let level_qty = self.current_level_qty(maker.side, maker.price);
-            self.publish_book_update(maker.side, maker.price, level_qty, market_data)?;
+            self.publish_book_update(maker.side, maker.price, level_qty, sequencer, market_data)?;
 
             // maker report reflects this fill and the maker's remaining book quantity.
             self.push_report(
@@ -894,11 +901,18 @@ impl Engine {
     }
 
     /// Emit market data for a visible book-level mutation.
-    fn publish_book_update(&mut self, side: Side, price: Price, level_qty: u64, market_data: &mut MarketDataRuntime) -> DomainResult<()> {
+    fn publish_book_update(
+        &mut self,
+        side: Side,
+        price: Price,
+        level_qty: u64,
+        sequencer: &mut Sequencer,
+        market_data: &mut MarketDataRuntime,
+    ) -> DomainResult<()> {
         let best_bid = self.best_bid();
         let best_ask = self.best_ask();
-        market_data.publish_l2_update(side, price, level_qty)?;
-        market_data.publish_l1_update_if_changed(best_bid, best_ask)
+        market_data.publish_l2_update(sequencer, side, price, level_qty)?;
+        market_data.publish_l1_update_if_changed(sequencer, best_bid, best_ask)
     }
 
     /// Return the aggregate quantity currently visible at a level after mutation.
@@ -1348,6 +1362,7 @@ mod tests {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum CapturedMarketData {
         Trade {
+            engine_seq: u64,
             md_seq: u64,
             trade_id: u64,
             maker_order_id: u64,
@@ -1356,6 +1371,7 @@ mod tests {
             qty: u64,
         },
         L1 {
+            engine_seq: u64,
             md_seq: u64,
             prev_md_seq: u64,
             bid_price: u64,
@@ -1364,6 +1380,7 @@ mod tests {
             ask_qty: u64,
         },
         L2 {
+            engine_seq: u64,
             md_seq: u64,
             prev_md_seq: u64,
             side: Side,
@@ -1376,6 +1393,11 @@ mod tests {
         const fn md_seq(self) -> u64 {
             match self {
                 Self::Trade { md_seq, .. } | Self::L1 { md_seq, .. } | Self::L2 { md_seq, .. } => md_seq,
+            }
+        }
+        const fn engine_seq(self) -> u64 {
+            match self {
+                Self::Trade { engine_seq, .. } | Self::L1 { engine_seq, .. } | Self::L2 { engine_seq, .. } => engine_seq,
             }
         }
     }
@@ -1403,6 +1425,7 @@ mod tests {
                         SCHEMA_VERSION,
                     );
                     CapturedMarketData::Trade {
+                        engine_seq: decoder.engine_seq(),
                         md_seq: decoder.md_seq(),
                         trade_id: decoder.trade_id(),
                         maker_order_id: decoder.maker_order_id(),
@@ -1419,6 +1442,7 @@ mod tests {
                         SCHEMA_VERSION,
                     );
                     CapturedMarketData::L1 {
+                        engine_seq: decoder.engine_seq(),
                         md_seq: decoder.md_seq(),
                         prev_md_seq: decoder.prev_md_seq(),
                         bid_price: decoder.bid_price(),
@@ -1435,6 +1459,7 @@ mod tests {
                         SCHEMA_VERSION,
                     );
                     CapturedMarketData::L2 {
+                        engine_seq: decoder.engine_seq(),
                         md_seq: decoder.md_seq(),
                         prev_md_seq: decoder.prev_md_seq(),
                         side: match decoder.side() {
@@ -2048,6 +2073,44 @@ mod tests {
     }
 
     #[test]
+    fn market_data_and_execution_reports_share_engine_sequence() {
+        let path = temp_path("global-outbound-sequence");
+        let mut engine = TestEngine::new_file_market_data(path.clone());
+        let mut events = Vec::new();
+
+        execute(
+            &mut engine,
+            new_order(1, 1, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some(1000), 10, 1),
+            &mut events,
+            "rest maker",
+        );
+        assert_eq!(
+            exec_reports(&events).iter().map(|event| event.engine_seq.raw()).collect::<Vec<_>>(),
+            vec![3]
+        );
+
+        execute(
+            &mut engine,
+            new_order(2, 2, Side::Buy, OrderType::Market, TimeInForce::Ioc, None, 4, 2),
+            &mut events,
+            "take liquidity",
+        );
+        assert_eq!(
+            exec_reports(&events).iter().map(|event| event.engine_seq.raw()).collect::<Vec<_>>(),
+            vec![7, 8]
+        );
+
+        engine.flush_market_data();
+        let captured = read_market_data(&path);
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(
+            captured.iter().map(|event| event.engine_seq()).collect::<Vec<_>>(),
+            vec![1, 2, 4, 5, 6]
+        );
+    }
+
+    #[test]
     fn price_change_replace_loses_priority() {
         let Some(mut engine) = TestEngine::new() else {
             return;
@@ -2376,6 +2439,7 @@ mod tests {
                 captured.iter().map(|event| event.md_seq()).collect::<Vec<_>>(),
                 (1..=captured.len() as u64).collect::<Vec<_>>()
             );
+            prop_assert!(captured.windows(2).all(|pair| pair[0].engine_seq() < pair[1].engine_seq()));
             for event in &captured {
                 match *event {
                     CapturedMarketData::L1 { md_seq, prev_md_seq, .. } | CapturedMarketData::L2 { md_seq, prev_md_seq, .. } => {

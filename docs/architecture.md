@@ -86,8 +86,8 @@ ownership boundary.
 
 - Owns outbound trade-print, L1, and L2 market-data shaping and multicast UDP
   egress.
-- Owns market-data sequencing separately from the matching engine's execution
-  report sequencing.
+- Owns feed-local market-data sequencing separately from global outbound
+  `EngineSeq` allocation.
 - Centralizes top-of-book change output, absolute level-update output, encoding,
   queueing, and flush/error state.
 - Tracks only last-published L1 state; the matching book remains the source of truth.
@@ -116,7 +116,8 @@ The intended flow is:
 3. runtime drains control and trading queues in deterministic order,
 4. control state and risk gates are observed before matching,
 5. engine mutates book state and emits internal execution/book effects,
-6. market-data and execution outputs are sequenced,
+6. market-data and execution outputs receive a shared global `EngineSeq`;
+   market-data messages also receive feed-local `MdSeq`,
 7. control and gateway encode endpoint-specific egress frames.
 
 Replay and benchmark traffic exercise the same protocol/runtime boundary as

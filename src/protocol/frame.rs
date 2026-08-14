@@ -10,7 +10,7 @@ use crate::protocol::error::{ProtocolError, ProtocolResult};
 pub const SCHEMA_ID: u16 = 7001;
 
 /// Current Ignition protocol schema version.
-pub const SCHEMA_VERSION: u16 = 12;
+pub const SCHEMA_VERSION: u16 = 1;
 
 /// Length of the standard SBE message header.
 pub const SBE_HEADER_LEN: usize = 8;

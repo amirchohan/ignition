@@ -1,5 +1,5 @@
 use crate::domain::{
-    DomainError, DomainResult, Price, Qty,
+    DomainError, DomainResult, EngineSeq, Price, Qty,
     trading::order::{OrderId, Side},
 };
 
@@ -31,6 +31,7 @@ impl TradeId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TradePrint {
+    pub engine_seq: EngineSeq,
     pub md_seq: MdSeq,
     pub trade_id: TradeId,
     pub maker_order_id: OrderId,
@@ -41,6 +42,7 @@ pub struct TradePrint {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L1Update {
+    pub engine_seq: EngineSeq,
     pub md_seq: MdSeq,
     pub prev_md_seq: MdSeq,
     pub bid_price: Option<Price>,
@@ -51,6 +53,7 @@ pub struct L1Update {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct L2Update {
+    pub engine_seq: EngineSeq,
     pub md_seq: MdSeq,
     pub prev_md_seq: MdSeq,
     pub side: Side,

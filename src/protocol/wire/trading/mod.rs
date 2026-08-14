@@ -85,6 +85,7 @@ mod tests {
         let market_data = [
             (
                 MarketDataEvent::TradePrint(TradePrint {
+                    engine_seq: EngineSeq::new(6),
                     md_seq: MdSeq::new(2),
                     trade_id: TradeId::new(3),
                     maker_order_id: OrderId::new(12).expect("maker"),
@@ -96,6 +97,7 @@ mod tests {
             ),
             (
                 MarketDataEvent::L1Update(L1Update {
+                    engine_seq: EngineSeq::new(7),
                     md_seq: MdSeq::new(4),
                     prev_md_seq: MdSeq::new(3),
                     bid_price: None,
@@ -107,6 +109,7 @@ mod tests {
             ),
             (
                 MarketDataEvent::L2Update(L2Update {
+                    engine_seq: EngineSeq::new(8),
                     md_seq: MdSeq::new(5),
                     prev_md_seq: MdSeq::new(4),
                     side: crate::domain::trading::order::Side::Buy,

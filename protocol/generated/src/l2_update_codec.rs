@@ -7,7 +7,7 @@ pub use crate::SBE_SCHEMA_ID;
 pub use crate::SBE_SCHEMA_VERSION;
 pub use crate::SBE_SEMANTIC_VERSION;
 
-pub const SBE_BLOCK_LENGTH: u16 = 33;
+pub const SBE_BLOCK_LENGTH: u16 = 41;
 pub const SBE_TEMPLATE_ID: u16 = 202;
 
 pub mod encoder {
@@ -66,7 +66,7 @@ pub mod encoder {
             header
         }
 
-        /// primitive field 'mdSeq'
+        /// primitive field 'engineSeq'
         /// - min value: 0
         /// - max value: -2
         /// - null value: 0xffffffffffffffff_u64
@@ -76,8 +76,24 @@ pub mod encoder {
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
-        pub fn md_seq(&mut self, value: u64) -> &mut Self {
+        pub fn engine_seq(&mut self, value: u64) -> &mut Self {
             let offset = self.offset;
+            self.get_buf_mut().put_u64_at(offset, value);
+            self
+        }
+
+        /// primitive field 'mdSeq'
+        /// - min value: 0
+        /// - max value: -2
+        /// - null value: 0xffffffffffffffff_u64
+        /// - characterEncoding: null
+        /// - semanticType: null
+        /// - encodedOffset: 8
+        /// - encodedLength: 8
+        /// - version: 0
+        #[inline]
+        pub fn md_seq(&mut self, value: u64) -> &mut Self {
+            let offset = self.offset + 8;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -88,12 +104,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 8
+        /// - encodedOffset: 16
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn prev_md_seq(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 8;
+            let offset = self.offset + 16;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -101,7 +117,7 @@ pub mod encoder {
         /// REQUIRED enum
         #[inline]
         pub fn side(&mut self, value: book_side::BookSide) -> &mut Self {
-            let offset = self.offset + 16;
+            let offset = self.offset + 24;
             self.get_buf_mut().put_u8_at(offset, value as u8);
             self
         }
@@ -112,12 +128,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 17
+        /// - encodedOffset: 25
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn price(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 17;
+            let offset = self.offset + 25;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -128,12 +144,12 @@ pub mod encoder {
         /// - null value: 0xffffffffffffffff_u64
         /// - characterEncoding: null
         /// - semanticType: null
-        /// - encodedOffset: 25
+        /// - encodedOffset: 33
         /// - encodedLength: 8
         /// - version: 0
         #[inline]
         pub fn qty(&mut self, value: u64) -> &mut Self {
-            let offset = self.offset + 25;
+            let offset = self.offset + 33;
             self.get_buf_mut().put_u64_at(offset, value);
             self
         }
@@ -213,32 +229,38 @@ pub mod decoder {
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn md_seq(&self) -> u64 {
+        pub fn engine_seq(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
-        pub fn prev_md_seq(&self) -> u64 {
+        pub fn md_seq(&self) -> u64 {
             self.get_buf().get_u64_at(self.offset + 8)
+        }
+
+        /// primitive field - 'REQUIRED'
+        #[inline]
+        pub fn prev_md_seq(&self) -> u64 {
+            self.get_buf().get_u64_at(self.offset + 16)
         }
 
         /// REQUIRED enum
         #[inline]
         pub fn side(&self) -> book_side::BookSide {
-            self.get_buf().get_u8_at(self.offset + 16).into()
+            self.get_buf().get_u8_at(self.offset + 24).into()
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
         pub fn price(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 17)
+            self.get_buf().get_u64_at(self.offset + 25)
         }
 
         /// primitive field - 'REQUIRED'
         #[inline]
         pub fn qty(&self) -> u64 {
-            self.get_buf().get_u64_at(self.offset + 25)
+            self.get_buf().get_u64_at(self.offset + 33)
         }
     }
 } // end decoder

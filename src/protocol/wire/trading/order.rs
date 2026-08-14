@@ -72,6 +72,7 @@ pub fn decode_order_entry(input: &[u8]) -> ProtocolResult<WireOrderEntry> {
     if !frame.kind.is_order_entry() {
         return Err(unexpected_template(frame.kind));
     }
+    ensure_order_entry_block_len(frame)?;
 
     let read_buf = ReadBuf::new(input);
     match frame.kind {
@@ -120,6 +121,20 @@ pub fn decode_order_entry(input: &[u8]) -> ProtocolResult<WireOrderEntry> {
         }
         _ => unreachable!("order entry kind checked above"),
     }
+}
+
+fn ensure_order_entry_block_len(frame: crate::protocol::ProtocolFrame) -> ProtocolResult<()> {
+    let expected = match frame.kind {
+        MessageKind::NewOrder => new_order_codec::SBE_BLOCK_LENGTH,
+        MessageKind::CancelOrder => cancel_order_codec::SBE_BLOCK_LENGTH,
+        MessageKind::CancelReplace => cancel_replace_codec::SBE_BLOCK_LENGTH,
+        MessageKind::MassCancel => mass_cancel_codec::SBE_BLOCK_LENGTH,
+        _ => return Err(unexpected_template(frame.kind)),
+    };
+    if frame.block_length < expected {
+        return Err(crate::protocol::ProtocolError::BufferTooShort);
+    }
+    Ok(())
 }
 
 pub fn normalize_order_entry(message: WireOrderEntry, recv_ts: RecvTs, instrument: &InstrumentSpec) -> DomainResult<OrderEntry> {
@@ -261,6 +276,16 @@ mod tests {
 
     fn put_u16_le(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn expected_order_entry_block_len(kind: MessageKind) -> u16 {
+        match kind {
+            MessageKind::NewOrder => new_order_codec::SBE_BLOCK_LENGTH,
+            MessageKind::CancelOrder => cancel_order_codec::SBE_BLOCK_LENGTH,
+            MessageKind::CancelReplace => cancel_replace_codec::SBE_BLOCK_LENGTH,
+            MessageKind::MassCancel => mass_cancel_codec::SBE_BLOCK_LENGTH,
+            _ => 0,
+        }
     }
 
     fn put_u64_le(bytes: &mut [u8], offset: usize, value: u64) {
@@ -470,6 +495,9 @@ mod tests {
                     }
                     Ok(kind) if !kind.is_order_entry() => {
                         prop_assert_eq!(result, Err(ProtocolError::UnexpectedTemplate { template_id }));
+                    }
+                    Ok(kind) if declared_block_len < expected_order_entry_block_len(kind) => {
+                        prop_assert_eq!(result, Err(ProtocolError::BufferTooShort));
                     }
                     Ok(_) => {
                         prop_assert!(result.is_ok());

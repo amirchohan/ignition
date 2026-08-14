@@ -6,7 +6,7 @@
 
 use crate::{
     domain::{
-        DomainError, DomainResult, Price, Qty,
+        DomainError, DomainResult, Price, Qty, Sequencer,
         rd::InstrumentSpec,
         trading::{
             md::{L1Update, L2Update, MarketDataEvent, MarketDataSequencer, TradePrint},
@@ -54,6 +54,7 @@ impl MarketDataRuntime {
     #[allow(clippy::too_many_arguments)]
     pub fn publish_trade(
         &mut self,
+        sequencer: &mut Sequencer,
         maker_order_id: OrderId,
         taker_order_id: OrderId,
         price: Price,
@@ -63,6 +64,7 @@ impl MarketDataRuntime {
         let qty = Qty::new(fill_qty, instrument).map_err(|_| DomainError::InvalidQuantity)?;
         let md_seq = self.sequencer.next_md_seq()?;
         let event = MarketDataEvent::TradePrint(TradePrint {
+            engine_seq: sequencer.next_engine_seq()?,
             md_seq,
             trade_id: self.sequencer.next_trade_id()?,
             maker_order_id,
@@ -76,10 +78,11 @@ impl MarketDataRuntime {
     }
 
     /// Emit one absolute L2 aggregate level update.
-    pub fn publish_l2_update(&mut self, side: Side, price: Price, qty: u64) -> DomainResult<()> {
+    pub fn publish_l2_update(&mut self, sequencer: &mut Sequencer, side: Side, price: Price, qty: u64) -> DomainResult<()> {
         let prev_md_seq = self.sequencer.previous_md_seq();
         let md_seq = self.sequencer.next_md_seq()?;
         self.emit_market_data(MarketDataEvent::L2Update(L2Update {
+            engine_seq: sequencer.next_engine_seq()?,
             md_seq,
             prev_md_seq,
             side,
@@ -90,7 +93,12 @@ impl MarketDataRuntime {
     }
 
     /// Emit one L1 top-of-book update only when the top state changed.
-    pub fn publish_l1_update_if_changed(&mut self, best_bid: Option<(Price, u64)>, best_ask: Option<(Price, u64)>) -> DomainResult<()> {
+    pub fn publish_l1_update_if_changed(
+        &mut self,
+        sequencer: &mut Sequencer,
+        best_bid: Option<(Price, u64)>,
+        best_ask: Option<(Price, u64)>,
+    ) -> DomainResult<()> {
         let bid_price = best_bid.map(|(price, _)| price);
         let bid_qty = best_bid.map_or(0, |(_, qty)| qty);
         let ask_price = best_ask.map(|(price, _)| price);
@@ -105,6 +113,7 @@ impl MarketDataRuntime {
         let prev_md_seq = self.sequencer.previous_md_seq();
         let md_seq = self.sequencer.next_md_seq()?;
         let event = L1Update {
+            engine_seq: sequencer.next_engine_seq()?,
             md_seq,
             prev_md_seq,
             bid_price,

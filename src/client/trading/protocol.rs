@@ -79,6 +79,7 @@ pub struct ClientExecutionReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientTradePrint {
+    pub engine_seq: u64,
     pub md_seq: u64,
     pub trade_id: u64,
     pub maker_order_id: u64,
@@ -89,6 +90,7 @@ pub struct ClientTradePrint {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientL1Update {
+    pub engine_seq: u64,
     pub md_seq: u64,
     pub prev_md_seq: u64,
     pub bid_price: u64,
@@ -99,6 +101,7 @@ pub struct ClientL1Update {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientL2Update {
+    pub engine_seq: u64,
     pub md_seq: u64,
     pub prev_md_seq: u64,
     pub side: book_side::BookSide,
@@ -148,6 +151,7 @@ pub fn decode_inbound_event(input: &[u8]) -> ProtocolResult<ClientInboundEvent> 
         MessageKind::TradePrint => {
             let decoder = trade_print_codec::TradePrintDecoder::default().wrap(read_buf, SBE_HEADER_LEN, frame.block_length, frame.version);
             Ok(ClientInboundEvent::TradePrint(ClientTradePrint {
+                engine_seq: decoder.engine_seq(),
                 md_seq: decoder.md_seq(),
                 trade_id: decoder.trade_id(),
                 maker_order_id: decoder.maker_order_id(),
@@ -159,6 +163,7 @@ pub fn decode_inbound_event(input: &[u8]) -> ProtocolResult<ClientInboundEvent> 
         MessageKind::L1Update => {
             let decoder = l1_update_codec::L1UpdateDecoder::default().wrap(read_buf, SBE_HEADER_LEN, frame.block_length, frame.version);
             Ok(ClientInboundEvent::L1Update(ClientL1Update {
+                engine_seq: decoder.engine_seq(),
                 md_seq: decoder.md_seq(),
                 prev_md_seq: decoder.prev_md_seq(),
                 bid_price: decoder.bid_price(),
@@ -170,6 +175,7 @@ pub fn decode_inbound_event(input: &[u8]) -> ProtocolResult<ClientInboundEvent> 
         MessageKind::L2Update => {
             let decoder = l2_update_codec::L2UpdateDecoder::default().wrap(read_buf, SBE_HEADER_LEN, frame.block_length, frame.version);
             Ok(ClientInboundEvent::L2Update(ClientL2Update {
+                engine_seq: decoder.engine_seq(),
                 md_seq: decoder.md_seq(),
                 prev_md_seq: decoder.prev_md_seq(),
                 side: decoder.side(),
@@ -353,6 +359,7 @@ mod tests {
         let mut bytes = [0_u8; 128];
         let written = encode_market_data_event(
             MarketDataEvent::TradePrint(TradePrint {
+                engine_seq: EngineSeq::new(6),
                 md_seq: MdSeq::new(7),
                 trade_id: TradeId::new(8),
                 maker_order_id: OrderId::new(9).expect("maker"),
@@ -367,10 +374,12 @@ mod tests {
             panic!("expected trade");
         };
         assert_eq!(trade.trade_id, 8);
+        assert_eq!(trade.engine_seq, 6);
         assert_eq!(trade.price, 11);
 
         let written = encode_market_data_event(
             MarketDataEvent::L1Update(L1Update {
+                engine_seq: EngineSeq::new(14),
                 md_seq: MdSeq::new(13),
                 prev_md_seq: MdSeq::new(12),
                 bid_price: Some(Price::new(10, &instrument).expect("bid")),
@@ -385,6 +394,7 @@ mod tests {
             panic!("expected l1");
         };
         assert_eq!(l1.bid_price, 10);
+        assert_eq!(l1.engine_seq, 14);
         assert_eq!(l1.ask_price, 0);
     }
 }

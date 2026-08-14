@@ -3,8 +3,8 @@
     xmlns:sbe="http://fixprotocol.io/2016/sbe"
     package="ignition_protocol_generated"
     id="7001"
-    version="12"
-    semanticVersion="12.0.0"
+    version="1"
+    semanticVersion="1"
     description="Ignition single-symbol CLOB protocol"
     byteOrder="littleEndian">
 
@@ -204,28 +204,31 @@
     </message>
 
     <message name="TradePrint" id="200" description="Market-data trade print">
-        <field name="mdSeq" id="1" type="uint64"/>
-        <field name="tradeId" id="2" type="uint64"/>
-        <field name="makerOrderId" id="3" type="uint64"/>
-        <field name="takerOrderId" id="4" type="uint64"/>
-        <field name="price" id="5" type="uint64"/>
-        <field name="qty" id="6" type="uint64"/>
+        <field name="engineSeq" id="1" type="uint64"/>
+        <field name="mdSeq" id="2" type="uint64"/>
+        <field name="tradeId" id="3" type="uint64"/>
+        <field name="makerOrderId" id="4" type="uint64"/>
+        <field name="takerOrderId" id="5" type="uint64"/>
+        <field name="price" id="6" type="uint64"/>
+        <field name="qty" id="7" type="uint64"/>
     </message>
 
     <message name="L1Update" id="201" description="Top-of-book market-data update">
-        <field name="mdSeq" id="1" type="uint64"/>
-        <field name="prevMdSeq" id="2" type="uint64"/>
-        <field name="bidPrice" id="3" type="uint64"/>
-        <field name="bidQty" id="4" type="uint64"/>
-        <field name="askPrice" id="5" type="uint64"/>
-        <field name="askQty" id="6" type="uint64"/>
+        <field name="engineSeq" id="1" type="uint64"/>
+        <field name="mdSeq" id="2" type="uint64"/>
+        <field name="prevMdSeq" id="3" type="uint64"/>
+        <field name="bidPrice" id="4" type="uint64"/>
+        <field name="bidQty" id="5" type="uint64"/>
+        <field name="askPrice" id="6" type="uint64"/>
+        <field name="askQty" id="7" type="uint64"/>
     </message>
 
     <message name="L2Update" id="202" description="Absolute aggregate L2 price-level update">
-        <field name="mdSeq" id="1" type="uint64"/>
-        <field name="prevMdSeq" id="2" type="uint64"/>
-        <field name="side" id="3" type="BookSide"/>
-        <field name="price" id="4" type="uint64"/>
-        <field name="qty" id="5" type="uint64"/>
+        <field name="engineSeq" id="1" type="uint64"/>
+        <field name="mdSeq" id="2" type="uint64"/>
+        <field name="prevMdSeq" id="3" type="uint64"/>
+        <field name="side" id="4" type="BookSide"/>
+        <field name="price" id="5" type="uint64"/>
+        <field name="qty" id="6" type="uint64"/>
     </message>
 </sbe:messageSchema>
