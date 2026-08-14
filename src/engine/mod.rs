@@ -1395,6 +1395,7 @@ mod tests {
                 Self::Trade { md_seq, .. } | Self::L1 { md_seq, .. } | Self::L2 { md_seq, .. } => md_seq,
             }
         }
+
         const fn engine_seq(self) -> u64 {
             match self {
                 Self::Trade { engine_seq, .. } | Self::L1 { engine_seq, .. } | Self::L2 { engine_seq, .. } => engine_seq,

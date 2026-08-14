@@ -21,15 +21,10 @@ frame: [u8; frame_len]
 ```
 
 Outbound trading and market-data messages currently do not carry receive
-<<<<<<< HEAD
-timestamps. Control responses and protocol errors that do carry `recv_ts` use
-the recorded timestamp.
-=======
 timestamps. Execution reports, control events, protocol errors, and
 market-data messages all carry a globally monotonic `engineSeq`; market-data
 messages also carry a feed-local `mdSeq` for gap detection. Control responses
 and protocol errors that do carry `recv_ts` use the recorded timestamp.
->>>>>>> single_engine_sequencer
 
 ## Recording
 
