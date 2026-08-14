@@ -15,6 +15,10 @@ path = "bin/trading_client.rs"
 name = "control-client"
 path = "bin/control_client.rs"
 
+[[bin]]
+name = "replay"
+path = "bin/replay.rs"
+
 [dependencies]
 ignition_protocol_generated = { path = "protocol/generated" }
 crossterm = "0.28"

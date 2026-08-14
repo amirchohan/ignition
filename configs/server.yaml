@@ -1,3 +1,7 @@
+mode:
+  type: live
+  next_input_seq: 1
+  record_path_dir: "fixtures/replay/runs"
 reference_data:
   instrument:
     instrument_id: 1001 # BTC-USD
@@ -17,7 +21,7 @@ engine:
 risk:
   max_open_orders_per_account: 1000
   max_open_notional_per_account: 100000000000000000
-  startup_reference_price: 7000000 # $70,000.00 with price_decimals=2
+  startup_reference_price: 6500000 # $70,000.00 with price_decimals=2
   price_band_bps: 1000 # +/-10%
 control:
   # type: noop

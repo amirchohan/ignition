@@ -169,7 +169,12 @@ impl IORuntime {
             Some(max_frames) => io.poll_bounded(&mut callback, max_frames),
             None => io.poll(&mut callback),
         };
-        flatten_poll_error(result)
+        let progress = flatten_poll_error(result)?;
+        let record_progress = match recorder.as_mut() {
+            Some(recorder) => recorder.flush_pending().map_err(FramePollError::Io)?,
+            None => false,
+        };
+        Ok(progress || record_progress)
     }
 
     fn poll_file<F, E>(&mut self, mode: &mut Mode, mut on_frame: F) -> Result<bool, FramePollError<E>>
@@ -206,6 +211,7 @@ impl IORuntime {
         let record = io.take_peeked().expect("peeked record");
         let mut publisher = IOPublisher::File(FileFramePublisher::new(io));
         on_frame(&mut publisher, record.recv_ts, &record.frame).map_err(FramePollError::Handler)?;
+        io.flush_pending().map_err(FramePollError::Io)?;
 
         // Replay advances only after the endpoint handled the frame.
         mode.accept_replay_frame(record.input_seq).map_err(FramePollError::Io)?;
@@ -224,12 +230,17 @@ impl IORuntime {
 
     /// Flush pending outbound frames.
     pub fn flush_pending(&mut self) -> Result<bool, IoError> {
-        match &mut self.backend {
+        let backend_progress = match &mut self.backend {
             IOBackend::Noop => Ok(false),
             IOBackend::Tcp(io) => io.flush_pending(),
             IOBackend::Udp(io) => io.flush_pending(),
             IOBackend::File(io) => io.flush_pending(),
-        }
+        }?;
+        let recorder_progress = match &mut self.recorder {
+            Some(recorder) => recorder.flush_pending()?,
+            None => false,
+        };
+        Ok(backend_progress || recorder_progress)
     }
 
     /// True when this endpoint's file-backed replay input is fully drained.
@@ -238,6 +249,14 @@ impl IORuntime {
             IOBackend::File(io) => io.input_exhausted(),
             IOBackend::Noop => Ok(true),
             IOBackend::Tcp(_) | IOBackend::Udp(_) => Err(IoError::ReplayExpectedInLive),
+        }
+    }
+
+    #[cfg(test)]
+    fn tcp_local_addr(&self) -> Result<std::net::SocketAddr, IoError> {
+        match &self.backend {
+            IOBackend::Tcp(io) => io.local_addr(),
+            IOBackend::Noop | IOBackend::Udp(_) | IOBackend::File(_) => Err(IoError::ReplayExpectedInLive),
         }
     }
 }
@@ -486,9 +505,13 @@ impl IOConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
+    use std::{io::Write, net::TcpStream, path::Path, thread, time::Duration};
 
-    use crate::{domain::RecvTs, runtime::Mode};
+    use crate::{
+        domain::RecvTs,
+        protocol::{MessageKind, SBE_HEADER_LEN, encode_header},
+        runtime::Mode,
+    };
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ignition-{name}-{}-{}.bin", std::process::id(), unique_suffix()))
@@ -505,6 +528,13 @@ mod tests {
         let mut io = FileFrameIo::open(None, Some(path.to_path_buf()), 128).expect("writer");
         io.record_input(&record).expect("record");
         io.flush_pending().expect("flush");
+    }
+
+    fn frame(kind: MessageKind, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0_u8; SBE_HEADER_LEN + payload.len()];
+        encode_header(&mut bytes, payload.len() as u16, kind).expect("header");
+        bytes[SBE_HEADER_LEN..].copy_from_slice(payload);
+        bytes
     }
 
     #[test]
@@ -590,5 +620,53 @@ mod tests {
 
         let _ = std::fs::remove_file(gateway_path);
         let _ = std::fs::remove_file(control_path);
+    }
+
+    #[test]
+    fn tcp_backend_records_live_input_frames() {
+        let record_path = temp_path("tcp-recording");
+        let mut runtime = match IORuntime::new(
+            Endpoint::Control,
+            IOConfig::Tcp {
+                bind_addr: "127.0.0.1:0".to_owned(),
+                max_frame_len: 128,
+                max_pending_write_bytes: 1024,
+                record_path: Some(record_path.clone()),
+            },
+        ) {
+            Ok(runtime) => runtime,
+            Err(IoError::Bind(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("tcp runtime: {error:?}"),
+        };
+        let addr = runtime.tcp_local_addr().expect("addr");
+        let mut client = TcpStream::connect(addr).expect("connect");
+        let frame = frame(MessageKind::Heartbeat, &[1, 0, 0, 0]);
+        client.write_all(&frame).expect("write");
+
+        let mut mode = Mode::default();
+        let mut seen = Vec::new();
+        for _ in 0..100 {
+            runtime
+                .poll(&mut mode, |_, recv_ts, bytes| {
+                    seen.push((recv_ts, bytes.to_vec()));
+                    Ok::<(), std::convert::Infallible>(())
+                })
+                .expect("poll");
+            if !seen.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        runtime.flush_pending().expect("flush");
+
+        assert_eq!(seen.len(), 1);
+        let mut recorded = FileFrameIo::open(Some(record_path.clone()), None, 128).expect("reader");
+        let record = recorded.peek_record().expect("record").expect("record");
+        assert_eq!(record.input_seq, 1);
+        assert_eq!(record.endpoint, Endpoint::Control);
+        assert_eq!(record.recv_ts, seen[0].0);
+        assert_eq!(record.frame, frame);
+
+        let _ = std::fs::remove_file(record_path);
     }
 }

@@ -11,5 +11,11 @@ trading-client:
 control-client:
     cargo run --bin control-client
 
+replay input_id:
+    cargo run --bin replay -- --run {{input_id}} --config configs/replay.yaml
+
+replay-compare input_id:
+    scripts/replay_compare.sh {{input_id}} configs/replay.yaml
+
 sbe:
     scripts/generate_sbe.sh

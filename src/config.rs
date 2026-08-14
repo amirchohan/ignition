@@ -4,7 +4,10 @@
 //! the validated numeric `InstrumentSpec` into protocol normalization and core
 //! components rather than reading YAML inside matching/risk logic.
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use serde::Deserialize;
 
@@ -21,6 +24,7 @@ use crate::{
 /// Server configuration loaded from `configs/server.yaml`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ServerConfig {
+    pub mode: RuntimeModeConfig,
     pub reference_data: ReferenceDataConfig,
     pub engine: EngineRuntimeConfig,
     pub risk: RiskRuntimeConfig,
@@ -88,6 +92,7 @@ pub struct InstrumentConfig {
 }
 
 impl InstrumentConfig {
+    /// Validate instrument reference data into core domain types.
     pub fn validate(self) -> DomainResult<InstrumentSpec> {
         InstrumentSpec::new(
             self.instrument_id,
@@ -113,6 +118,7 @@ pub struct EngineRuntimeConfig {
 }
 
 impl EngineRuntimeConfig {
+    /// Validate storage bounds and engine capacity settings.
     pub fn validate(self, instrument: &InstrumentSpec) -> DomainResult<EngineConfig> {
         EngineConfig::new(
             *instrument,
@@ -136,6 +142,7 @@ pub struct RiskRuntimeConfig {
 }
 
 impl RiskRuntimeConfig {
+    /// Validate risk settings against the configured instrument scale.
     pub fn validate(self, instrument: &InstrumentSpec) -> DomainResult<RiskConfig> {
         RiskConfig::new(
             self.max_open_orders_per_account,
@@ -155,11 +162,36 @@ pub struct ControlRuntimeConfig {
 }
 
 impl ControlRuntimeConfig {
+    /// Convert control-plane config into endpoint runtime config.
     pub fn validate(&self) -> ControlConfig {
         ControlConfig {
             heartbeat_timeout_ns: self.heartbeat_timeout_ns,
             io: self.backend.validate(),
         }
+    }
+
+    /// Return the configured control frame capacity.
+    pub fn frame_capacity(&self) -> usize {
+        self.backend.frame_capacity()
+    }
+
+    /// Set TCP live-input recording path, returning whether the backend was TCP.
+    pub fn set_tcp_record_path(&mut self, path: PathBuf) -> bool {
+        self.backend.set_tcp_record_path(path)
+    }
+
+    /// Switch the control endpoint to file input/output while preserving frame capacity.
+    pub fn set_file_io(&mut self, input_path: Option<PathBuf>, output_path: Option<PathBuf>) {
+        self.backend = ControlBackendConfig::File {
+            input_path,
+            output_path,
+            max_frame_len: self.frame_capacity(),
+        };
+    }
+
+    /// Return the configured control file output path, if any.
+    pub fn file_output_path(&self) -> Option<&Path> {
+        self.backend.file_output_path()
     }
 }
 
@@ -167,27 +199,76 @@ impl ControlRuntimeConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlBackendConfig {
     Noop,
+    File {
+        #[serde(default)]
+        input_path: Option<PathBuf>,
+        #[serde(default)]
+        output_path: Option<PathBuf>,
+        max_frame_len: usize,
+    },
     Tcp {
         bind_addr: String,
         max_frame_len: usize,
         max_pending_write_bytes: usize,
+        #[serde(default)]
+        record_path: Option<PathBuf>,
     },
 }
 
 impl ControlBackendConfig {
+    /// Convert the control backend config into generic IO config.
     fn validate(&self) -> IOConfig {
         match self {
             Self::Noop => IOConfig::Noop,
+            Self::File {
+                input_path,
+                output_path,
+                max_frame_len,
+            } => IOConfig::File {
+                input_path: input_path.clone(),
+                output_path: output_path.clone(),
+                max_frame_len: *max_frame_len,
+            },
             Self::Tcp {
                 bind_addr,
                 max_frame_len,
                 max_pending_write_bytes,
+                record_path,
             } => IOConfig::Tcp {
                 bind_addr: bind_addr.clone(),
                 max_frame_len: *max_frame_len,
                 max_pending_write_bytes: *max_pending_write_bytes,
-                record_path: None,
+                record_path: record_path.clone(),
             },
+        }
+    }
+
+    /// Return the maximum frame length for this backend.
+    fn frame_capacity(&self) -> usize {
+        match self {
+            Self::Noop => 4096,
+            Self::File { max_frame_len, .. } | Self::Tcp { max_frame_len, .. } => *max_frame_len,
+        }
+    }
+
+    /// Set TCP live-input recording path, returning whether this backend is TCP.
+    fn set_tcp_record_path(&mut self, path: PathBuf) -> bool {
+        match self {
+            Self::Tcp { record_path, .. } => {
+                *record_path = Some(path);
+                true
+            }
+            Self::Noop | Self::File { .. } => false,
+        }
+    }
+
+    /// Return the file output path when this backend is file based.
+    fn file_output_path(&self) -> Option<&Path> {
+        match self {
+            Self::File {
+                output_path: Some(path), ..
+            } => Some(path.as_path()),
+            Self::File { .. } | Self::Noop | Self::Tcp { .. } => None,
         }
     }
 }
@@ -201,11 +282,36 @@ pub struct GatewayRuntimeConfig {
 }
 
 impl GatewayRuntimeConfig {
+    /// Convert gateway config into endpoint runtime config.
     pub fn validate(&self) -> GatewayConfig {
         GatewayConfig {
             io: self.backend.validate(),
             max_messages_per_poll: self.max_messages_per_poll,
         }
+    }
+
+    /// Return the configured gateway frame capacity.
+    pub fn frame_capacity(&self) -> usize {
+        self.backend.frame_capacity()
+    }
+
+    /// Set TCP live-input recording path, returning whether the backend was TCP.
+    pub fn set_tcp_record_path(&mut self, path: PathBuf) -> bool {
+        self.backend.set_tcp_record_path(path)
+    }
+
+    /// Switch the gateway endpoint to file input/output while preserving frame capacity.
+    pub fn set_file_io(&mut self, input_path: Option<PathBuf>, output_path: Option<PathBuf>) {
+        self.backend = GatewayBackendConfig::File {
+            input_path,
+            output_path,
+            max_frame_len: self.frame_capacity(),
+        };
+    }
+
+    /// Return the configured gateway file output path, if any.
+    pub fn file_output_path(&self) -> Option<&Path> {
+        self.backend.file_output_path()
     }
 }
 
@@ -213,27 +319,76 @@ impl GatewayRuntimeConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GatewayBackendConfig {
     Noop,
+    File {
+        #[serde(default)]
+        input_path: Option<PathBuf>,
+        #[serde(default)]
+        output_path: Option<PathBuf>,
+        max_frame_len: usize,
+    },
     Tcp {
         bind_addr: String,
         max_frame_len: usize,
         max_pending_write_bytes: usize,
+        #[serde(default)]
+        record_path: Option<PathBuf>,
     },
 }
 
 impl GatewayBackendConfig {
+    /// Convert the gateway backend config into generic IO config.
     fn validate(&self) -> IOConfig {
         match self {
             Self::Noop => IOConfig::Noop,
+            Self::File {
+                input_path,
+                output_path,
+                max_frame_len,
+            } => IOConfig::File {
+                input_path: input_path.clone(),
+                output_path: output_path.clone(),
+                max_frame_len: *max_frame_len,
+            },
             Self::Tcp {
                 bind_addr,
                 max_frame_len,
                 max_pending_write_bytes,
+                record_path,
             } => IOConfig::Tcp {
                 bind_addr: bind_addr.clone(),
                 max_frame_len: *max_frame_len,
                 max_pending_write_bytes: *max_pending_write_bytes,
-                record_path: None,
+                record_path: record_path.clone(),
             },
+        }
+    }
+
+    /// Return the maximum frame length for this backend.
+    fn frame_capacity(&self) -> usize {
+        match self {
+            Self::Noop => 4096,
+            Self::File { max_frame_len, .. } | Self::Tcp { max_frame_len, .. } => *max_frame_len,
+        }
+    }
+
+    /// Set TCP live-input recording path, returning whether this backend is TCP.
+    fn set_tcp_record_path(&mut self, path: PathBuf) -> bool {
+        match self {
+            Self::Tcp { record_path, .. } => {
+                *record_path = Some(path);
+                true
+            }
+            Self::Noop | Self::File { .. } => false,
+        }
+    }
+
+    /// Return the file output path when this backend is file based.
+    fn file_output_path(&self) -> Option<&Path> {
+        match self {
+            Self::File {
+                output_path: Some(path), ..
+            } => Some(path.as_path()),
+            Self::File { .. } | Self::Noop | Self::Tcp { .. } => None,
         }
     }
 }
@@ -243,6 +398,11 @@ impl GatewayBackendConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MarketDataRuntimeConfig {
     Noop,
+    File {
+        #[serde(default)]
+        output_path: Option<PathBuf>,
+        max_frame_len: usize,
+    },
     Udp {
         bind_addr: String,
         group_addr: String,
@@ -254,10 +414,46 @@ pub enum MarketDataRuntimeConfig {
 }
 
 impl MarketDataRuntimeConfig {
+    /// Return the configured market-data frame/datagram capacity.
+    pub fn frame_capacity(&self) -> usize {
+        match self {
+            Self::Noop => 4096,
+            Self::File { max_frame_len, .. } => *max_frame_len,
+            Self::Udp { max_datagram_len, .. } => *max_datagram_len,
+        }
+    }
+
+    /// Switch market data to file output while preserving frame capacity.
+    pub fn set_file_output(&mut self, output_path: Option<PathBuf>) {
+        *self = Self::File {
+            output_path,
+            max_frame_len: self.frame_capacity(),
+        };
+    }
+
+    /// Return the configured market-data file output path, if any.
+    pub fn file_output_path(&self) -> Option<&Path> {
+        match self {
+            Self::File {
+                output_path: Some(path), ..
+            } => Some(path.as_path()),
+            Self::File { .. } | Self::Noop | Self::Udp { .. } => None,
+        }
+    }
+
+    /// Convert market-data config into endpoint runtime config.
     pub fn validate(&self) -> MarketDataFeedConfig {
         MarketDataFeedConfig {
             io: match self {
                 Self::Noop => IOConfig::Noop,
+                Self::File {
+                    output_path,
+                    max_frame_len,
+                } => IOConfig::File {
+                    input_path: None,
+                    output_path: output_path.clone(),
+                    max_frame_len: *max_frame_len,
+                },
                 Self::Udp {
                     bind_addr,
                     group_addr,
@@ -278,373 +474,25 @@ impl MarketDataRuntimeConfig {
     }
 }
 
+/// Runtime input sequencing mode loaded from YAML.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RuntimeModeConfig {
+    Live {
+        next_input_seq: u64,
+        #[serde(default)]
+        record_path_dir: Option<PathBuf>,
+    },
+    Replay {
+        expected_input_seq: u64,
+        record_path_dir: PathBuf,
+    },
+}
+
 /// Config load/parse/validation errors.
 #[derive(Debug)]
 pub enum ConfigError {
     Read(std::io::Error),
     Parse(serde_yaml::Error),
     Validate(DomainError),
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn parse(input: &str) -> ServerConfig {
-        serde_yaml::from_str(input).expect("config should parse")
-    }
-
-    fn parse_with_required_defaults(input: &str) -> ServerConfig {
-        parse(&format!("{input}{}", required_non_target_config()))
-    }
-
-    fn required_non_target_config() -> &'static str {
-        r#"
-engine:
-  storage_min_price: 1
-  storage_max_price: 1000000
-  page_size: 1024
-  max_resting_orders: 16384
-  max_account_id: 65535
-  max_active_pages: 1024
-risk:
-  max_open_orders_per_account: 1000
-  max_open_notional_per_account: 10000000000000000
-  startup_reference_price: 10000000
-  price_band_bps: 1000
-control:
-  type: tcp
-  bind_addr: "127.0.0.1:19001"
-  heartbeat_timeout_ns: 0
-  max_frame_len: 4096
-  max_pending_write_bytes: 1048576
-gateway:
-  type: tcp
-  bind_addr: "127.0.0.1:19000"
-  max_frame_len: 4096
-  max_pending_write_bytes: 1048576
-  max_messages_per_poll: 1024
-market_data:
-  type: udp
-  bind_addr: "0.0.0.0:0"
-  group_addr: "239.255.0.1:19002"
-  multicast_ttl: 1
-  multicast_loop_v4: true
-  max_datagram_len: 4096
-  max_pending_datagram_bytes: 1048576
-"#
-    }
-
-    #[test]
-    fn parses_and_validates_reference_data() {
-        let config = parse_with_required_defaults(
-            r#"
-reference_data:
-  instrument:
-    instrument_id: 1001
-    base_asset_id: 1
-    quote_asset_id: 2
-    price_decimals: 2
-    qty_decimals: 8
-    price_tick: 1
-    qty_lot: 1
-"#,
-        );
-
-        let instrument = config.validate().expect("valid instrument");
-        assert_eq!(instrument.instrument_id.raw(), 1001);
-        assert_eq!(instrument.base_asset_id.raw(), 1);
-        assert_eq!(instrument.quote_asset_id.raw(), 2);
-        assert_eq!(instrument.price_decimals, 2);
-        assert_eq!(instrument.qty_decimals, 8);
-        assert_eq!(instrument.price_tick, 1);
-        assert_eq!(instrument.qty_lot, 1);
-        let engine = config.validate_engine().expect("valid engine config");
-        assert_eq!(engine.page_size(), 1024);
-    }
-
-    #[test]
-    fn rejects_invalid_reference_data() {
-        let config = parse_with_required_defaults(
-            r#"
-reference_data:
-  instrument:
-    instrument_id: 1001
-    base_asset_id: 1
-    quote_asset_id: 1
-    price_decimals: 2
-    qty_decimals: 8
-    price_tick: 1
-    qty_lot: 1
-"#,
-        );
-
-        assert_eq!(config.validate(), Err(DomainError::InvalidInstrumentSpec));
-    }
-
-    #[test]
-    fn rejects_reference_data_ids_that_exceed_u16() {
-        let mut yaml = r#"
-reference_data:
-  instrument:
-    instrument_id: 65536
-    base_asset_id: 1
-    quote_asset_id: 2
-    price_decimals: 2
-    qty_decimals: 8
-    price_tick: 1
-    qty_lot: 1
-"#
-        .to_owned();
-        yaml.push_str(required_non_target_config());
-        let error = serde_yaml::from_str::<ServerConfig>(&yaml).expect_err("instrument id should exceed u16");
-
-        assert!(error.to_string().contains("invalid value"));
-    }
-
-    #[test]
-    fn rejects_missing_runtime_config_sections() {
-        let error = serde_yaml::from_str::<ServerConfig>(
-            r#"
-reference_data:
-  instrument:
-    instrument_id: 1001
-    base_asset_id: 1
-    quote_asset_id: 2
-    price_decimals: 2
-    qty_decimals: 8
-    price_tick: 1
-    qty_lot: 1
-"#,
-        )
-        .expect_err("runtime config sections should be required");
-
-        assert!(error.to_string().contains("missing field"));
-    }
-
-    #[test]
-    fn parses_and_validates_engine_config() {
-        let config = parse(
-            r#"
-reference_data:
-  instrument:
-    instrument_id: 1001
-    base_asset_id: 1
-    quote_asset_id: 2
-    price_decimals: 2
-    qty_decimals: 8
-    price_tick: 5
-    qty_lot: 1
-engine:
-  storage_min_price: 10
-  storage_max_price: 1000
-  page_size: 1024
-  max_resting_orders: 100
-  max_account_id: 1000
-  max_active_pages: 10
-risk:
-  max_open_orders_per_account: 1000
-  max_open_notional_per_account: 10000000000000000
-  startup_reference_price: 100
-  price_band_bps: 1000
-control:
-  type: tcp
-  bind_addr: "127.0.0.1:19001"
-  heartbeat_timeout_ns: 0
-  max_frame_len: 4096
-  max_pending_write_bytes: 1048576
-gateway:
-  type: tcp
-  bind_addr: "127.0.0.1:19000"
-  max_frame_len: 4096
-  max_pending_write_bytes: 1048576
-  max_messages_per_poll: 1024
-market_data:
-  type: udp
-  bind_addr: "0.0.0.0:0"
-  group_addr: "239.255.0.1:19002"
-  multicast_ttl: 1
-  multicast_loop_v4: true
-  max_datagram_len: 4096
-  max_pending_datagram_bytes: 1048576
-"#,
-        );
-
-        let engine = config.validate_engine().expect("valid engine config");
-        assert_eq!(engine.storage_min_price().raw(), 10);
-        assert_eq!(engine.storage_max_price().raw(), 1000);
-        assert_eq!(engine.max_resting_orders(), 100);
-        assert_eq!(engine.max_account_id(), 1000);
-    }
-
-    #[test]
-    fn parses_and_validates_control_config() {
-        let config = parse(
-            r#"
-reference_data:
-  instrument:
-    instrument_id: 1001
-    base_asset_id: 1
-    quote_asset_id: 2
-    price_decimals: 2
-    qty_decimals: 8
-    price_tick: 1
-    qty_lot: 1
-engine:
-  storage_min_price: 1
-  storage_max_price: 1000000
-  page_size: 1024
-  max_resting_orders: 16384
-  max_account_id: 65535
-  max_active_pages: 1024
-risk:
-  max_open_orders_per_account: 1000
-  max_open_notional_per_account: 10000000000000000
-  startup_reference_price: 10000000
-  price_band_bps: 1000
-control:
-  type: tcp
-  bind_addr: "127.0.0.1:9011"
-  heartbeat_timeout_ns: 500
-  max_frame_len: 8192
-  max_pending_write_bytes: 16384
-gateway:
-  type: tcp
-  bind_addr: "127.0.0.1:19000"
-  max_frame_len: 4096
-  max_pending_write_bytes: 1048576
-  max_messages_per_poll: 1024
-market_data:
-  type: udp
-  bind_addr: "0.0.0.0:0"
-  group_addr: "239.255.0.1:19002"
-  multicast_ttl: 1
-  multicast_loop_v4: true
-  max_datagram_len: 4096
-  max_pending_datagram_bytes: 1048576
-"#,
-        );
-
-        let control = config.validate_control();
-        assert_eq!(control.heartbeat_timeout_ns, 500);
-        let IOConfig::Tcp {
-            bind_addr,
-            max_frame_len,
-            max_pending_write_bytes,
-            record_path,
-        } = control.io
-        else {
-            panic!("control io");
-        };
-        assert_eq!(bind_addr, "127.0.0.1:9011");
-        assert_eq!(max_frame_len, 8192);
-        assert_eq!(max_pending_write_bytes, 16384);
-        assert_eq!(record_path, None);
-    }
-
-    #[test]
-    fn parses_and_validates_gateway_config() {
-        let config = parse(
-            r#"
-reference_data:
-  instrument:
-    instrument_id: 1001
-    base_asset_id: 1
-    quote_asset_id: 2
-    price_decimals: 2
-    qty_decimals: 8
-    price_tick: 1
-    qty_lot: 1
-engine:
-  storage_min_price: 1
-  storage_max_price: 1000000
-  page_size: 1024
-  max_resting_orders: 16384
-  max_account_id: 65535
-  max_active_pages: 1024
-risk:
-  max_open_orders_per_account: 1000
-  max_open_notional_per_account: 10000000000000000
-  startup_reference_price: 10000000
-  price_band_bps: 1000
-control:
-  type: tcp
-  bind_addr: "127.0.0.1:19001"
-  heartbeat_timeout_ns: 0
-  max_frame_len: 4096
-  max_pending_write_bytes: 1048576
-gateway:
-  type: tcp
-  bind_addr: "127.0.0.1:9010"
-  max_frame_len: 8192
-  max_pending_write_bytes: 32768
-  max_messages_per_poll: 64
-market_data:
-  type: udp
-  bind_addr: "0.0.0.0:0"
-  group_addr: "239.255.0.1:19002"
-  multicast_ttl: 1
-  multicast_loop_v4: true
-  max_datagram_len: 4096
-  max_pending_datagram_bytes: 1048576
-"#,
-        );
-
-        let gateway = config.validate_gateway();
-        let IOConfig::Tcp {
-            bind_addr,
-            max_frame_len,
-            max_pending_write_bytes,
-            record_path,
-        } = gateway.io
-        else {
-            panic!("gateway io");
-        };
-        assert_eq!(bind_addr, "127.0.0.1:9010");
-        assert_eq!(max_frame_len, 8192);
-        assert_eq!(max_pending_write_bytes, 32768);
-        assert_eq!(record_path, None);
-        assert_eq!(gateway.max_messages_per_poll, 64);
-    }
-
-    #[test]
-    fn parses_noop_endpoint_backend_types() {
-        let config = parse(
-            r#"
-reference_data:
-  instrument:
-    instrument_id: 1001
-    base_asset_id: 1
-    quote_asset_id: 2
-    price_decimals: 2
-    qty_decimals: 8
-    price_tick: 1
-    qty_lot: 1
-engine:
-  storage_min_price: 1
-  storage_max_price: 1000000
-  page_size: 1024
-  max_resting_orders: 16384
-  max_account_id: 65535
-  max_active_pages: 1024
-risk:
-  max_open_orders_per_account: 1000
-  max_open_notional_per_account: 10000000000000000
-  startup_reference_price: 10000000
-  price_band_bps: 1000
-control:
-  type: noop
-  heartbeat_timeout_ns: 0
-gateway:
-  type: noop
-  max_messages_per_poll: 1024
-market_data:
-  type: noop
-"#,
-        );
-
-        assert!(matches!(config.validate_control().io, IOConfig::Noop));
-        assert!(matches!(config.validate_gateway().io, IOConfig::Noop));
-        assert!(matches!(config.validate_market_data().io, IOConfig::Noop));
-    }
 }

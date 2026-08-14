@@ -1,16 +1,22 @@
 //! Server entry point.
 
-use ignition::{
-    config::{ConfigError, ServerConfig},
-    control::{ControlError, ControlRuntime},
-    domain::DomainError,
-    engine::EngineError,
-    gateway::{GatewayError, GatewayRuntime},
-    market_data::{MarketDataError, MarketDataRuntime},
-    runtime::{Mode, Runtime, RuntimeError},
+use std::{
+    error::Error,
+    fs, io,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
+
+use ignition::{
+    config::{RuntimeModeConfig, ServerConfig},
+    runtime::{Mode, Runtime, RuntimeBuildError},
+};
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
+type ServerResult<T> = Result<T, Box<dyn Error>>;
+
+/// Start tracing and run the configured server process.
 fn main() {
     init_tracing();
     if let Err(error) = run() {
@@ -19,115 +25,94 @@ fn main() {
     };
 }
 
+/// Initialise process-wide tracing from `RUST_LOG`, defaulting to info logs.
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-fn run() -> Result<(), ServerError> {
-    let config = ServerConfig::load("configs/server.yaml")?;
-    let instrument = config.validate().map_err(ServerError::ReferenceData)?;
-    let engine_config = config.validate_engine().map_err(ServerError::EngineConfig)?;
-    let risk_config = config.validate_risk().map_err(ServerError::RiskConfig)?;
-    tracing::info!(
-        "reference data config: instrument_id={}|base_asset_id={}|quote_asset_id={}|price_decimals={}|qty_decimals={}|price_tick={}|qty_lot={}",
-        instrument.instrument_id.raw(),
-        instrument.base_asset_id.raw(),
-        instrument.quote_asset_id.raw(),
-        instrument.price_decimals,
-        instrument.qty_decimals,
-        instrument.price_tick,
-        instrument.qty_lot
-    );
-    tracing::info!(
-        "engine config: storage_min_price={}|storage_max_price={}|page_size={}|max_resting_orders={}|max_account_id={}|max_active_pages={}",
-        engine_config.storage_min_price().raw(),
-        engine_config.storage_max_price().raw(),
-        engine_config.page_size(),
-        engine_config.max_resting_orders(),
-        engine_config.max_account_id(),
-        engine_config.max_active_pages()
-    );
-    tracing::info!(
-        "risk config: max_open_orders_per_account={}|max_open_notional_per_account={}|startup_reference_price={}|price_band_bps={}",
-        risk_config.max_open_orders_per_account,
-        risk_config.max_open_notional_per_account,
-        risk_config.startup_reference_price.raw(),
-        risk_config.price_band_bps
-    );
+/// Load server config, apply optional live replay recording, and run the runtime.
+fn run() -> ServerResult<()> {
+    let mut config = ServerConfig::load("configs/server.yaml").map_err(RuntimeBuildError::Config)?;
+    prepare_config_for_live_mode(&mut config)?;
+    let mode = runtime_mode_for_live(&config)?;
 
-    let control = ControlRuntime::new(config.validate_control())?;
-    let gateway = GatewayRuntime::new(config.validate_gateway(), instrument)?;
-    let market_data = MarketDataRuntime::new(config.validate_market_data())?;
-    let mut runtime = Runtime::new(Mode::default(), engine_config, risk_config, control, gateway, market_data)?;
-
-    runtime.run()?;
+    // runtime construction is shared with replay so both entry points validate
+    // and open endpoints through the same path.
+    let mut runtime = Runtime::from_server_config(mode, config)?;
+    runtime
+        .run()
+        .map_err(|error| io::Error::other(format!("runtime failed: {error:?}")))?;
     Ok(())
 }
 
-#[derive(Debug)]
-enum ServerError {
-    Config(ConfigError),
-    ReferenceData(DomainError),
-    EngineConfig(DomainError),
-    RiskConfig(DomainError),
-    Control(ControlError),
-    Gateway(GatewayError),
-    MarketData(MarketDataError),
-    Engine(EngineError),
-    Runtime(RuntimeError),
-}
-
-impl std::fmt::Display for ServerError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Config(error) => write!(f, "failed to load config: {error:?}"),
-            Self::ReferenceData(error) => write!(f, "failed to validate reference data: {error:?}"),
-            Self::EngineConfig(error) => write!(f, "failed to validate engine config: {error:?}"),
-            Self::RiskConfig(error) => write!(f, "failed to validate risk config: {error:?}"),
-            Self::Control(error) => write!(f, "failed to open control listener: {error:?}"),
-            Self::Gateway(error) => write!(f, "failed to open trading gateway listener: {error:?}"),
-            Self::MarketData(error) => write!(f, "failed to open market-data multicast feed: {error:?}"),
-            Self::Engine(error) => write!(f, "failed to construct runtime engine: {error:?}"),
-            Self::Runtime(error) => write!(f, "runtime failed: {error:?}"),
+/// Resolve live-mode sequencing state from config.
+fn runtime_mode_for_live(config: &ServerConfig) -> ServerResult<Mode> {
+    match &config.mode {
+        RuntimeModeConfig::Live { next_input_seq, .. } if *next_input_seq != 0 => Ok(Mode::Live {
+            next_input_seq: *next_input_seq,
+        }),
+        RuntimeModeConfig::Live { next_input_seq, .. } => {
+            Err(io::Error::other(format!("invalid runtime mode sequence next_input_seq={next_input_seq}")).into())
         }
+        RuntimeModeConfig::Replay { .. } => Err(io::Error::other("server requires config mode.type: live").into()),
     }
 }
 
-impl std::error::Error for ServerError {}
+/// Prepare live-mode runtime config before startup.
+fn prepare_config_for_live_mode(config: &mut ServerConfig) -> ServerResult<()> {
+    let record_path_dir = match &config.mode {
+        RuntimeModeConfig::Live {
+            record_path_dir: Some(path),
+            ..
+        } => path.clone(),
+        RuntimeModeConfig::Live { .. } | RuntimeModeConfig::Replay { .. } => return Ok(()),
+    };
 
-impl From<ConfigError> for ServerError {
-    fn from(error: ConfigError) -> Self {
-        Self::Config(error)
+    let input_id = epoch_seconds()?;
+    let input_dir = create_recording_input_dir(&record_path_dir, input_id)?;
+
+    if !config.control.set_tcp_record_path(input_dir.join("control.bin")) {
+        return Err(io::Error::other("control endpoint must use tcp backend for live input recording").into());
     }
+    if !config.gateway.set_tcp_record_path(input_dir.join("gateway.bin")) {
+        return Err(io::Error::other("gateway endpoint must use tcp backend for live input recording").into());
+    }
+
+    info!("recording input_id={input_id}");
+    info!("input: {}", input_dir.display());
+    Ok(())
 }
 
-impl From<ControlError> for ServerError {
-    fn from(error: ControlError) -> Self {
-        Self::Control(error)
+/// Create the input directory for one live recording run.
+fn create_recording_input_dir(record_path_dir: &Path, input_id: u64) -> ServerResult<PathBuf> {
+    // The root can pre-exist across many server runs, but a specific run id
+    // must be unique so replay inputs are never silently appended.
+    fs::create_dir_all(record_path_dir)?;
+
+    let run_dir = record_path_dir.join(input_id.to_string());
+    match fs::create_dir(&run_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("replay recording run already exists: {}", run_dir.display()),
+            )
+            .into());
+        }
+        Err(error) => return Err(error.into()),
     }
+
+    // TCP endpoints record into the input directory expected by `just replay`.
+    let input_dir = run_dir.join("input");
+    fs::create_dir(&input_dir)?;
+    Ok(input_dir)
 }
 
-impl From<GatewayError> for ServerError {
-    fn from(error: GatewayError) -> Self {
-        Self::Gateway(error)
-    }
-}
-
-impl From<MarketDataError> for ServerError {
-    fn from(error: MarketDataError) -> Self {
-        Self::MarketData(error)
-    }
-}
-
-impl From<EngineError> for ServerError {
-    fn from(error: EngineError) -> Self {
-        Self::Engine(error)
-    }
-}
-
-impl From<RuntimeError> for ServerError {
-    fn from(error: RuntimeError) -> Self {
-        Self::Runtime(error)
-    }
+/// Return the current Unix epoch seconds used as a live recording input id.
+fn epoch_seconds() -> ServerResult<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| io::Error::other(format!("failed to generate replay input id: {error}")))?
+        .as_secs())
 }

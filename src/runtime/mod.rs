@@ -7,8 +7,10 @@
 mod mode;
 mod order;
 mod snapshot;
+mod startup;
 
 pub use mode::Mode;
+pub use startup::RuntimeBuildError;
 
 use self::order::OrderProcessor;
 use self::snapshot::SnapshotProcessor;
