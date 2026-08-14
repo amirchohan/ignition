@@ -314,6 +314,8 @@ mode:
   type: replay
   expected_input_seq: 1
   record_path_dir: "fixtures/replay/runs"
+metrics:
+  type: noop
 reference_data:
   instrument:
     instrument_id: 1001

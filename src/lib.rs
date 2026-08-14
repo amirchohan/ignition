@@ -11,6 +11,7 @@ pub mod engine;
 pub mod gateway;
 pub mod io;
 pub mod market_data;
+pub mod metrics;
 pub mod protocol;
 pub mod risk;
 pub mod runtime;

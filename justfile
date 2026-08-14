@@ -17,5 +17,8 @@ replay input_id:
 replay-compare input_id:
     scripts/replay_compare.sh {{input_id}} configs/replay.yaml
 
+bench:
+    cargo run --release --bin benchmark -- --orders 1000000 --warmup 50000 --workload mixed
+
 sbe:
     scripts/generate_sbe.sh

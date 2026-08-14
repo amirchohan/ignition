@@ -18,6 +18,7 @@ use crate::{
     gateway::GatewayConfig,
     io::IOConfig,
     market_data::MarketDataFeedConfig,
+    metrics::MetricsBackend,
     risk::RiskConfig,
 };
 
@@ -25,6 +26,7 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ServerConfig {
     pub mode: RuntimeModeConfig,
+    pub metrics: MetricsBackend,
     pub reference_data: ReferenceDataConfig,
     pub engine: EngineRuntimeConfig,
     pub risk: RiskRuntimeConfig,
@@ -495,4 +497,55 @@ pub enum ConfigError {
     Read(std::io::Error),
     Parse(serde_yaml::Error),
     Validate(DomainError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_config_parses_in_memory_metrics_backend() {
+        let config = serde_yaml::from_str::<ServerConfig>(config_yaml()).expect("config");
+
+        assert_eq!(config.metrics, MetricsBackend::InMemory);
+    }
+
+    fn config_yaml() -> &'static str {
+        r#"
+mode:
+  type: live
+  next_input_seq: 1
+metrics:
+  type: in_memory
+reference_data:
+  instrument:
+    instrument_id: 1001
+    base_asset_id: 1
+    quote_asset_id: 2
+    price_decimals: 2
+    qty_decimals: 8
+    price_tick: 1
+    qty_lot: 1
+engine:
+  storage_min_price: 1000000
+  storage_max_price: 25000000
+  page_size: 1024
+  max_resting_orders: 100000
+  max_account_id: 100000
+  max_active_pages: 4096
+risk:
+  max_open_orders_per_account: 1000
+  max_open_notional_per_account: 100000000000000000
+  startup_reference_price: 6500000
+  price_band_bps: 1000
+control:
+  type: noop
+  heartbeat_timeout_ns: 0
+gateway:
+  type: noop
+  max_messages_per_poll: 1024
+market_data:
+  type: noop
+"#
+    }
 }

@@ -12,18 +12,9 @@ use std::{
 
 use crate::domain::RecvTs;
 
-use super::{Endpoint, IoError};
+use super::{Endpoint, InputRecord, IoError};
 
 const RECORD_HEADER_LEN: usize = 21;
-
-/// One recorded input frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InputRecord {
-    pub input_seq: u64,
-    pub endpoint: Endpoint,
-    pub recv_ts: RecvTs,
-    pub frame: Vec<u8>,
-}
 
 /// File-backed frame IO.
 #[derive(Debug)]

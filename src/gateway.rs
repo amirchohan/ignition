@@ -25,6 +25,7 @@ use crate::{
         trading::order::{AccountId, ExecType, ExecutionReport, OrdStatus, OrderEntry, OrderId},
     },
     io::{Endpoint, FramePollError, IOConfig, IOPublisher, IORuntime, IoError},
+    metrics::MetricsRuntime,
     protocol::{
         ProtocolError,
         wire::{
@@ -152,6 +153,7 @@ impl GatewayRuntime {
         &mut self,
         mode: &mut crate::runtime::Mode,
         sequencer: &mut Sequencer,
+        metrics: &mut MetricsRuntime,
         mut on_order: F,
     ) -> Result<bool, GatewayPollError<E>>
     where
@@ -161,6 +163,7 @@ impl GatewayRuntime {
             encode_buf: &mut self.encode_buf,
             instrument: self.instrument,
             sequencer,
+            metrics,
             on_order: &mut on_order,
             handled_frame: false,
         };
@@ -215,6 +218,7 @@ struct GatewaySession<'a, F> {
     encode_buf: &'a mut Vec<u8>,
     instrument: InstrumentSpec,
     sequencer: &'a mut Sequencer,
+    metrics: &'a mut MetricsRuntime,
     on_order: &'a mut F,
     handled_frame: bool,
 }
@@ -224,6 +228,7 @@ where
     F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), E>,
 {
     fn on_frame(&mut self, io_publisher: &mut IOPublisher<'_>, recv_ts: RecvTs, bytes: &[u8]) -> Result<(), GatewayPollError<E>> {
+        let time = self.metrics.start_clock();
         self.handled_frame = true;
         let mut publisher = GatewayPublisher {
             io: io_publisher,
@@ -239,7 +244,9 @@ where
             Err(error) => publish_protocol_error(self.sequencer, error, bytes, recv_ts, &mut publisher),
         };
         result?;
-        publisher.check_deferred_error().map_err(GatewayPollError::Gateway)
+        publisher.check_deferred_error().map_err(GatewayPollError::Gateway)?;
+        self.metrics.stop_clock(time);
+        Ok(())
     }
 }
 
@@ -440,8 +447,9 @@ mod tests {
         F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), GatewayError> + Copy,
     {
         let mut mode = crate::runtime::Mode::default();
+        let mut metrics = MetricsRuntime::noop();
         for _ in 0..100 {
-            if gateway.poll(&mut mode, sequencer, f).expect("poll") {
+            if gateway.poll(&mut mode, sequencer, &mut metrics, f).expect("poll") {
                 return;
             }
             thread::sleep(Duration::from_millis(1));
@@ -503,11 +511,12 @@ mod tests {
         client.write_all(&new_order_frame(0)).expect("write");
         let mut sequencer = Sequencer::default();
         let mut mode = crate::runtime::Mode::default();
+        let mut metrics = MetricsRuntime::noop();
         let mut callback_seen = false;
 
         for _ in 0..100 {
             if gateway
-                .poll(&mut mode, &mut sequencer, |_, _, _| {
+                .poll(&mut mode, &mut sequencer, &mut metrics, |_, _, _| {
                     callback_seen = true;
                     Ok::<(), GatewayError>(())
                 })

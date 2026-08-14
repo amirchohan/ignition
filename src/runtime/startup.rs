@@ -11,6 +11,7 @@ use crate::{
     engine::{EngineConfig, EngineError},
     gateway::{GatewayError, GatewayRuntime},
     market_data::{MarketDataError, MarketDataRuntime},
+    metrics::{MetricsBackend, MetricsRuntime},
     risk::RiskConfig,
 };
 
@@ -30,6 +31,7 @@ impl Runtime {
             endpoints.control,
             endpoints.gateway,
             endpoints.market_data,
+            MetricsRuntime::new(resolved.metrics, 0),
         )
         .map_err(RuntimeBuildError::Runtime)
     }
@@ -40,6 +42,7 @@ struct ResolvedRuntimeConfig {
     instrument: InstrumentSpec,
     engine: EngineConfig,
     risk: RiskConfig,
+    metrics: MetricsBackend,
 }
 
 impl ResolvedRuntimeConfig {
@@ -50,6 +53,7 @@ impl ResolvedRuntimeConfig {
             instrument: server_config.validate().map_err(RuntimeBuildError::ReferenceData)?,
             engine: server_config.validate_engine().map_err(RuntimeBuildError::EngineConfig)?,
             risk: server_config.validate_risk().map_err(RuntimeBuildError::RiskConfig)?,
+            metrics: server_config.metrics,
         })
     }
 
@@ -81,6 +85,7 @@ impl ResolvedRuntimeConfig {
             self.risk.startup_reference_price.raw(),
             self.risk.price_band_bps
         );
+        tracing::info!("metrics config: backend={:?}", self.metrics);
     }
 }
 

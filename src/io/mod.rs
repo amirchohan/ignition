@@ -25,10 +25,12 @@ use std::path::PathBuf;
 use crate::{domain::RecvTs, runtime::Mode};
 
 pub mod file;
+pub mod in_memory;
 pub mod tcp;
 pub mod udp;
 
-pub use file::{FileFrameIo, FileFramePublisher, InputRecord};
+pub use file::{FileFrameIo, FileFramePublisher};
+pub use in_memory::{InMemoryFrameIo, InMemoryFramePublisher};
 pub use tcp::{TcpFrameIo, TcpFramePublisher};
 pub use udp::{UdpFramePublisher, UdpMulticastConfig};
 
@@ -82,6 +84,7 @@ impl IORuntime {
                 output_path,
                 max_frame_len,
             } => (IOBackend::File(FileFrameIo::open(input_path, output_path, max_frame_len)?), None),
+            IOConfig::InMemory { input, max_frame_len } => (IOBackend::InMemory(InMemoryFrameIo::new(input, max_frame_len)), None),
         };
 
         tracing::info!(
@@ -123,6 +126,8 @@ impl IORuntime {
             self.poll_tcp(mode, on_frame, max_frames)
         } else if matches!(&self.backend, IOBackend::File(_)) {
             self.poll_file(mode, on_frame)
+        } else if matches!(&self.backend, IOBackend::InMemory(_)) {
+            self.poll_in_memory(mode, on_frame, max_frames)
         } else {
             // These backends do not produce inbound frames here.
             Ok(false)
@@ -218,6 +223,16 @@ impl IORuntime {
         Ok(true)
     }
 
+    fn poll_in_memory<F, E>(&mut self, mode: &mut Mode, mut on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
+    where
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
+    {
+        let IOBackend::InMemory(io) = &mut self.backend else {
+            return Ok(false);
+        };
+        io.poll(self.endpoint, mode, &mut on_frame, max_frames)
+    }
+
     /// Queue one outbound frame through this endpoint backend.
     pub fn queue_frame(&mut self, frame: &[u8]) -> Result<(), IoError> {
         match &mut self.backend {
@@ -225,6 +240,7 @@ impl IORuntime {
             IOBackend::Tcp(io) => io.queue_frame(frame),
             IOBackend::Udp(io) => io.queue_frame(frame),
             IOBackend::File(io) => io.queue_frame(frame),
+            IOBackend::InMemory(io) => io.queue_frame(frame),
         }
     }
 
@@ -235,6 +251,7 @@ impl IORuntime {
             IOBackend::Tcp(io) => io.flush_pending(),
             IOBackend::Udp(io) => io.flush_pending(),
             IOBackend::File(io) => io.flush_pending(),
+            IOBackend::InMemory(io) => Ok(io.flush_pending()),
         }?;
         let recorder_progress = match &mut self.recorder {
             Some(recorder) => recorder.flush_pending()?,
@@ -247,6 +264,7 @@ impl IORuntime {
     pub fn replay_input_exhausted(&mut self) -> Result<bool, IoError> {
         match &mut self.backend {
             IOBackend::File(io) => io.input_exhausted(),
+            IOBackend::InMemory(io) => Ok(io.input_exhausted()),
             IOBackend::Noop => Ok(true),
             IOBackend::Tcp(_) | IOBackend::Udp(_) => Err(IoError::ReplayExpectedInLive),
         }
@@ -256,7 +274,7 @@ impl IORuntime {
     fn tcp_local_addr(&self) -> Result<std::net::SocketAddr, IoError> {
         match &self.backend {
             IOBackend::Tcp(io) => io.local_addr(),
-            IOBackend::Noop | IOBackend::Udp(_) | IOBackend::File(_) => Err(IoError::ReplayExpectedInLive),
+            IOBackend::Noop | IOBackend::Udp(_) | IOBackend::File(_) | IOBackend::InMemory(_) => Err(IoError::ReplayExpectedInLive),
         }
     }
 }
@@ -281,6 +299,8 @@ pub enum IOBackend {
     Udp(UdpFramePublisher),
     /// File-backed replay/capture backend.
     File(FileFrameIo),
+    /// In-memory replay/capture backend for benchmarks.
+    InMemory(InMemoryFrameIo),
 }
 
 /// Borrowed frame publisher passed to endpoint frame handlers.
@@ -292,6 +312,8 @@ pub enum IOPublisher<'a> {
     Tcp(TcpFramePublisher<'a>),
     /// File publisher borrowed from a file-backed IO runtime.
     File(FileFramePublisher<'a>),
+    /// In-memory publisher borrowed from a benchmark IO runtime.
+    InMemory(InMemoryFramePublisher<'a>),
 }
 
 impl IOPublisher<'_> {
@@ -301,6 +323,7 @@ impl IOPublisher<'_> {
             Self::Noop => Ok(()),
             Self::Tcp(publisher) => publisher.publish(frame),
             Self::File(publisher) => publisher.publish(frame),
+            Self::InMemory(publisher) => publisher.publish(frame),
         }
     }
 
@@ -310,8 +333,18 @@ impl IOPublisher<'_> {
             Self::Noop => Ok(()),
             Self::Tcp(publisher) => publisher.queue_frame(frame),
             Self::File(publisher) => publisher.queue_frame(frame),
+            Self::InMemory(publisher) => publisher.queue_frame(frame),
         }
     }
+}
+
+/// One recorded input frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputRecord {
+    pub input_seq: u64,
+    pub endpoint: Endpoint,
+    pub recv_ts: RecvTs,
+    pub frame: Vec<u8>,
 }
 
 /// Transport and shared IO-layer failure.
@@ -434,6 +467,11 @@ impl IOStartupLog {
                 egress: optional_file_descriptor(output_path.as_ref()),
                 recorder: "disabled".to_owned(),
             },
+            IOConfig::InMemory { input, .. } => Self {
+                ingress: format!("InMemory({} records)", input.len()),
+                egress: "InMemory(counting)".to_owned(),
+                recorder: "disabled".to_owned(),
+            },
         }
     }
 }
@@ -488,6 +526,8 @@ pub enum IOConfig {
         /// Maximum accepted frame length in file records.
         max_frame_len: usize,
     },
+    /// In-memory replay input and output counting for benchmarks.
+    InMemory { input: Vec<InputRecord>, max_frame_len: usize },
 }
 
 impl IOConfig {
@@ -496,7 +536,7 @@ impl IOConfig {
     pub const fn frame_capacity(&self) -> usize {
         match self {
             Self::Noop => 4096,
-            Self::Tcp { max_frame_len, .. } | Self::File { max_frame_len, .. } => *max_frame_len,
+            Self::Tcp { max_frame_len, .. } | Self::File { max_frame_len, .. } | Self::InMemory { max_frame_len, .. } => *max_frame_len,
             Self::Udp { max_datagram_len, .. } => *max_datagram_len,
         }
     }
@@ -620,6 +660,89 @@ mod tests {
 
         let _ = std::fs::remove_file(gateway_path);
         let _ = std::fs::remove_file(control_path);
+    }
+
+    #[test]
+    fn in_memory_backend_releases_replay_records_in_sequence() {
+        let mut mode = Mode::Replay { expected_input_seq: 1 };
+        let records = vec![
+            InputRecord {
+                input_seq: 1,
+                endpoint: Endpoint::Gateway,
+                recv_ts: RecvTs::new(10),
+                frame: frame(MessageKind::NewOrder, &[1, 2, 3, 4]),
+            },
+            InputRecord {
+                input_seq: 2,
+                endpoint: Endpoint::Gateway,
+                recv_ts: RecvTs::new(11),
+                frame: frame(MessageKind::CancelOrder, &[5, 6, 7, 8]),
+            },
+        ];
+        let mut io = IORuntime::new(
+            Endpoint::Gateway,
+            IOConfig::InMemory {
+                input: records.clone(),
+                max_frame_len: 128,
+            },
+        )
+        .expect("in-memory io");
+        let mut seen = Vec::new();
+
+        assert!(
+            io.poll_bounded(
+                &mut mode,
+                |publisher, recv_ts, bytes| {
+                    seen.push((recv_ts.raw(), bytes.to_vec()));
+                    publisher.queue_frame(bytes)?;
+                    Ok::<(), IoError>(())
+                },
+                1
+            )
+            .expect("first poll")
+        );
+        assert!(
+            io.poll_bounded(
+                &mut mode,
+                |publisher, recv_ts, bytes| {
+                    seen.push((recv_ts.raw(), bytes.to_vec()));
+                    publisher.queue_frame(bytes)?;
+                    Ok::<(), IoError>(())
+                },
+                1
+            )
+            .expect("second poll")
+        );
+        assert!(!io.poll(&mut mode, |_, _, _| Ok::<(), IoError>(())).expect("drained"));
+        assert!(io.replay_input_exhausted().expect("exhausted"));
+        assert_eq!(mode, Mode::Replay { expected_input_seq: 3 });
+        assert_eq!(seen, vec![(10, records[0].frame.clone()), (11, records[1].frame.clone())]);
+    }
+
+    #[test]
+    fn in_memory_backend_rejects_wrong_endpoint_record() {
+        let mut mode = Mode::Replay { expected_input_seq: 1 };
+        let mut io = IORuntime::new(
+            Endpoint::Control,
+            IOConfig::InMemory {
+                input: vec![InputRecord {
+                    input_seq: 1,
+                    endpoint: Endpoint::Gateway,
+                    recv_ts: RecvTs::new(10),
+                    frame: vec![1, 2, 3],
+                }],
+                max_frame_len: 128,
+            },
+        )
+        .expect("in-memory io");
+
+        assert!(matches!(
+            io.poll(&mut mode, |_, _, _| Ok::<(), IoError>(())),
+            Err(FramePollError::Io(IoError::EndpointMismatch {
+                configured: Endpoint::Control,
+                record: Endpoint::Gateway,
+            }))
+        ));
     }
 
     #[test]

@@ -24,6 +24,7 @@ use crate::{
     gateway::{GatewayError, GatewayPollError, GatewayRuntime},
     io::IoError,
     market_data::{MarketDataError, MarketDataRuntime},
+    metrics::{MetricsRuntime, MetricsSnapshot},
     risk::{RiskConfig, RiskRuntime},
 };
 
@@ -42,6 +43,8 @@ pub struct Runtime {
     market_data: MarketDataRuntime,
     /// Matching engine state.
     engine: Engine,
+    /// Runtime-adjacent hot-path metrics.
+    metrics: MetricsRuntime,
     /// Shared deterministic execution/control sequencer.
     sequencer: Sequencer,
     /// Set after deterministic drain-and-shutdown completes.
@@ -57,6 +60,7 @@ impl Runtime {
         control: ControlRuntime,
         gateway: GatewayRuntime,
         market_data: MarketDataRuntime,
+        metrics: MetricsRuntime,
     ) -> Result<Self, RuntimeError> {
         tracing::info!("runtime setup in {} mode", mode.label());
         Ok(Self {
@@ -66,9 +70,15 @@ impl Runtime {
             market_data,
             risk: RiskRuntime::new(risk_config),
             engine: Engine::new(engine_config)?,
+            metrics,
             sequencer: Sequencer::default(),
             terminal: false,
         })
+    }
+
+    /// Return a post-run metrics snapshot.
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        self.metrics.snapshot()
     }
 
     /// Run the deterministic control-then-gateway phase loop until shutdown completes.
@@ -106,6 +116,7 @@ impl Runtime {
             risk,
             engine,
             sequencer,
+            metrics: _,
             terminal,
             mode,
         } = self;
@@ -165,13 +176,14 @@ impl Runtime {
             risk,
             engine,
             sequencer,
+            metrics,
             ..
         } = self;
         // the gateway may hand us several ready orders in one poll. Process
         // them one at a time so reports, book changes, and market data stay in
         // the same order as the incoming frames.
         let gateway_progress = gateway
-            .poll(mode, sequencer, |entry, publisher, sequencer| {
+            .poll(mode, sequencer, metrics, |entry, publisher, sequencer| {
                 handled_order = true;
                 // the same sequencer is passed through the gateway callback so
                 // protocol rejects and engine reports share one monotonic stream.
@@ -374,7 +386,18 @@ mod tests {
             }
             Err(error) => panic!("gateway: {error:?}"),
         };
-        Some(Runtime::new(Mode::default(), engine_config(), risk_config, control, gateway, market_data).expect("runtime"))
+        Some(
+            Runtime::new(
+                Mode::default(),
+                engine_config(),
+                risk_config,
+                control,
+                gateway,
+                market_data,
+                MetricsRuntime::noop(),
+            )
+            .expect("runtime"),
+        )
     }
 
     fn runtime_with_control_and_orders(
@@ -405,8 +428,19 @@ mod tests {
         let mut client = TcpStream::connect(gateway_addr).expect("connect gateway");
         client.set_read_timeout(Some(Duration::from_secs(1))).expect("gateway timeout");
         write_gateway_orders(&mut client, orders);
-        Some(Runtime::new(Mode::default(), engine_config(), risk_config, control, gateway, market_data).expect("runtime"))
-            .map(|runtime| (runtime, client))
+        Some(
+            Runtime::new(
+                Mode::default(),
+                engine_config(),
+                risk_config,
+                control,
+                gateway,
+                market_data,
+                MetricsRuntime::noop(),
+            )
+            .expect("runtime"),
+        )
+        .map(|runtime| (runtime, client))
     }
 
     fn control_config() -> ControlConfig {
@@ -978,6 +1012,7 @@ mod tests {
             control,
             gateway,
             market_data,
+            MetricsRuntime::noop(),
         )
         .expect("runtime");
 
