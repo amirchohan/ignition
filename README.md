@@ -50,6 +50,9 @@ Endpoint families:
 - Control egress: control responses, heartbeat status, snapshot rows, and
   protocol errors.
 
+Every visible price-level mutation emits an absolute L2 update followed by an
+L1 top-of-book snapshot, including when the best bid and ask tuple is unchanged.
+
 Order-entry messages are scoped to one configured instrument. Prices and
 quantities are unsigned integer-scaled values; zero is invalid in domain types
 and is used only as a no-price sentinel in outbound optional price fields.
@@ -59,8 +62,8 @@ endianness, and compatibility rules.
 `Snapshot` provides an inspection-grade point-in-time view of the book and
 selected runtime metadata. Its begin/order/end stream is deterministic and can
 detect truncation, but it is not a restorable checkpoint or replay seed. It
-does not contain all sequencing, control, market-data cache, account-ordering,
-or configuration state required to continue with byte-identical outputs.
+does not contain all sequencing, control, account-ordering, or configuration
+state required to continue with byte-identical outputs.
 Recorded input streams remain the sole supported replay source.
 
 ## Matching And Risk Rules

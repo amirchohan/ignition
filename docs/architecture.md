@@ -88,9 +88,10 @@ ownership boundary.
   egress.
 - Owns feed-local market-data sequencing separately from global outbound
   `EngineSeq` allocation.
-- Centralizes top-of-book change output, absolute level-update output, encoding,
-  queueing, and flush/error state.
-- Tracks only last-published L1 state; the matching book remains the source of truth.
+- Centralizes per-mutation top-of-book output, absolute level-update output,
+  encoding, queueing, and flush/error state.
+- Reads each L1 snapshot from the matching book, which remains the source of
+  truth.
 - Does not make matching or risk decisions.
 
 ### `control`

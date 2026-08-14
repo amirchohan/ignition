@@ -30,7 +30,6 @@ pub struct MarketDataRuntime {
     io: IORuntime,
     encode_buf: Vec<u8>,
     sequencer: MarketDataSequencer,
-    last_l1: Option<L1Update>,
     pending_reference_price: Option<Price>,
     first_error: Option<MarketDataError>,
 }
@@ -44,7 +43,6 @@ impl MarketDataRuntime {
             io,
             encode_buf: vec![0_u8; encode_len],
             sequencer: MarketDataSequencer::default(),
-            last_l1: None,
             pending_reference_price: None,
             first_error: None,
         })
@@ -92,8 +90,8 @@ impl MarketDataRuntime {
         Ok(())
     }
 
-    /// Emit one L1 top-of-book update only when the top state changed.
-    pub fn publish_l1_update_if_changed(
+    /// Emit one L1 top-of-book snapshot after a visible book mutation.
+    pub fn publish_l1_update(
         &mut self,
         sequencer: &mut Sequencer,
         best_bid: Option<(Price, u64)>,
@@ -103,12 +101,6 @@ impl MarketDataRuntime {
         let bid_qty = best_bid.map_or(0, |(_, qty)| qty);
         let ask_price = best_ask.map(|(price, _)| price);
         let ask_qty = best_ask.map_or(0, |(_, qty)| qty);
-
-        if self.last_l1.is_some_and(|last| {
-            last.bid_price == bid_price && last.bid_qty == bid_qty && last.ask_price == ask_price && last.ask_qty == ask_qty
-        }) {
-            return Ok(());
-        }
 
         let prev_md_seq = self.sequencer.previous_md_seq();
         let md_seq = self.sequencer.next_md_seq()?;
@@ -122,7 +114,6 @@ impl MarketDataRuntime {
             ask_qty,
         };
         self.emit_market_data(MarketDataEvent::L1Update(event));
-        self.last_l1 = Some(event);
         Ok(())
     }
 

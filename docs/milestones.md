@@ -52,7 +52,8 @@ boundaries, measurable latency, and honest documentation.
 
 ## Milestone 4: Market Data Output
 
-- Emit an L1 top-of-book update whenever the best bid or best ask tuple changes.
+- Emit an L1 top-of-book update after every visible price-level mutation, even
+  when the best bid and best ask tuple is unchanged.
 - Emit an absolute L2 level update on every visible price-level mutation.
 - Emit a trade print on every execution.
 - Include monotonic market-data sequence numbers and gap-detection fields.

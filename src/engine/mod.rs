@@ -912,7 +912,7 @@ impl Engine {
         let best_bid = self.best_bid();
         let best_ask = self.best_ask();
         market_data.publish_l2_update(sequencer, side, price, level_qty)?;
-        market_data.publish_l1_update_if_changed(sequencer, best_bid, best_ask)
+        market_data.publish_l1_update(sequencer, best_bid, best_ask)
     }
 
     /// Return the aggregate quantity currently visible at a level after mutation.
@@ -1815,6 +1815,47 @@ mod tests {
     }
 
     #[test]
+    fn non_best_level_mutation_reemits_unchanged_top_of_book() {
+        let path = temp_path("unchanged-top-of-book");
+        let mut engine = TestEngine::new_file_market_data(path.clone());
+        let mut events = Vec::new();
+
+        execute(
+            &mut engine,
+            new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1000), 10, 1),
+            &mut events,
+            "rest best bid",
+        );
+        execute(
+            &mut engine,
+            new_order(2, 2, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(999), 5, 2),
+            &mut events,
+            "rest non-best bid",
+        );
+
+        engine.flush_market_data();
+        let captured = read_market_data(&path);
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(captured.len(), 4);
+        assert!(matches!(captured[0], CapturedMarketData::L2 { price: 1000, qty: 10, .. }));
+        assert!(matches!(captured[2], CapturedMarketData::L2 { price: 999, qty: 5, .. }));
+        for event in [captured[1], captured[3]] {
+            assert!(matches!(
+                event,
+                CapturedMarketData::L1 {
+                    bid_price: 1000,
+                    bid_qty: 10,
+                    ask_price: 0,
+                    ask_qty: 0,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(captured.iter().map(|event| event.md_seq()).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
     fn snapshot_streams_rows_in_price_time_order() {
         let Some(mut engine) = TestEngine::new() else {
             return;
@@ -2364,8 +2405,8 @@ mod tests {
         /// actual encoded SBE feed, not only execution reports. It builds a
         /// generated one-sided book, executes one aggressive market IOC, then
         /// asserts that TradePrints carry the expected maker, taker, price, and
-        /// quantity, L2 updates publish absolute level quantities after every
-        /// add/fill, L1 ends at the final top of book, and market-data sequence
+        /// quantity, every L2 mutation is immediately followed by an L1
+        /// snapshot, L1 ends at the final top of book, and market-data sequence
         /// numbers plus prev links are monotonic.
         #[test]
         fn property_market_data_feed_matches_generated_matching_semantics(
@@ -2447,6 +2488,22 @@ mod tests {
                         prop_assert_eq!(prev_md_seq, md_seq - 1);
                     }
                     CapturedMarketData::Trade { .. } => {}
+                }
+            }
+
+            let l2_count = captured
+                .iter()
+                .filter(|event| matches!(event, CapturedMarketData::L2 { .. }))
+                .count();
+            let l1_count = captured
+                .iter()
+                .filter(|event| matches!(event, CapturedMarketData::L1 { .. }))
+                .count();
+            prop_assert_eq!(l1_count, l2_count);
+            for pair in captured.windows(2) {
+                if matches!(pair[0], CapturedMarketData::L2 { .. }) {
+                    let l1_follows = matches!(pair[1], CapturedMarketData::L1 { .. });
+                    prop_assert!(l1_follows);
                 }
             }
 

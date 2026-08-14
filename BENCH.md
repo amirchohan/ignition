@@ -128,10 +128,7 @@ environment:
   cpu_pinning: 0-3
 
 workload: mixed
-<<<<<<< HEAD
-=======
 schedule: burst
->>>>>>> benchmarking_update
 orders: 100000
 warmup_orders: 10000
 throughput_orders_per_sec: 687802
