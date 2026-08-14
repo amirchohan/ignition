@@ -1,5 +1,10 @@
 # Replay And Recorded Streams
 
+Deterministic replay starts from a complete recorded input stream. The control
+plane's `Snapshot` output is inspection-only and is not accepted as a replay
+seed; it omits state required for byte-identical continuation and has no
+restore path.
+
 Ignition records live TCP input before endpoint decoding. Each record wraps one
 raw SBE frame with replay metadata:
 

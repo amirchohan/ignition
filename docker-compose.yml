@@ -32,15 +32,25 @@ services:
   benchmark:
     build: .
     command:
-      - benchmark
-      - --orders
-      - "${ORDERS:-1000000}"
-      - --warmup
-      - "${WARMUP:-50000}"
-      - --workload
-      - "${WORKLOAD:-mixed}"
-      - --config
-      - configs/benchmark.yaml
+      - /bin/sh
+      - -c
+      - |
+        set -- benchmark \
+          --orders "$${ORDERS:-1000000}" \
+          --warmup "$${WARMUP:-50000}" \
+          --workload "$${WORKLOAD:-mixed}" \
+          --schedule "$${SCHEDULE:-burst}" \
+          --config configs/benchmark.yaml
+        if [ "$${SCHEDULE:-burst}" = "open-loop" ]; then
+          set -- "$$@" --target-rate "$${TARGET_RATE:?TARGET_RATE is required for open-loop benchmarks}"
+        fi
+        exec "$$@"
+    environment:
+      ORDERS: "${ORDERS:-1000000}"
+      WARMUP: "${WARMUP:-50000}"
+      WORKLOAD: "${WORKLOAD:-mixed}"
+      SCHEDULE: "${SCHEDULE:-burst}"
+      TARGET_RATE: "${TARGET_RATE:-}"
 
   replay:
     build: .

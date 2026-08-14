@@ -2,8 +2,8 @@
 //!
 //! This binary measures the order-entry path without TCP or disk IO in the
 //! measured loop. It generates deterministic binary SBE order-entry frames,
-//! wraps them as gateway `InputRecord`s, preloads them into `InMemoryFrameIo`,
-//! and runs the normal single-writer `Runtime` in replay mode.
+//! wraps them as gateway `InputRecord`s, preloads them into in-memory IO, and
+//! runs the normal single-writer `Runtime` in replay mode.
 //!
 //! Replay mode gives deterministic input sequencing; in-memory IO removes
 //! transport and filesystem noise. The measured path is:
@@ -11,9 +11,9 @@
 //! gateway frame decode -> risk checks -> matching engine -> execution report
 //! encoding/emission.
 //!
-//! The benchmark runs an optional warmup phase first, discards those samples,
-//! then runs a measured phase and prints HDR-histogram latency percentiles,
-//! sustained throughput, and global allocation counts after the runtime exits.
+//! Burst mode releases input as fast as the runtime can consume it. Open-loop
+//! mode releases input against absolute deadlines at a configured target rate
+//! and reports raw and coordinated-omission-corrected HDR percentiles.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -83,7 +83,12 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Err
     reset_allocations();
     runtime.run().map_err(runtime_error)?;
     let allocations = AllocationSnapshot::read();
-    print_report(&args, runtime.metrics_snapshot(), allocations, &environment);
+    let raw_metrics = runtime.metrics_snapshot();
+    let corrected_metrics = args
+        .schedule
+        .expected_interval_ns()
+        .map(|expected_interval_ns| runtime.metrics_snapshot_corrected(expected_interval_ns));
+    print_report(&args, raw_metrics, corrected_metrics, allocations, &environment);
     Ok(())
 }
 
@@ -105,12 +110,20 @@ fn build_runtime(
         heartbeat_timeout_ns: 0,
         io: IOConfig::Noop,
     })?;
+    let benchmark_io = match args.schedule {
+        Schedule::Burst => IOConfig::InMemory {
+            input: records,
+            max_frame_len: config.gateway.frame_capacity(),
+        },
+        Schedule::OpenLoop { target_rate_per_sec } => IOConfig::ScheduledInMemory {
+            input: records,
+            max_frame_len: config.gateway.frame_capacity(),
+            target_rate_per_sec,
+        },
+    };
     let gateway = GatewayRuntime::new(
         GatewayConfig {
-            io: IOConfig::InMemory {
-                input: records,
-                max_frame_len: config.gateway.frame_capacity(),
-            },
+            io: benchmark_io,
             max_messages_per_poll: config.gateway.max_messages_per_poll,
         },
         instrument,
@@ -140,6 +153,7 @@ struct BenchArgs {
     orders: u64,
     warmup_orders: u64,
     workload: Workload,
+    schedule: Schedule,
     config_path: String,
 }
 
@@ -150,14 +164,19 @@ impl BenchArgs {
             orders: 1_000_000,
             warmup_orders: 50_000,
             workload: Workload::Mixed,
+            schedule: Schedule::Burst,
             config_path: "configs/benchmark.yaml".to_owned(),
         };
+        let mut schedule_kind = ScheduleKind::Burst;
+        let mut target_rate_per_sec = None;
         let mut args = args.peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--orders" => parsed.orders = next_arg(&mut args, "--orders")?.parse().map_err(parse_error)?,
                 "--warmup" => parsed.warmup_orders = next_arg(&mut args, "--warmup")?.parse().map_err(parse_error)?,
                 "--workload" => parsed.workload = next_arg(&mut args, "--workload")?.parse()?,
+                "--schedule" => schedule_kind = next_arg(&mut args, "--schedule")?.parse()?,
+                "--target-rate" => target_rate_per_sec = Some(next_arg(&mut args, "--target-rate")?.parse().map_err(parse_error)?),
                 "--config" => parsed.config_path = next_arg(&mut args, "--config")?,
                 "--help" | "-h" => return Err(io::Error::other(usage())),
                 other => return Err(io::Error::other(format!("unknown argument {other}\n{}", usage()))),
@@ -166,6 +185,7 @@ impl BenchArgs {
         if parsed.orders == 0 {
             return Err(io::Error::other("--orders must be greater than zero"));
         }
+        parsed.schedule = Schedule::from_options(schedule_kind, target_rate_per_sec)?;
         Ok(parsed)
     }
 }
@@ -183,7 +203,70 @@ fn parse_error(error: std::num::ParseIntError) -> io::Error {
 
 /// Return benchmark CLI usage.
 fn usage() -> &'static str {
-    "usage: benchmark [--orders N] [--warmup N] [--workload mixed|cancel|aggressive-ioc|passive-add] [--config PATH]"
+    "usage: benchmark [--orders N] [--warmup N] [--workload mixed|cancel|aggressive-ioc|passive-add] [--schedule burst|open-loop] [--target-rate ORDERS_PER_SEC] [--config PATH]"
+}
+
+/// Validated benchmark input schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Schedule {
+    Burst,
+    OpenLoop { target_rate_per_sec: u64 },
+}
+
+impl Schedule {
+    fn from_options(kind: ScheduleKind, target_rate_per_sec: Option<u64>) -> Result<Self, io::Error> {
+        match (kind, target_rate_per_sec) {
+            (ScheduleKind::Burst, None) => Ok(Self::Burst),
+            (ScheduleKind::Burst, Some(_)) => Err(io::Error::other("--target-rate requires --schedule open-loop")),
+            (ScheduleKind::OpenLoop, None) => Err(io::Error::other("--schedule open-loop requires --target-rate")),
+            (ScheduleKind::OpenLoop, Some(target_rate_per_sec)) if !(1..=1_000_000_000).contains(&target_rate_per_sec) => {
+                Err(io::Error::other("--target-rate must be between 1 and 1000000000 orders per second"))
+            }
+            (ScheduleKind::OpenLoop, Some(target_rate_per_sec)) => Ok(Self::OpenLoop { target_rate_per_sec }),
+        }
+    }
+
+    const fn expected_interval_ns(self) -> Option<u64> {
+        match self {
+            Self::Burst => None,
+            Self::OpenLoop { target_rate_per_sec } => Some(1_000_000_000 / target_rate_per_sec),
+        }
+    }
+
+    const fn target_rate_per_sec(self) -> Option<u64> {
+        match self {
+            Self::Burst => None,
+            Self::OpenLoop { target_rate_per_sec } => Some(target_rate_per_sec),
+        }
+    }
+}
+
+impl std::fmt::Display for Schedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Burst => f.write_str("burst"),
+            Self::OpenLoop { .. } => f.write_str("open-loop"),
+        }
+    }
+}
+
+/// Schedule name parsed before its required rate is validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduleKind {
+    Burst,
+    OpenLoop,
+}
+
+impl std::str::FromStr for ScheduleKind {
+    type Err = io::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "burst" => Ok(Self::Burst),
+            "open-loop" => Ok(Self::OpenLoop),
+            _ => Err(io::Error::other(format!("unknown schedule {value}"))),
+        }
+    }
 }
 
 /// Deterministic workload shapes supported by the benchmark generator.
@@ -487,13 +570,19 @@ impl EnvironmentSnapshot {
 }
 
 /// Print the benchmark result in a simple stable text format.
-fn print_report(args: &BenchArgs, metrics: MetricsSnapshot, allocations: AllocationSnapshot, environment: &EnvironmentSnapshot) {
-    let throughput = if metrics.measured_elapsed_ns == 0 {
+fn print_report(
+    args: &BenchArgs,
+    raw_metrics: MetricsSnapshot,
+    corrected_metrics: Option<MetricsSnapshot>,
+    allocations: AllocationSnapshot,
+    environment: &EnvironmentSnapshot,
+) {
+    let throughput = if raw_metrics.measured_elapsed_ns == 0 {
         0.0
     } else {
-        metrics.measured_samples as f64 / (metrics.measured_elapsed_ns as f64 / 1_000_000_000.0)
+        raw_metrics.measured_samples as f64 / (raw_metrics.measured_elapsed_ns as f64 / 1_000_000_000.0)
     };
-    let allocs_per_order = allocations.calls as f64 / metrics.measured_samples.max(1) as f64;
+    let allocs_per_order = allocations.calls as f64 / raw_metrics.measured_samples.max(1) as f64;
 
     println!("environment:");
     println!("  cpu_model: {}", environment.cpu_model);
@@ -510,21 +599,41 @@ fn print_report(args: &BenchArgs, metrics: MetricsSnapshot, allocations: Allocat
     println!("  cpu_pinning: {}", environment.cpu_pinning);
     println!();
     println!("workload: {}", args.workload);
+    println!("schedule: {}", args.schedule);
+    if let Some(target_rate_per_sec) = args.schedule.target_rate_per_sec() {
+        println!("target_rate_orders_per_sec: {target_rate_per_sec}");
+    }
+    if let Some(expected_interval_ns) = args.schedule.expected_interval_ns() {
+        println!("expected_interval_ns: {expected_interval_ns}");
+    }
     println!("orders: {}", args.orders);
     println!("warmup_orders: {}", args.warmup_orders);
     println!("throughput_orders_per_sec: {:.0}", throughput);
     println!();
-    println!("latency_ns:");
-    println!("  p50: {}", metrics.p50_ns);
-    println!("  p99: {}", metrics.p99_ns);
-    println!("  p99.9: {}", metrics.p999_ns);
-    println!("  p99.99: {}", metrics.p9999_ns);
-    println!("  max: {}", metrics.max_ns);
+    let raw_label = if corrected_metrics.is_some() {
+        "latency_ns_raw"
+    } else {
+        "latency_ns"
+    };
+    print_latency(raw_label, raw_metrics);
+    if let Some(corrected_metrics) = corrected_metrics {
+        println!();
+        print_latency("latency_ns_coordinated_omission_corrected", corrected_metrics);
+    }
     println!();
     println!("allocations:");
     println!("  calls: {}", allocations.calls);
     println!("  bytes: {}", allocations.bytes);
     println!("  calls_per_order: {:.6}", allocs_per_order);
+}
+
+fn print_latency(label: &str, metrics: MetricsSnapshot) {
+    println!("{label}:");
+    println!("  p50: {}", metrics.p50_ns);
+    println!("  p99: {}", metrics.p99_ns);
+    println!("  p99.9: {}", metrics.p999_ns);
+    println!("  p99.99: {}", metrics.p9999_ns);
+    println!("  max: {}", metrics.max_ns);
 }
 
 /// Read the CPU model from `/proc/cpuinfo`.
@@ -657,5 +766,52 @@ mod tests {
             assert_eq!(record.endpoint, Endpoint::Gateway);
             assert!(decode_header(&record.frame).expect("header").kind.is_order_entry());
         }
+    }
+
+    #[test]
+    fn benchmark_defaults_to_burst_without_a_target_rate() {
+        let args = BenchArgs::parse(std::iter::empty()).expect("args");
+
+        assert_eq!(args.schedule, Schedule::Burst);
+    }
+
+    #[test]
+    fn open_loop_requires_and_validates_a_target_rate() {
+        let args = BenchArgs::parse(
+            ["--schedule", "open-loop", "--target-rate", "100000"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect("args");
+
+        assert_eq!(
+            args.schedule,
+            Schedule::OpenLoop {
+                target_rate_per_sec: 100_000
+            }
+        );
+        assert_eq!(args.schedule.expected_interval_ns(), Some(10_000));
+
+        let missing = BenchArgs::parse(["--schedule", "open-loop"].into_iter().map(str::to_owned)).expect_err("missing rate");
+        assert!(missing.to_string().contains("requires --target-rate"));
+
+        let zero =
+            BenchArgs::parse(["--schedule", "open-loop", "--target-rate", "0"].into_iter().map(str::to_owned)).expect_err("zero rate");
+        assert!(zero.to_string().contains("between 1 and 1000000000"));
+
+        let too_high = BenchArgs::parse(
+            ["--schedule", "open-loop", "--target-rate", "1000000001"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect_err("sub-nanosecond interval");
+        assert!(too_high.to_string().contains("between 1 and 1000000000"));
+    }
+
+    #[test]
+    fn burst_rejects_a_target_rate() {
+        let error = BenchArgs::parse(["--target-rate", "100000"].into_iter().map(str::to_owned)).expect_err("rate without open loop");
+
+        assert!(error.to_string().contains("requires --schedule open-loop"));
     }
 }

@@ -20,5 +20,8 @@ replay-compare input_id:
 bench:
     cargo run --release --bin benchmark -- --orders 1000000 --warmup 50000 --workload mixed
 
+bench-open-loop rate:
+    cargo run --release --bin benchmark -- --orders 1000000 --warmup 50000 --workload mixed --schedule open-loop --target-rate {{rate}}
+
 sbe:
     scripts/generate_sbe.sh

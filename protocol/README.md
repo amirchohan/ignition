@@ -95,14 +95,22 @@ so it is strictly monotonic across all logical outbound engine events.
 
 ## Control Snapshots
 
-`Snapshot` requests produce a fixed-size control-event stream:
+`Snapshot` is an inspection-only control operation. Requests produce a sequence
+of fixed-width control events:
 `SnapshotBegin`, zero or more `SnapshotOrder` rows, then `SnapshotEnd`.
 `SnapshotBegin` carries top-of-book aggregates, resting order count, last
 market-data sequence, next trade ID, and the active risk reference price.
 `SnapshotOrder` rows are emitted in deterministic book order: bids from high to
 low price, FIFO within each bid level, then asks from low to high price, FIFO
 within each ask level. `rowIndex` is zero-based. `SnapshotEnd.rowCount` equals
-the number of emitted rows.
+the number of emitted rows, allowing a consumer to detect a truncated batch.
+
+This stream is not a checkpoint or replay seed, and there is no restore path.
+It does not serialize the runtime input cursor, the global sequencer's next
+value, kill-switch or heartbeat state, the market-data L1 publication cache,
+per-account mass-cancel ordering, or the static configuration identity needed
+to validate a restore. Deterministic replay starts from a complete recorded
+input stream instead.
 
 ## Execution Reports
 

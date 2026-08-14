@@ -94,7 +94,7 @@
         <field name="action" id="2" type="KillSwitchAction"/>
     </message>
 
-    <message name="Snapshot" id="2" description="Request a book and engine-state snapshot">
+    <message name="Snapshot" id="2" description="Request an inspection-only book and selected-state snapshot">
         <field name="requestId" id="1" type="uint32"/>
     </message>
 
@@ -117,7 +117,7 @@
         <field name="result" id="4" type="ControlResult"/>
     </message>
 
-    <message name="SnapshotBegin" id="52" description="Begin a deterministic book snapshot">
+    <message name="SnapshotBegin" id="52" description="Begin a deterministic inspection snapshot">
         <field name="engineSeq" id="1" type="uint64"/>
         <field name="requestId" id="2" type="uint32"/>
         <field name="recvTs" id="3" type="uint64"/>
@@ -131,7 +131,7 @@
         <field name="riskReferencePrice" id="11" type="uint64"/>
     </message>
 
-    <message name="SnapshotOrder" id="53" description="One price-time ordered resting order snapshot row">
+    <message name="SnapshotOrder" id="53" description="One price-time ordered resting order inspection row">
         <field name="engineSeq" id="1" type="uint64"/>
         <field name="requestId" id="2" type="uint32"/>
         <field name="rowIndex" id="3" type="uint64"/>
@@ -142,7 +142,7 @@
         <field name="remainingQty" id="8" type="uint64"/>
     </message>
 
-    <message name="SnapshotEnd" id="54" description="End a deterministic book snapshot">
+    <message name="SnapshotEnd" id="54" description="End a deterministic inspection snapshot">
         <field name="engineSeq" id="1" type="uint64"/>
         <field name="requestId" id="2" type="uint32"/>
         <field name="recvTs" id="3" type="uint64"/>

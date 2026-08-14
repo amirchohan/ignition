@@ -58,6 +58,14 @@ impl MetricsRuntime {
             MetricsBackend::InMemory => self.metrics.snapshot(),
         }
     }
+
+    /// Return a post-run snapshot corrected for coordinated omission.
+    pub fn snapshot_corrected(&self, expected_interval_ns: u64) -> MetricsSnapshot {
+        match self.backend {
+            MetricsBackend::Noop => MetricsSnapshot::default(),
+            MetricsBackend::InMemory => self.metrics.snapshot_corrected(expected_interval_ns),
+        }
+    }
 }
 
 /// Metrics backend selected at runtime construction.
@@ -119,14 +127,23 @@ impl Metrics {
     }
 
     fn snapshot(&self) -> MetricsSnapshot {
+        self.snapshot_from(&self.histogram)
+    }
+
+    fn snapshot_corrected(&self, expected_interval_ns: u64) -> MetricsSnapshot {
+        let histogram = self.histogram.clone_correct(expected_interval_ns);
+        self.snapshot_from(&histogram)
+    }
+
+    fn snapshot_from(&self, histogram: &Histogram<u64>) -> MetricsSnapshot {
         MetricsSnapshot {
             warmup_samples: self.warmup_samples,
             measured_samples: self.measured_samples,
-            p50_ns: percentile(&self.histogram, 50.0),
-            p99_ns: percentile(&self.histogram, 99.0),
-            p999_ns: percentile(&self.histogram, 99.9),
-            p9999_ns: percentile(&self.histogram, 99.99),
-            max_ns: self.histogram.max(),
+            p50_ns: percentile(histogram, 50.0),
+            p99_ns: percentile(histogram, 99.0),
+            p999_ns: percentile(histogram, 99.9),
+            p9999_ns: percentile(histogram, 99.99),
+            max_ns: histogram.max(),
             measured_elapsed_ns: match (self.first_measured_start, self.last_measured_end) {
                 (Some(start), Some(end)) => end.duration_since(start).as_nanos().min(u128::from(u64::MAX)) as u64,
                 _ => 0,
@@ -182,5 +199,19 @@ mod tests {
         assert_eq!(snapshot.measured_samples, 1);
         assert!(snapshot.p50_ns > 0);
         assert!(snapshot.max_ns >= snapshot.p50_ns);
+    }
+
+    #[test]
+    fn corrected_snapshot_adds_expected_interval_samples() {
+        let mut metrics = MetricsRuntime::in_memory(0);
+        metrics.metrics.record(Duration::from_nanos(100));
+
+        let raw = metrics.snapshot();
+        let corrected = metrics.snapshot_corrected(10);
+
+        assert_eq!(raw.measured_samples, 1);
+        assert_eq!(corrected.measured_samples, 1);
+        assert!(corrected.p50_ns < raw.p50_ns);
+        assert_eq!(corrected.max_ns, raw.max_ns);
     }
 }

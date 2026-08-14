@@ -67,7 +67,8 @@ boundaries, measurable latency, and honest documentation.
 - Add price-band or fat-finger checks against a documented reference price.
 - Add self-trade prevention with a documented policy.
 - Add a kill switch that is observed before matching, not only at ingress.
-- Add Snapshot control behavior for inspecting or seeding book and engine state.
+- Add Snapshot control behavior for inspecting the book and selected runtime
+  metadata; a restorable replay seed is deferred.
 - Define heartbeat messages for the control plane.
 - Treat missed control-plane heartbeat as visible fail-fast behavior. The exact
   policy remains a later design decision: halt matching, reject new orders,
@@ -139,6 +140,7 @@ boundaries, measurable latency, and honest documentation.
 
 ## Stretch Items To Defer
 
+- A versioned full-runtime checkpoint format and validated restore path.
 - Full L2 snapshot and delta recovery.
 - Prometheus or OpenMetrics export.
 - CPU pinning, NUMA-aware placement, and huge page setup.

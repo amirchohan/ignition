@@ -97,6 +97,8 @@ ownership boundary.
 
 - Owns operational state: kill switch, snapshot requests, heartbeat liveness,
   and status responses.
+- Emits deterministic inspection snapshots; these are not full-runtime
+  checkpoints and cannot seed replay.
 - Does not mutate the book directly; runtime applies control outcomes such as
   shutdown drains and snapshots in order.
 

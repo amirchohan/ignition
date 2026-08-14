@@ -56,6 +56,13 @@ and is used only as a no-price sentinel in outbound optional price fields.
 `protocol/README.md` documents message families, template ID ranges, framing,
 endianness, and compatibility rules.
 
+`Snapshot` provides an inspection-grade point-in-time view of the book and
+selected runtime metadata. Its begin/order/end stream is deterministic and can
+detect truncation, but it is not a restorable checkpoint or replay seed. It
+does not contain all sequencing, control, market-data cache, account-ordering,
+or configuration state required to continue with byte-identical outputs.
+Recorded input streams remain the sole supported replay source.
+
 ## Matching And Risk Rules
 
 Matching uses strict price-time priority. Aggressive orders walk executable
@@ -152,16 +159,25 @@ A smaller smoke run:
 cargo run --release --bin benchmark -- --orders 10000 --warmup 1000 --workload mixed
 ```
 
+An open-loop run with coordinated-omission-corrected HDR reporting:
+
+```bash
+just bench-open-loop 100000
+```
+
 Docker benchmark:
 
 ```bash
 docker compose run --rm benchmark
 ORDERS=10000 WARMUP=1000 docker compose run --rm benchmark
+SCHEDULE=open-loop TARGET_RATE=100000 docker compose run --rm benchmark
 ```
 
 The benchmark reports p50, p99, p99.9, p99.99, max latency, throughput, and
 measured allocation counts for the order-entry-to-execution-report hot path.
-Methodology and local observed numbers are in `BENCH.md`.
+Burst mode remains the default. Open-loop mode schedules arrivals independently
+of response time and reports both raw and coordinated-omission-corrected HDR
+percentiles. Methodology and local observed numbers are in `BENCH.md`.
 
 ## Microstructure Notes
 
@@ -179,6 +195,7 @@ venue may eventually want both: CLOB for liquid pairs and RFQ/FBA mechanisms for
 less liquid pairs or batch-friendly settlement windows.
 
 The main limitation is single-symbol, in-memory scope. The natural evolution is
-to shard by instrument, keep each symbol on a single writer, add recovery
-snapshots plus market-data replay, and then put kernel-bypass networking or
-FPGA-assisted parsing in front of the same protocol/domain boundary.
+to shard by instrument, keep each symbol on a single writer, add a versioned
+recovery-checkpoint format with validated restore plus market-data replay, and
+then put kernel-bypass networking or FPGA-assisted parsing in front of the same
+protocol/domain boundary.

@@ -85,6 +85,14 @@ impl IORuntime {
                 max_frame_len,
             } => (IOBackend::File(FileFrameIo::open(input_path, output_path, max_frame_len)?), None),
             IOConfig::InMemory { input, max_frame_len } => (IOBackend::InMemory(InMemoryFrameIo::new(input, max_frame_len)), None),
+            IOConfig::ScheduledInMemory {
+                input,
+                max_frame_len,
+                target_rate_per_sec,
+            } => (
+                IOBackend::InMemory(InMemoryFrameIo::new_scheduled(input, max_frame_len, target_rate_per_sec)?),
+                None,
+            ),
         };
 
         tracing::info!(
@@ -472,6 +480,15 @@ impl IOStartupLog {
                 egress: "InMemory(counting)".to_owned(),
                 recorder: "disabled".to_owned(),
             },
+            IOConfig::ScheduledInMemory {
+                input,
+                target_rate_per_sec,
+                ..
+            } => Self {
+                ingress: format!("ScheduledInMemory({} records at {target_rate_per_sec}/s)", input.len()),
+                egress: "InMemory(counting)".to_owned(),
+                recorder: "disabled".to_owned(),
+            },
         }
     }
 }
@@ -528,6 +545,12 @@ pub enum IOConfig {
     },
     /// In-memory replay input and output counting for benchmarks.
     InMemory { input: Vec<InputRecord>, max_frame_len: usize },
+    /// Rate-scheduled in-memory replay input and output counting for benchmarks.
+    ScheduledInMemory {
+        input: Vec<InputRecord>,
+        max_frame_len: usize,
+        target_rate_per_sec: u64,
+    },
 }
 
 impl IOConfig {
@@ -536,7 +559,10 @@ impl IOConfig {
     pub const fn frame_capacity(&self) -> usize {
         match self {
             Self::Noop => 4096,
-            Self::Tcp { max_frame_len, .. } | Self::File { max_frame_len, .. } | Self::InMemory { max_frame_len, .. } => *max_frame_len,
+            Self::Tcp { max_frame_len, .. }
+            | Self::File { max_frame_len, .. }
+            | Self::InMemory { max_frame_len, .. }
+            | Self::ScheduledInMemory { max_frame_len, .. } => *max_frame_len,
             Self::Udp { max_datagram_len, .. } => *max_datagram_len,
         }
     }

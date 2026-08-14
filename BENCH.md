@@ -25,10 +25,18 @@ Default release benchmark:
 just bench
 ```
 
+Open-loop benchmark at an explicit target arrival rate:
+
+```bash
+just bench-open-loop 100000
+cargo run --release --bin benchmark -- --orders 1000000 --warmup 50000 --workload mixed --schedule open-loop --target-rate 100000
+```
+
 Docker benchmark without local Rust setup:
 
 ```bash
 docker compose run --rm benchmark
+SCHEDULE=open-loop TARGET_RATE=100000 docker compose run --rm benchmark
 ```
 
 Smaller smoke run:
@@ -66,15 +74,29 @@ handler. The timer starts when the complete frame is handed to gateway decoding
 and stops after execution report emission/queueing for that frame. The
 benchmark prints p50, p99, p99.9, p99.99, and max latency in nanoseconds.
 
+Burst mode is the default and releases all pre-generated frames as fast as the
+runtime can consume them. Open-loop mode requires `--target-rate` and assigns
+each frame an absolute arrival deadline from the start of the run. A slow frame
+does not shift later deadlines: overdue frames are released immediately until
+the runtime catches up. This prevents the input schedule from waiting for each
+response before deciding when to send the next order.
+
+Open-loop output includes the configured target rate, the expected inter-arrival
+interval, the raw HDR histogram, and a post-corrected HDR histogram created with
+that interval. The corrected histogram adds the samples that a response-paced
+measurement would otherwise omit during a long operation. Correction happens
+after allocation counters are captured and is therefore excluded from the
+reported hot-path allocation count.
+
 Warmup runs before the measured run. Allocation counters are reset immediately
 before the measured run, so reported allocations exclude workload generation,
 runtime construction, and warmup. The measured hot path should report zero
 allocation calls once buffers and book storage are preallocated.
 
-The workload is pre-generated rather than request/response paced, so the
-benchmark does not hide slow samples by waiting to create the next order after a
-stall. For future rate-limited/open-loop runs, HDR coordinated-omission
-correction should use the configured target inter-arrival interval.
+The raw latency timer measures frame handling, not TCP transport or client-side
+round-trip time. Open-loop scheduling and HDR correction are benchmark-only;
+they do not introduce wall-clock time into matching, replay records, or protocol
+output.
 
 ## Local Result
 
@@ -106,6 +128,10 @@ environment:
   cpu_pinning: 0-3
 
 workload: mixed
+<<<<<<< HEAD
+=======
+schedule: burst
+>>>>>>> benchmarking_update
 orders: 100000
 warmup_orders: 10000
 throughput_orders_per_sec: 687802
