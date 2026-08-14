@@ -36,10 +36,10 @@ not use lazy cancellation as the default because lazy cleanup pushes
 cancellation work into later aggressive matching and can create tail-latency
 spikes.
 
-The public engine boundary accepts caller-owned market-data state and an event
-buffer: `Engine::execute(entry, market_data, events)`. The engine clears and
-reuses that buffer instead of allocating a fresh result vector for every
-command.
+The public engine boundary accepts caller-owned market-data state and an
+execution-report callback: `Engine::execute(entry, sequencer, market_data,
+emit_report)`. The engine emits directly into caller-owned sinks instead of
+allocating a fresh result vector for every command.
 
 ## Why This Design
 
@@ -51,8 +51,8 @@ This gives predictable hot-path behavior:
 - Strict FIFO at each price level.
 - Constant-time arbitrary cancel after `order_id -> handle` lookup.
 - Mass cancel walks only the target account's active orders.
-- Caller-owned event buffers keep normal command execution allocation-free once
-  the caller has reserved enough capacity for its workload.
+- Caller-owned output sinks keep normal command execution allocation-free once
+  endpoint buffers and book storage are preallocated.
 - GTC orders remain valid inside the fixed storage envelope even if risk price
   bands move later.
 

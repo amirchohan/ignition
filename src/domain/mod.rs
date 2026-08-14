@@ -1,8 +1,9 @@
 //! Protocol-agnostic domain model for the deterministic engine core.
 //!
-//! These types carry validated integer-scaled data into later matching, risk,
-//! market-data, and replay milestones. They deliberately do not contain symbols,
-//! asset labels, generated protocol enums, wall-clock reads, or randomness.
+//! These types carry validated integer-scaled data through matching, risk,
+//! market-data, replay, and benchmark paths. They deliberately do not contain
+//! symbols, asset labels, generated protocol enums, wall-clock reads, or
+//! randomness.
 
 pub mod control;
 pub mod rd;

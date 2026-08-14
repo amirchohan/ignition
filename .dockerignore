@@ -1,0 +1,6 @@
+target/
+.git/
+.agents/
+.codex/
+fixtures/replay/runs/*/output/
+**/*.tmp

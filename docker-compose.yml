@@ -1,0 +1,49 @@
+services:
+  server:
+    build: .
+    command: ["server", "--config", "configs/server.docker.yaml"]
+    ports:
+      - "19000:19000/tcp"
+      - "19001:19001/tcp"
+      - "19002:19002/udp"
+    volumes:
+      - ./fixtures/replay/runs:/app/fixtures/replay/runs
+
+  trading-client:
+    build: .
+    command: ["trading-client", "--config", "configs/trading-client.docker.yaml"]
+    depends_on:
+      - server
+    stdin_open: true
+    tty: true
+    environment:
+      TERM: "${TERM:-xterm-256color}"
+
+  control-client:
+    build: .
+    command: ["control-client", "--config", "configs/control-client.docker.yaml"]
+    depends_on:
+      - server
+    stdin_open: true
+    tty: true
+    environment:
+      TERM: "${TERM:-xterm-256color}"
+
+  benchmark:
+    build: .
+    command:
+      - benchmark
+      - --orders
+      - "${ORDERS:-1000000}"
+      - --warmup
+      - "${WARMUP:-50000}"
+      - --workload
+      - "${WORKLOAD:-mixed}"
+      - --config
+      - configs/benchmark.yaml
+
+  replay:
+    build: .
+    command: ["replay", "--run", "${REPLAY_RUN:-1786693693}", "--config", "configs/replay.yaml"]
+    volumes:
+      - ./fixtures/replay/runs:/app/fixtures/replay/runs

@@ -1,6 +1,7 @@
 //! Server entry point.
 
 use std::{
+    env,
     error::Error,
     fs, io,
     path::{Path, PathBuf},
@@ -33,7 +34,8 @@ fn init_tracing() {
 
 /// Load server config, apply optional live replay recording, and run the runtime.
 fn run() -> ServerResult<()> {
-    let mut config = ServerConfig::load("configs/server.yaml").map_err(RuntimeBuildError::Config)?;
+    let config_path = parse_config_path(env::args().skip(1), "configs/server.yaml")?;
+    let mut config = ServerConfig::load(config_path).map_err(RuntimeBuildError::Config)?;
     prepare_config_for_live_mode(&mut config)?;
     let mode = runtime_mode_for_live(&config)?;
 
@@ -44,6 +46,29 @@ fn run() -> ServerResult<()> {
         .run()
         .map_err(|error| io::Error::other(format!("runtime failed: {error:?}")))?;
     Ok(())
+}
+
+/// Parse the optional config path flag.
+fn parse_config_path(args: impl Iterator<Item = String>, default_path: &'static str) -> ServerResult<String> {
+    let mut config_path = default_path.to_owned();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" | "-h" => return Err(io::Error::other(usage()).into()),
+            "--config" => {
+                config_path = args
+                    .next()
+                    .ok_or_else(|| io::Error::other(format!("missing value for --config\n{}", usage())))?;
+            }
+            other => return Err(io::Error::other(format!("unknown argument {other}\n{}", usage())).into()),
+        }
+    }
+    Ok(config_path)
+}
+
+/// Return server CLI usage text.
+fn usage() -> &'static str {
+    "usage: server [--config PATH]"
 }
 
 /// Resolve live-mode sequencing state from config.

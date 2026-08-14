@@ -84,6 +84,7 @@ id_type!(AssetId);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn instrument() -> InstrumentSpec {
         InstrumentSpec::new(1001, 1, 2, 2, 8, 5, 10).expect("valid instrument")
@@ -124,5 +125,21 @@ mod tests {
             RawNotional::from_price_qty(price, qty).raw(),
             u128::from(u64::MAX) * u128::from(u64::MAX - 5)
         );
+    }
+
+    proptest! {
+        /// Checks that the domain constructors only accept prices and quantities
+        /// that are positive and aligned to the instrument tick or lot size.
+        /// Negative values are not representable because the raw inputs are
+        /// unsigned integers at both the domain and wire boundaries.
+        #[test]
+        fn property_price_and_qty_accept_only_positive_tick_and_lot_aligned_values(raw in 0_u64..10_000) {
+            let instrument = instrument();
+            let price_result = Price::new(raw, &instrument);
+            let qty_result = Qty::new(raw, &instrument);
+
+            prop_assert_eq!(price_result.is_ok(), raw != 0 && raw.is_multiple_of(instrument.price_tick));
+            prop_assert_eq!(qty_result.is_ok(), raw != 0 && raw.is_multiple_of(instrument.qty_lot));
+        }
     }
 }

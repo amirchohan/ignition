@@ -114,6 +114,7 @@ impl MarketDataSequencer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn market_data_sequencer_is_monotonic() {
@@ -133,5 +134,31 @@ mod tests {
         assert_eq!(md.next_md_seq(), Err(DomainError::SequenceOverflow));
         assert_eq!(md.next_trade_id().expect("penultimate trade").raw(), u64::MAX - 1);
         assert_eq!(md.next_trade_id(), Err(DomainError::SequenceOverflow));
+    }
+
+    proptest! {
+        /// Checks that generated market-data and trade-id allocations always
+        /// move forward one step at a time. This enforces the outbound stream
+        /// monotonicity contract used by gap detection and replay comparison.
+        #[test]
+        fn property_market_data_sequences_are_strictly_monotonic(md_count in 1_usize..256, trade_count in 1_usize..256) {
+            let mut md = MarketDataSequencer::default();
+            let mut last_md_seq = md.previous_md_seq().raw();
+            for expected in 1..=md_count as u64 {
+                let next = md.next_md_seq().expect("md seq").raw();
+                prop_assert!(next > last_md_seq);
+                prop_assert_eq!(next, expected);
+                prop_assert_eq!(md.previous_md_seq().raw(), next);
+                last_md_seq = next;
+            }
+
+            let mut last_trade_id = 0;
+            for expected in 1..=trade_count as u64 {
+                let next = md.next_trade_id().expect("trade id").raw();
+                prop_assert!(next > last_trade_id);
+                prop_assert_eq!(next, expected);
+                last_trade_id = next;
+            }
+        }
     }
 }

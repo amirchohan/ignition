@@ -1,0 +1,47 @@
+mode:
+  type: live
+  next_input_seq: 1
+  record_path_dir: "fixtures/replay/runs"
+metrics:
+  type: noop
+reference_data:
+  instrument:
+    instrument_id: 1001 # BTC-USD
+    base_asset_id: 1 # BTC
+    quote_asset_id: 2 # USD
+    price_decimals: 2
+    qty_decimals: 8
+    price_tick: 1
+    qty_lot: 1
+engine:
+  storage_min_price: 1000000
+  storage_max_price: 25000000
+  page_size: 1024
+  max_resting_orders: 100000
+  max_account_id: 100000
+  max_active_pages: 4096
+risk:
+  max_open_orders_per_account: 1000
+  max_open_notional_per_account: 100000000000000000
+  startup_reference_price: 6500000
+  price_band_bps: 1000
+control:
+  type: tcp
+  bind_addr: "0.0.0.0:19001"
+  heartbeat_timeout_ns: 0
+  max_frame_len: 4096
+  max_pending_write_bytes: 1048576
+gateway:
+  type: tcp
+  bind_addr: "0.0.0.0:19000"
+  max_frame_len: 4096
+  max_pending_write_bytes: 1048576
+  max_messages_per_poll: 1024
+market_data:
+  type: udp
+  bind_addr: "0.0.0.0:0"
+  group_addr: "239.255.0.1:19002"
+  multicast_ttl: 1
+  multicast_loop_v4: true
+  max_datagram_len: 4096
+  max_pending_datagram_bytes: 1048576

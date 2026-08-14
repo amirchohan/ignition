@@ -197,6 +197,7 @@ mod tests {
             },
         },
     };
+    use proptest::prelude::*;
 
     fn temp_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("ignition-replay-{name}-{}-{}.bin", std::process::id(), unique_suffix()))
@@ -412,6 +413,60 @@ market_data:
 
         for path in [input, gateway_output, market_data_output, config_path] {
             let _ = std::fs::remove_file(path);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// Generates a bounded binary gateway input stream, writes it as replay
+        /// input records, and runs replay twice through the normal runtime. The
+        /// property checks the determinism requirement directly by comparing
+        /// the raw gateway and market-data output bytes from both runs.
+        #[test]
+        fn property_generated_replay_is_byte_identical(
+            order_specs in prop::collection::vec((any::<bool>(), 0_u64..100, 1_u64..1_000_000, any::<bool>()), 1..24),
+        ) {
+            let input = temp_path("property-input");
+            let first_gateway = temp_path("property-first-gateway-output");
+            let first_market_data = temp_path("property-first-market-data-output");
+            let second_gateway = temp_path("property-second-gateway-output");
+            let second_market_data = temp_path("property-second-market-data-output");
+            let records = order_specs
+                .iter()
+                .enumerate()
+                .map(|(index, (buy, price_offset, qty, ioc))| {
+                    record(
+                        index as u64 + 1,
+                        index as u64 + 10,
+                        new_order(
+                            index as u64 + 1,
+                            index as u32 + 1,
+                            if *buy { Side::Buy } else { Side::Sell },
+                            6_950_000 + price_offset * 1_000,
+                            *qty,
+                            if *ioc { wire_tif::TimeInForce::Ioc } else { wire_tif::TimeInForce::Gtc },
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            write_records(&input, &records);
+
+            run_sample(input.clone(), first_gateway.clone(), first_market_data.clone());
+            run_sample(input.clone(), second_gateway.clone(), second_market_data.clone());
+
+            prop_assert_eq!(
+                std::fs::read(&first_gateway).expect("first gateway"),
+                std::fs::read(&second_gateway).expect("second gateway")
+            );
+            prop_assert_eq!(
+                std::fs::read(&first_market_data).expect("first market data"),
+                std::fs::read(&second_market_data).expect("second market data")
+            );
+
+            for path in [input, first_gateway, first_market_data, second_gateway, second_market_data] {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 

@@ -1,7 +1,8 @@
 //! Ignition is a single-symbol, deterministic CLOB matching engine.
 //!
-//! Milestone 1 establishes the architecture and protocol contract. Later
-//! milestones fill in matching, risk, market-data, replay, and client behavior.
+//! The crate keeps protocol, I/O, runtime orchestration, risk, matching,
+//! market-data, replay, benchmark, and client concerns behind explicit typed
+//! boundaries.
 
 pub mod client;
 pub mod config;

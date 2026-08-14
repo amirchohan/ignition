@@ -1,0 +1,4 @@
+server_config_path: "configs/server.docker.yaml"
+control_addr: "server:19001"
+heartbeat_interval_ms: 1000
+max_snapshot_rows: 200

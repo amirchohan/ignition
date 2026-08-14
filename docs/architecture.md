@@ -41,6 +41,11 @@ ownership boundary.
   endpoint.
 - The live TCP path decodes a borrowed complete frame, normalizes it once, and
   lets runtime process/publish through a borrowed gateway publisher.
+- The current live TCP adapter keeps one active client per endpoint. Production
+  multi-client fan-in should sit in an upstream order gateway/session layer
+  responsible for authentication, account binding, rate limits, backpressure,
+  disconnect policy, and deterministic sequencing before frames reach this
+  matcher runtime.
 - Does not own matching, risk, market-data feed state, or control-plane policy.
 
 ### `runtime`
@@ -56,10 +61,11 @@ ownership boundary.
 - Owns order-book state, order lifecycle mutations, and price-time priority
   matching.
 - Accepts internal typed `OrderEntry` values, not raw protocol buffers.
-- Exposes `Engine::execute(entry, market_data, emit_report)`, where the
-  caller owns market-data feed state and order-entry report egress.
-- Stores the book as two `SideLadder` values, one shared resting-order arena, a
-  `client_order_id -> handle` lookup, and a dense account table.
+- Exposes `Engine::execute(entry, sequencer, market_data, emit_report)`, where
+  the caller owns sequence state, market-data feed state, and order-entry report
+  egress.
+- Stores the book directly as two `SideLadder` values, one shared resting-order
+  arena, a `client_order_id -> handle` lookup, and a dense account table.
 - Uses a fixed storage envelope from `configs/server.yaml` for direct price
   addressing; dynamic risk price bands are enforced outside the matching data
   structure.
@@ -70,10 +76,11 @@ ownership boundary.
 
 ### `risk`
 
-- Owns future pre-match gating: account limits, notional checks, price bands,
-  kill-switch observation, and self-trade-prevention policy evaluation.
+- Owns pre-match account limits, notional checks, price bands, and
+  self-trade-prevention policy evaluation.
 - Produces typed accept/reject decisions before matching.
-- Does not mutate the order book or emit protocol frames directly.
+- Reads book-derived state through `Engine` views, but does not mutate the book
+  or emit protocol frames directly.
 
 ### `market_data`
 
@@ -90,11 +97,12 @@ ownership boundary.
 
 - Owns operational state: kill switch, snapshot requests, heartbeat liveness,
   and status responses.
-- Does not mutate the book directly; runtime applies control outcomes in order.
+- Does not mutate the book directly; runtime applies control outcomes such as
+  shutdown drains and snapshots in order.
 
 ### Client Tooling
 
-- Future file, CLI, benchmark, replay, TCP, and UDS clients are adapters from
+- File, CLI, benchmark, replay, TCP, and in-memory clients are adapters from
   input sources to protocol frames.
 - Clients must use the same SBE protocol path as the server runtime.
 - Clients do not call privileged internal engine APIs.
@@ -103,7 +111,7 @@ ownership boundary.
 
 The intended flow is:
 
-1. gateway receives bytes on the control or trading endpoint,
+1. control and gateway receive bytes on their respective endpoints,
 2. protocol wire adapters decode into `ControlRequest` or `OrderEntry`,
 3. runtime drains control and trading queues in deterministic order,
 4. control state and risk gates are observed before matching,
@@ -111,6 +119,10 @@ The intended flow is:
 6. market-data and execution outputs are sequenced,
 7. control and gateway encode endpoint-specific egress frames.
 
-Milestones 1 through 3 define this ownership contract, protocol/domain boundary,
-single-symbol reference data, deterministic core model, and matching behavior.
-Client tooling, replay, and benchmarking remain later milestones.
+Replay and benchmark traffic exercise the same protocol/runtime boundary as
+live clients, using file and in-memory I/O backends instead of privileged engine
+entrypoints.
+
+Concurrent submission is modeled as deterministic serialization before the
+single-writer matcher. The runtime-assigned input stream, not client-provided
+timestamps or socket scheduling, defines same-price FIFO priority.

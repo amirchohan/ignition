@@ -543,10 +543,10 @@ fn read_physical_cores() -> String {
 
     for line in text.lines().chain(std::iter::once("")) {
         if line.trim().is_empty() {
-            if let (Some(physical), Some(core)) = (physical_id.take(), core_id.take()) {
-                if !cores.iter().any(|seen| seen.0 == physical && seen.1 == core) {
-                    cores.push((physical, core));
-                }
+            if let (Some(physical), Some(core)) = (physical_id.take(), core_id.take())
+                && !cores.iter().any(|seen| seen.0 == physical && seen.1 == core)
+            {
+                cores.push((physical, core));
             }
             physical_id = None;
             core_id = None;

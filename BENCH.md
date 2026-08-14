@@ -25,10 +25,17 @@ Default release benchmark:
 just bench
 ```
 
+Docker benchmark without local Rust setup:
+
+```bash
+docker compose run --rm benchmark
+```
+
 Smaller smoke run:
 
 ```bash
 cargo run --release --bin benchmark -- --orders 10000 --warmup 1000 --workload mixed
+ORDERS=10000 WARMUP=1000 docker compose run --rm benchmark
 ```
 
 Optional CPU pinning on Linux:

@@ -262,6 +262,7 @@ mod tests {
         io::IOConfig,
         market_data::{MarketDataFeedConfig, MarketDataRuntime},
     };
+    use proptest::prelude::*;
 
     fn instrument() -> InstrumentSpec {
         InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 1).expect("instrument")
@@ -338,16 +339,7 @@ mod tests {
     }
 
     fn market_data_config() -> MarketDataFeedConfig {
-        MarketDataFeedConfig {
-            io: IOConfig::Udp {
-                bind_addr: "0.0.0.0:0".to_owned(),
-                group_addr: "239.255.0.1:19002".to_owned(),
-                multicast_ttl: 1,
-                multicast_loop_v4: true,
-                max_datagram_len: 4096,
-                max_pending_datagram_bytes: 1 << 20,
-            },
-        }
+        MarketDataFeedConfig { io: IOConfig::Noop }
     }
 
     #[test]
@@ -464,5 +456,119 @@ mod tests {
         risk.observe_trade_price(price(1_010));
 
         assert_eq!(risk.reference_price(), price(1_010));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+
+        /// Builds a resting order, then projects a crossing order from either
+        /// the same account or a different account. The property checks the
+        /// configured cancel-aggressive STP policy: same-account non-post-only
+        /// crosses are rejected before matching, post-only crosses are left to
+        /// engine cancel behavior, and opposite-account crosses are accepted.
+        #[test]
+        fn property_stp_rejects_only_self_crossing_non_post_only_orders(
+            resting_sell in any::<bool>(),
+            same_account in any::<bool>(),
+            post_only in any::<bool>(),
+            qty_raw in 1_u64..50,
+        ) {
+            let mut engine = Engine::new(engine_config()).expect("engine");
+            let resting_side = if resting_sell { Side::Sell } else { Side::Buy };
+            let taker_side = if resting_sell { Side::Buy } else { Side::Sell };
+            let Some(_) = execute(
+                &mut engine,
+                OrderEntry::NewOrder(new_order(1, 1, resting_side, OrderType::Limit, TimeInForce::Gtc, Some(1_000), qty_raw)),
+            ) else {
+                return Ok(());
+            };
+
+            let risk = RiskRuntime::new(risk_config(10, 1_000_000));
+            let taker_account = if same_account { 1 } else { 2 };
+            let tif = if post_only { TimeInForce::PostOnly } else { TimeInForce::Ioc };
+            let decision = risk.evaluate(
+                OrderEntry::NewOrder(new_order(2, taker_account, taker_side, OrderType::Limit, tif, Some(1_000), qty_raw)),
+                &engine,
+            );
+
+            let expected = if same_account && !post_only {
+                RiskDecision::Reject(RejectReason::SelfTradePrevention)
+            } else {
+                RiskDecision::Accept
+            };
+            prop_assert_eq!(decision, expected);
+            prop_assert_eq!(engine.resting_order_count(), 1);
+        }
+
+        /// Generates an account close to its configured open-order limit and
+        /// submits one more resting GTC order. The property checks that risk
+        /// rejects exactly when the projected resting order count would exceed
+        /// the configured limit, without relying on matching side effects.
+        #[test]
+        fn property_account_limits_reject_projected_resting_exposure(
+            max_orders in 1_u32..8,
+            existing_orders in 0_u32..8,
+            qty_raw in 1_u64..50,
+        ) {
+            let mut engine = Engine::new(engine_config()).expect("engine");
+            let seed_count = existing_orders.min(max_orders);
+            for index in 0..seed_count {
+                let Some(_) = execute(
+                    &mut engine,
+                    OrderEntry::NewOrder(new_order(
+                        u64::from(index) + 1,
+                        1,
+                        Side::Buy,
+                        OrderType::Limit,
+                        TimeInForce::Gtc,
+                        Some(1_000 + u64::from(index)),
+                        qty_raw,
+                    )),
+                ) else {
+                    return Ok(());
+                };
+            }
+
+            let risk = RiskRuntime::new(risk_config(max_orders, u128::MAX / 4));
+            let decision = risk.evaluate(
+                OrderEntry::NewOrder(new_order(100, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1_000), qty_raw)),
+                &engine,
+            );
+
+            if seed_count >= max_orders {
+                prop_assert_eq!(decision, RiskDecision::Reject(RejectReason::RiskOpenOrderLimit));
+            } else {
+                prop_assert_eq!(decision, RiskDecision::Accept);
+            }
+        }
+
+        /// Generates prices around the startup reference price and checks that
+        /// the price band is inclusive at both endpoints. Prices inside the
+        /// configured band are accepted; prices outside it get the specific
+        /// PriceBand reject reason.
+        #[test]
+        fn property_price_band_is_inclusive_around_reference(price_offset in 0_u64..30, buy in any::<bool>()) {
+            let engine = Engine::new(engine_config()).expect("engine");
+            let risk = RiskRuntime::new(risk_config(10, 1_000_000));
+            let price_raw = 990 + price_offset;
+            let decision = risk.evaluate(
+                OrderEntry::NewOrder(new_order(
+                    1,
+                    1,
+                    if buy { Side::Buy } else { Side::Sell },
+                    OrderType::Limit,
+                    TimeInForce::Gtc,
+                    Some(price_raw),
+                    10,
+                )),
+                &engine,
+            );
+
+            if (990..=1_010).contains(&price_raw) {
+                prop_assert_eq!(decision, RiskDecision::Accept);
+            } else {
+                prop_assert_eq!(decision, RiskDecision::Reject(RejectReason::PriceBand));
+            }
+        }
     }
 }

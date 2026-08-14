@@ -211,12 +211,23 @@ mod tests {
             generated::codecs::{kill_switch_action as wire_kill_switch_action, kill_switch_codec, message_header_codec},
         },
     };
+    use proptest::prelude::*;
 
     fn instrument() -> InstrumentSpec {
         InstrumentSpec::new(1001, 1, 2, 2, 8, 1, 1).expect("valid instrument")
     }
 
     fn encode_new_order(order_type: order_type::OrderType, price: u64, qty: u64) -> Vec<u8> {
+        encode_new_order_with(order_type, side::Side::Buy, time_in_force::TimeInForce::Gtc, price, qty)
+    }
+
+    fn encode_new_order_with(
+        order_type: order_type::OrderType,
+        side: side::Side,
+        tif: time_in_force::TimeInForce,
+        price: u64,
+        qty: u64,
+    ) -> Vec<u8> {
         let len = SBE_HEADER_LEN + new_order_codec::SBE_BLOCK_LENGTH as usize;
         let mut bytes = vec![0_u8; len];
         encode_header(&mut bytes, new_order_codec::SBE_BLOCK_LENGTH, MessageKind::NewOrder).expect("header");
@@ -227,9 +238,9 @@ mod tests {
             .client_order_id(11)
             .account_id(22)
             .client_ts(33)
-            .side(side::Side::Buy)
+            .side(side)
             .order_type(order_type)
-            .time_in_force(time_in_force::TimeInForce::Gtc)
+            .time_in_force(tif)
             .price(price)
             .qty(qty);
         bytes
@@ -246,6 +257,14 @@ mod tests {
             .request_id(77)
             .action(wire_kill_switch_action::KillSwitchAction::HaltTrading);
         bytes
+    }
+
+    fn put_u16_le(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64_le(bytes: &mut [u8], offset: usize, value: u64) {
+        bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
     }
 
     #[test]
@@ -332,5 +351,176 @@ mod tests {
 
         let decoder = message_header_codec::MessageHeaderDecoder::default().wrap(ReadBuf::new(&bytes), 0);
         assert_eq!(decoder.template_id(), MessageKind::ExecutionReport.template_id());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+
+        /// Checks that valid generated binary NewOrder frames decode into the
+        /// same typed order fields the client sent. It also checks the market
+        /// order rule that wire price is ignored and normalized to no limit
+        /// price before the matching core sees the order.
+        #[test]
+        fn property_new_order_wire_normalization_preserves_valid_fields(
+            is_buy in any::<bool>(),
+            is_market in any::<bool>(),
+            tif_index in 0_u8..3,
+            price_raw in 1_u64..10_000,
+            qty_raw in 1_u64..10_000,
+            recv_ts in 0_u64..1_000_000,
+        ) {
+            let order_type = if is_market {
+                order_type::OrderType::Market
+            } else {
+                order_type::OrderType::Limit
+            };
+            let side = if is_buy { side::Side::Buy } else { side::Side::Sell };
+            let tif = match tif_index {
+                0 => time_in_force::TimeInForce::Gtc,
+                1 => time_in_force::TimeInForce::Ioc,
+                _ => time_in_force::TimeInForce::PostOnly,
+            };
+            let bytes = encode_new_order_with(order_type, side, tif, price_raw, qty_raw);
+
+            let OrderEntry::NewOrder(order) =
+                decode_and_normalize_order_entry(&bytes, RecvTs::new(recv_ts), &instrument()).expect("valid generated order")
+            else {
+                panic!("expected new order");
+            };
+
+            prop_assert_eq!(order.client_order_id.raw(), 11);
+            prop_assert_eq!(order.account_id.raw(), 22);
+            prop_assert_eq!(order.recv_ts.raw(), recv_ts);
+            prop_assert_eq!(order.side, if is_buy { Side::Buy } else { Side::Sell });
+            prop_assert_eq!(order.order_type, if is_market { OrderType::Market } else { OrderType::Limit });
+            prop_assert_eq!(order.price.map(Price::raw), (!is_market).then_some(price_raw));
+            prop_assert_eq!(order.qty.raw(), qty_raw);
+        }
+
+        /// Checks that generated binary NewOrder frames with bad scalar values
+        /// are rejected at the protocol normalization boundary with the expected
+        /// domain error. Limit orders validate their required price before
+        /// quantity, while market orders ignore price and still reject zero qty.
+        #[test]
+        fn property_new_order_wire_rejects_invalid_scalars(is_market in any::<bool>(), price_raw in 0_u64..10, qty_raw in 0_u64..10) {
+            let order_type = if is_market {
+                order_type::OrderType::Market
+            } else {
+                order_type::OrderType::Limit
+            };
+            let bytes = encode_new_order(order_type, price_raw, qty_raw);
+            let result = decode_and_normalize_order_entry(&bytes, RecvTs::new(1), &instrument());
+
+            if !is_market && price_raw == 0 {
+                prop_assert_eq!(result, Err(InboundDecodeError::Domain(DomainError::InvalidPrice)));
+            } else if qty_raw == 0 {
+                prop_assert_eq!(result, Err(InboundDecodeError::Domain(DomainError::InvalidQuantity)));
+            } else {
+                prop_assert!(result.is_ok());
+            }
+        }
+
+        /// Fuzzes raw byte lengths around a valid NewOrder frame. Any prefix
+        /// shorter than the SBE header or shorter than the declared payload
+        /// length must be rejected as an incomplete frame instead of being
+        /// decoded from missing bytes.
+        #[test]
+        fn property_order_entry_rejects_truncated_frames(len in 0_usize..(SBE_HEADER_LEN + new_order_codec::SBE_BLOCK_LENGTH as usize)) {
+            let bytes = encode_new_order(order_type::OrderType::Limit, 100, 10);
+            let result = decode_order_entry(&bytes[..len]);
+
+            prop_assert_eq!(result, Err(ProtocolError::BufferTooShort));
+        }
+
+        /// Fuzzes header bytes directly: schema ID, schema version, template
+        /// ID, and declared block length. This catches endian/layout mistakes
+        /// and verifies that unsupported schemas, unsupported versions, unknown
+        /// templates, wrong endpoint templates, and impossible lengths are
+        /// rejected at the protocol boundary before domain normalization.
+        #[test]
+        fn property_order_entry_rejects_corrupted_headers(
+            corrupt_schema in any::<bool>(),
+            corrupt_version in any::<bool>(),
+            template_id in 0_u16..260,
+            declared_block_len in 0_u16..80,
+        ) {
+            let mut bytes = encode_new_order(order_type::OrderType::Limit, 100, 10);
+            if corrupt_schema {
+                put_u16_le(&mut bytes, 4, crate::protocol::SCHEMA_ID + 1);
+            }
+            if corrupt_version {
+                put_u16_le(&mut bytes, 6, crate::protocol::SCHEMA_VERSION + 1);
+            }
+            put_u16_le(&mut bytes, 2, template_id);
+            put_u16_le(&mut bytes, 0, declared_block_len);
+
+            let result = decode_order_entry(&bytes);
+
+            if corrupt_schema {
+                prop_assert_eq!(result, Err(ProtocolError::UnsupportedSchema { schema_id: crate::protocol::SCHEMA_ID + 1 }));
+            } else if corrupt_version {
+                prop_assert_eq!(result, Err(ProtocolError::UnsupportedVersion { version: crate::protocol::SCHEMA_VERSION + 1 }));
+            } else {
+                match MessageKind::from_template_id(template_id) {
+                    Err(ProtocolError::UnknownTemplate { template_id }) => {
+                        prop_assert_eq!(result, Err(ProtocolError::UnknownTemplate { template_id }));
+                    }
+                    Ok(_) if declared_block_len as usize > bytes.len() - SBE_HEADER_LEN => {
+                        prop_assert_eq!(result, Err(ProtocolError::BufferTooShort));
+                    }
+                    Ok(kind) if !kind.is_order_entry() => {
+                        prop_assert_eq!(result, Err(ProtocolError::UnexpectedTemplate { template_id }));
+                    }
+                    Ok(_) => {
+                        prop_assert!(result.is_ok());
+                    }
+                    Err(error) => panic!("unexpected template decode error: {error:?}"),
+                }
+            }
+        }
+
+        /// Corrupts the raw enum bytes inside an otherwise valid NewOrder
+        /// payload. Unknown side, order type, and time-in-force values must
+        /// normalize to domain Malformed rather than leaking generated-codec
+        /// NullVal variants into the engine.
+        #[test]
+        fn property_new_order_rejects_unknown_enum_discriminants(field in 0_usize..3, raw in 4_u8..=254) {
+            let mut bytes = encode_new_order(order_type::OrderType::Limit, 100, 10);
+            let payload_offset = SBE_HEADER_LEN;
+            let field_offset = match field {
+                0 => payload_offset + 20,
+                1 => payload_offset + 21,
+                _ => payload_offset + 22,
+            };
+            bytes[field_offset] = raw;
+
+            prop_assert_eq!(
+                decode_and_normalize_order_entry(&bytes, RecvTs::new(1), &instrument()),
+                Err(InboundDecodeError::Domain(DomainError::Malformed))
+            );
+        }
+
+        /// Mutates the raw price and quantity fields to values that are not
+        /// aligned with a stricter test instrument. This verifies that protocol
+        /// normalization enforces tick and lot size, not just positivity.
+        #[test]
+        fn property_new_order_rejects_tick_and_lot_misalignment(price_units in 0_u64..1000, qty_units in 0_u64..1000) {
+            let instrument = InstrumentSpec::new(1001, 1, 2, 2, 8, 5, 10).expect("instrument");
+            let price_raw = price_units * 5 + 1;
+            let qty_raw = qty_units * 10 + 1;
+            let mut price_bad = encode_new_order(order_type::OrderType::Limit, 100, 10);
+            put_u64_le(&mut price_bad, SBE_HEADER_LEN + 23, price_raw);
+            prop_assert_eq!(
+                decode_and_normalize_order_entry(&price_bad, RecvTs::new(1), &instrument),
+                Err(InboundDecodeError::Domain(DomainError::InvalidPrice))
+            );
+
+            let mut qty_bad = encode_new_order(order_type::OrderType::Limit, 100, 10);
+            put_u64_le(&mut qty_bad, SBE_HEADER_LEN + 31, qty_raw);
+            prop_assert_eq!(
+                decode_and_normalize_order_entry(&qty_bad, RecvTs::new(1), &instrument),
+                Err(InboundDecodeError::Domain(DomainError::InvalidQuantity))
+            );
+        }
     }
 }

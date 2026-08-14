@@ -223,7 +223,7 @@ impl Runtime {
             }));
         }
 
-        // todo - we should be able to switch between yield types (e.g. no-op)
+        // Live mode yields when both ingress endpoints are idle.
         std::thread::yield_now();
         Ok(true)
     }
@@ -282,7 +282,7 @@ mod tests {
             OrderType, Side, TimeInForce,
         },
     };
-    use crate::io::IOConfig;
+    use crate::io::{Endpoint, FileFrameIo, IOConfig, InputRecord};
     use crate::market_data::{MarketDataFeedConfig, MarketDataRuntime};
     use crate::protocol::{
         MessageKind, SBE_HEADER_LEN, SCHEMA_VERSION, decode_header, encode_header,
@@ -293,9 +293,11 @@ mod tests {
             snapshot_order_codec, time_in_force as wire_tif,
         },
     };
+    use proptest::prelude::*;
     use std::{
         io::{Read, Write},
         net::{SocketAddr, TcpListener, TcpStream},
+        path::Path,
         thread,
         time::Duration,
     };
@@ -468,16 +470,7 @@ mod tests {
     }
 
     fn market_data_config() -> MarketDataFeedConfig {
-        MarketDataFeedConfig {
-            io: IOConfig::Udp {
-                bind_addr: "0.0.0.0:0".to_owned(),
-                group_addr: "239.255.0.1:19002".to_owned(),
-                multicast_ttl: 1,
-                multicast_loop_v4: true,
-                max_datagram_len: 4096,
-                max_pending_datagram_bytes: 1 << 20,
-            },
-        }
+        MarketDataFeedConfig { io: IOConfig::Noop }
     }
 
     fn reserve_loopback_addr() -> Option<SocketAddr> {
@@ -709,63 +702,82 @@ mod tests {
             if header.kind != MessageKind::ExecutionReport {
                 continue;
             }
-            let decoder = execution_report_codec::ExecutionReportDecoder::default().wrap(
-                ReadBuf::new(&frame),
-                SBE_HEADER_LEN,
-                execution_report_codec::SBE_BLOCK_LENGTH,
-                SCHEMA_VERSION,
-            );
-            reports.push(ExecutionReport {
-                engine_seq: crate::domain::EngineSeq::new(decoder.engine_seq()),
-                client_order_id: OrderId::new(decoder.client_order_id()).expect("order"),
-                account_id: AccountId::new(decoder.account_id()).expect("account"),
-                exec_type: match decoder.exec_type() {
-                    crate::protocol::generated::codecs::exec_type::ExecType::New => ExecType::New,
-                    crate::protocol::generated::codecs::exec_type::ExecType::Trade => ExecType::Trade,
-                    crate::protocol::generated::codecs::exec_type::ExecType::Canceled => ExecType::Canceled,
-                    crate::protocol::generated::codecs::exec_type::ExecType::Replaced => ExecType::Replaced,
-                    crate::protocol::generated::codecs::exec_type::ExecType::Rejected => ExecType::Rejected,
-                    crate::protocol::generated::codecs::exec_type::ExecType::Expired => ExecType::Expired,
-                    crate::protocol::generated::codecs::exec_type::ExecType::NullVal => {
-                        panic!("null exec type")
-                    }
-                },
-                ord_status: match decoder.ord_status() {
-                    crate::protocol::generated::codecs::ord_status::OrdStatus::New => OrdStatus::New,
-                    crate::protocol::generated::codecs::ord_status::OrdStatus::PartiallyFilled => OrdStatus::PartiallyFilled,
-                    crate::protocol::generated::codecs::ord_status::OrdStatus::Filled => OrdStatus::Filled,
-                    crate::protocol::generated::codecs::ord_status::OrdStatus::Canceled => OrdStatus::Canceled,
-                    crate::protocol::generated::codecs::ord_status::OrdStatus::Replaced => OrdStatus::Replaced,
-                    crate::protocol::generated::codecs::ord_status::OrdStatus::Rejected => OrdStatus::Rejected,
-                    crate::protocol::generated::codecs::ord_status::OrdStatus::Expired => OrdStatus::Expired,
-                    crate::protocol::generated::codecs::ord_status::OrdStatus::NullVal => {
-                        panic!("null order status")
-                    }
-                },
-                reject_reason: match decoder.reject_reason() {
-                    wire_reject_reason::RejectReason::None => RejectReason::None,
-                    wire_reject_reason::RejectReason::Malformed => RejectReason::Malformed,
-                    wire_reject_reason::RejectReason::UnknownOrder => RejectReason::UnknownOrder,
-                    wire_reject_reason::RejectReason::InvalidPrice => RejectReason::InvalidPrice,
-                    wire_reject_reason::RejectReason::InvalidQuantity => RejectReason::InvalidQuantity,
-                    wire_reject_reason::RejectReason::RiskOpenOrderLimit => RejectReason::RiskOpenOrderLimit,
-                    wire_reject_reason::RejectReason::RiskNotionalLimit => RejectReason::RiskNotionalLimit,
-                    wire_reject_reason::RejectReason::PriceBand => RejectReason::PriceBand,
-                    wire_reject_reason::RejectReason::SelfTradePrevention => RejectReason::SelfTradePrevention,
-                    wire_reject_reason::RejectReason::KillSwitchActive => RejectReason::KillSwitchActive,
-                    wire_reject_reason::RejectReason::HeartbeatLost => RejectReason::HeartbeatLost,
-                    wire_reject_reason::RejectReason::NullVal => panic!("null reject reason"),
-                },
-                fill_price: if decoder.fill_price() == 0 {
-                    None
-                } else {
-                    Some(price(decoder.fill_price()))
-                },
-                fill_qty: decoder.fill_qty(),
-                remaining_qty: decoder.remaining_qty(),
-            });
+            reports.push(decode_execution_report_frame(&frame));
         }
         reports
+    }
+
+    fn read_file_execution_reports(path: &Path) -> Vec<ExecutionReport> {
+        let mut file = std::fs::File::open(path).expect("gateway output");
+        let mut reports = Vec::new();
+        loop {
+            let mut len = [0_u8; 4];
+            match file.read_exact(&mut len) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => panic!("read output len: {error:?}"),
+            }
+            let mut frame = vec![0_u8; u32::from_le_bytes(len) as usize];
+            file.read_exact(&mut frame).expect("read output frame");
+            if decode_header(&frame).expect("gateway header").kind == MessageKind::ExecutionReport {
+                reports.push(decode_execution_report_frame(&frame));
+            }
+        }
+        reports
+    }
+
+    fn decode_execution_report_frame(frame: &[u8]) -> ExecutionReport {
+        let decoder = execution_report_codec::ExecutionReportDecoder::default().wrap(
+            ReadBuf::new(frame),
+            SBE_HEADER_LEN,
+            execution_report_codec::SBE_BLOCK_LENGTH,
+            SCHEMA_VERSION,
+        );
+        ExecutionReport {
+            engine_seq: crate::domain::EngineSeq::new(decoder.engine_seq()),
+            client_order_id: OrderId::new(decoder.client_order_id()).expect("order"),
+            account_id: AccountId::new(decoder.account_id()).expect("account"),
+            exec_type: match decoder.exec_type() {
+                crate::protocol::generated::codecs::exec_type::ExecType::New => ExecType::New,
+                crate::protocol::generated::codecs::exec_type::ExecType::Trade => ExecType::Trade,
+                crate::protocol::generated::codecs::exec_type::ExecType::Canceled => ExecType::Canceled,
+                crate::protocol::generated::codecs::exec_type::ExecType::Replaced => ExecType::Replaced,
+                crate::protocol::generated::codecs::exec_type::ExecType::Rejected => ExecType::Rejected,
+                crate::protocol::generated::codecs::exec_type::ExecType::Expired => ExecType::Expired,
+                crate::protocol::generated::codecs::exec_type::ExecType::NullVal => panic!("null exec type"),
+            },
+            ord_status: match decoder.ord_status() {
+                crate::protocol::generated::codecs::ord_status::OrdStatus::New => OrdStatus::New,
+                crate::protocol::generated::codecs::ord_status::OrdStatus::PartiallyFilled => OrdStatus::PartiallyFilled,
+                crate::protocol::generated::codecs::ord_status::OrdStatus::Filled => OrdStatus::Filled,
+                crate::protocol::generated::codecs::ord_status::OrdStatus::Canceled => OrdStatus::Canceled,
+                crate::protocol::generated::codecs::ord_status::OrdStatus::Replaced => OrdStatus::Replaced,
+                crate::protocol::generated::codecs::ord_status::OrdStatus::Rejected => OrdStatus::Rejected,
+                crate::protocol::generated::codecs::ord_status::OrdStatus::Expired => OrdStatus::Expired,
+                crate::protocol::generated::codecs::ord_status::OrdStatus::NullVal => panic!("null order status"),
+            },
+            reject_reason: match decoder.reject_reason() {
+                wire_reject_reason::RejectReason::None => RejectReason::None,
+                wire_reject_reason::RejectReason::Malformed => RejectReason::Malformed,
+                wire_reject_reason::RejectReason::UnknownOrder => RejectReason::UnknownOrder,
+                wire_reject_reason::RejectReason::InvalidPrice => RejectReason::InvalidPrice,
+                wire_reject_reason::RejectReason::InvalidQuantity => RejectReason::InvalidQuantity,
+                wire_reject_reason::RejectReason::RiskOpenOrderLimit => RejectReason::RiskOpenOrderLimit,
+                wire_reject_reason::RejectReason::RiskNotionalLimit => RejectReason::RiskNotionalLimit,
+                wire_reject_reason::RejectReason::PriceBand => RejectReason::PriceBand,
+                wire_reject_reason::RejectReason::SelfTradePrevention => RejectReason::SelfTradePrevention,
+                wire_reject_reason::RejectReason::KillSwitchActive => RejectReason::KillSwitchActive,
+                wire_reject_reason::RejectReason::HeartbeatLost => RejectReason::HeartbeatLost,
+                wire_reject_reason::RejectReason::NullVal => panic!("null reject reason"),
+            },
+            fill_price: if decoder.fill_price() == 0 {
+                None
+            } else {
+                Some(price(decoder.fill_price()))
+            },
+            fill_qty: decoder.fill_qty(),
+            remaining_qty: decoder.remaining_qty(),
+        }
     }
 
     fn assert_no_control_frame(client: &mut TcpStream) {
@@ -1067,37 +1079,68 @@ mod tests {
 
     #[test]
     fn heartbeat_timeout_starts_after_first_heartbeat() {
-        let Some(bind_addr) = reserve_loopback_addr() else {
-            return;
-        };
-        let Some(control) = new_control_with_config(ControlConfig {
-            heartbeat_timeout_ns: 10,
-            io: IOConfig::Tcp {
-                bind_addr: bind_addr.to_string(),
-                max_frame_len: 4096,
-                max_pending_write_bytes: 1 << 20,
-                record_path: None,
-            },
-        }) else {
-            return;
-        };
-        let mut client = TcpStream::connect(bind_addr).expect("connect");
-        let Some((mut runtime, mut gateway_client)) = runtime_with_control_and_orders(
-            control,
-            [new_order(1_000_000_000, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10)],
-            risk_config(10, 1_000_000),
-        ) else {
-            return;
-        };
-        write_control(&mut client, &heartbeat(1));
+        let gateway_input = temp_path("heartbeat-gateway-input");
+        let gateway_output = temp_path("heartbeat-gateway-output");
+        {
+            let mut input = FileFrameIo::open(None, Some(gateway_input.clone()), 4096).expect("gateway input writer");
+            input
+                .record_input(&InputRecord {
+                    input_seq: 2,
+                    endpoint: Endpoint::Gateway,
+                    recv_ts: RecvTs::new(1_000_000_000),
+                    frame: order_entry_frame(new_order(1_000_000_000, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10)),
+                })
+                .expect("gateway record");
+            input.flush_pending().expect("flush gateway input");
+        }
 
-        poll_until_control(&mut runtime);
+        let control = ControlRuntime::new(ControlConfig {
+            heartbeat_timeout_ns: 10,
+            io: IOConfig::InMemory {
+                input: vec![InputRecord {
+                    input_seq: 1,
+                    endpoint: Endpoint::Control,
+                    recv_ts: RecvTs::new(1),
+                    frame: heartbeat(1),
+                }],
+                max_frame_len: 4096,
+            },
+        })
+        .expect("control");
+        let gateway = GatewayRuntime::new(
+            crate::gateway::GatewayConfig {
+                io: IOConfig::File {
+                    input_path: Some(gateway_input.clone()),
+                    output_path: Some(gateway_output.clone()),
+                    max_frame_len: 4096,
+                },
+                max_messages_per_poll: 1024,
+            },
+            instrument(),
+        )
+        .expect("gateway");
+        let mut runtime = Runtime::new(
+            Mode::Replay { expected_input_seq: 1 },
+            engine_config(),
+            risk_config(10, 1_000_000),
+            control,
+            gateway,
+            new_market_data().expect("market data"),
+            MetricsRuntime::noop(),
+        )
+        .expect("runtime");
+
+        assert!(runtime.poll_control().expect("poll control"));
         runtime.poll_gateway().expect("poll gateway");
-        let reports = read_execution_reports(&mut gateway_client, 1);
+        runtime.gateway.flush_pending().expect("flush gateway");
+        let reports = read_file_execution_reports(&gateway_output);
 
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].reject_reason, RejectReason::HeartbeatLost);
         assert_eq!(runtime.engine.resting_order_count(), 0);
+
+        let _ = std::fs::remove_file(gateway_input);
+        let _ = std::fs::remove_file(gateway_output);
     }
 
     #[test]
@@ -1197,5 +1240,134 @@ mod tests {
         assert!(runtime.terminal);
         assert_eq!(decode_header(&frame).expect("control header").kind, MessageKind::ControlResponse);
         assert_no_control_frame(&mut client);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// Writes a generated batch of gateway orders, then delivers a halt
+        /// control request before polling the gateway. The property checks that
+        /// runtime orchestration observes control before matching: every
+        /// risk-increasing order is rejected with KillSwitchActive, nothing
+        /// rests on the book, and execution report sequences still increase.
+        #[test]
+        fn property_halt_control_is_observed_before_generated_gateway_batch(qtys in prop::collection::vec(1_u64..50, 1..8)) {
+            let orders = qtys
+                .iter()
+                .enumerate()
+                .map(|(index, qty_raw)| new_order(index as u64 + 1, index as u32 + 1, Side::Buy, TimeInForce::Gtc, 1_000, *qty_raw))
+                .collect::<Vec<_>>();
+            let Some((mut runtime, mut client, mut gateway_client)) =
+                runtime_with_control_client_and_orders(orders, risk_config(100, 1_000_000))
+            else {
+                return Ok(());
+            };
+
+            write_control(&mut client, &kill_switch(KillSwitchAction::HaltTrading));
+            poll_until_control(&mut runtime);
+            runtime.poll_gateway().expect("poll gateway");
+            let reports = read_execution_reports(&mut gateway_client, qtys.len());
+
+            prop_assert_eq!(runtime.engine.resting_order_count(), 0);
+            prop_assert!(reports.iter().all(|report| report.reject_reason == RejectReason::KillSwitchActive));
+            prop_assert!(reports.windows(2).all(|pair| pair[0].engine_seq.raw() < pair[1].engine_seq.raw()));
+        }
+
+        /// Replays an already-serialized gateway stream that represents
+        /// interleaved submitters. The property checks that same-price maker
+        /// priority follows runtime ingress order, not client timestamps,
+        /// account IDs, receive timestamps, or client order IDs.
+        #[test]
+        fn property_serialized_gateway_ingress_defines_same_price_priority(
+            qtys in prop::collection::vec(1_u64..25, 2..8),
+            lane_count in 2_u32..5,
+            lane_offset in 0_u32..5,
+        ) {
+            let gateway_input = temp_path("serialized-ingress-gateway-input");
+            let gateway_output = temp_path("serialized-ingress-gateway-output");
+            let mut expected_maker_ids = Vec::with_capacity(qtys.len());
+            {
+                let mut input = FileFrameIo::open(None, Some(gateway_input.clone()), 4096).expect("gateway input writer");
+                for (index, qty_raw) in qtys.iter().copied().enumerate() {
+                    let maker_id = 10_000 - index as u64;
+                    expected_maker_ids.push(maker_id);
+                    let account = ((index as u32 + lane_offset) % lane_count) + 1;
+                    input
+                        .record_input(&InputRecord {
+                            input_seq: index as u64 + 1,
+                            endpoint: Endpoint::Gateway,
+                            recv_ts: RecvTs::new(1_000_000 - index as u64),
+                            frame: order_entry_frame(new_order(
+                                maker_id,
+                                account,
+                                Side::Sell,
+                                TimeInForce::Gtc,
+                                1_000,
+                                qty_raw,
+                            )),
+                        })
+                        .expect("maker record");
+                }
+                input
+                    .record_input(&InputRecord {
+                        input_seq: qtys.len() as u64 + 1,
+                        endpoint: Endpoint::Gateway,
+                        recv_ts: RecvTs::new(1),
+                        frame: order_entry_frame(new_order(
+                            20_000,
+                            99,
+                            Side::Buy,
+                            TimeInForce::Ioc,
+                            1_000,
+                            qtys.iter().sum(),
+                        )),
+                    })
+                    .expect("taker record");
+                input.flush_pending().expect("flush gateway input");
+            }
+
+            let control = ControlRuntime::new(ControlConfig {
+                heartbeat_timeout_ns: 0,
+                io: IOConfig::Noop,
+            })
+            .expect("control");
+            let gateway = GatewayRuntime::new(
+                crate::gateway::GatewayConfig {
+                    io: IOConfig::File {
+                        input_path: Some(gateway_input.clone()),
+                        output_path: Some(gateway_output.clone()),
+                        max_frame_len: 4096,
+                    },
+                    max_messages_per_poll: 1024,
+                },
+                instrument(),
+            )
+            .expect("gateway");
+            let mut runtime = Runtime::new(
+                Mode::Replay { expected_input_seq: 1 },
+                engine_config(),
+                risk_config(100, 10_000_000),
+                control,
+                gateway,
+                new_market_data().expect("market data"),
+                MetricsRuntime::noop(),
+            )
+            .expect("runtime");
+
+            runtime.run().expect("runtime");
+            runtime.gateway.flush_pending().expect("flush gateway");
+            let reports = read_file_execution_reports(&gateway_output);
+            let maker_trade_ids = reports
+                .iter()
+                .filter(|report| report.exec_type == ExecType::Trade && report.client_order_id.raw() != 20_000)
+                .map(|report| report.client_order_id.raw())
+                .collect::<Vec<_>>();
+
+            prop_assert_eq!(maker_trade_ids, expected_maker_ids);
+            prop_assert!(reports.windows(2).all(|pair| pair[0].engine_seq.raw() < pair[1].engine_seq.raw()));
+
+            let _ = std::fs::remove_file(gateway_input);
+            let _ = std::fs::remove_file(gateway_output);
+        }
     }
 }
