@@ -1,27 +1,27 @@
-reference_data:
-  instrument:
-    instrument_id: 1001 # BTC-USD
-    base_asset_id: 1 # BTC
-    quote_asset_id: 2 # USD
-    price_decimals: 2
-    qty_decimals: 8
-    price_tick: 1
-    qty_lot: 1
-engine:
-  storage_min_price: 1000000 # $10,000.00
-  storage_max_price: 25000000 # $250,000.00
-  page_size: 1024
-  max_resting_orders: 100000
-  max_account_id: 100000
-  max_active_pages: 4096
-risk:
-  max_open_orders_per_account: 1000
-  max_open_notional_per_account: 100000000000000000
-  startup_reference_price: 6500000 # $65,000.00
-  price_band_bps: 1000 # +/-10%
-runtime:
-  control:
-    heartbeat_timeout_ns: 0
-    max_messages_per_poll: 1024
-  gateway:
-    max_messages_per_poll: 1024
+reference_data: # Defines the instrument and numeric scales used by every runtime mode.
+  instrument: # Describes the single instrument matched by this server instance.
+    instrument_id: 1001 # Identifies BTC-USD internally without carrying a symbol string on each order.
+    base_asset_id: 1 # Identifies BTC as the asset represented by order quantities.
+    quote_asset_id: 2 # Identifies USD as the asset used to express prices.
+    price_decimals: 2 # Displays integer prices with two decimal places, so 6500000 means $65,000.00.
+    qty_decimals: 8 # Displays integer quantities with eight decimal places, so 100000000 means 1 BTC.
+    price_tick: 1 # Requires every price to move in multiples of one raw price unit.
+    qty_lot: 1 # Requires every quantity to move in multiples of one raw quantity unit.
+engine: # Sets the fixed storage bounds allocated for the in-memory order book.
+  storage_min_price: 1000000 # Sets the lowest representable book price to $10,000.00.
+  storage_max_price: 25000000 # Sets the highest representable book price to $250,000.00.
+  page_size: 1024 # Groups this many adjacent price ticks into each preallocated ladder page.
+  max_resting_orders: 100000 # Caps how many orders may rest on the book at the same time.
+  max_account_id: 100000 # Sets the highest account ID addressable by the dense account table.
+  max_active_pages: 4096 # Caps how many price pages each side of the book may activate at once.
+risk: # Configures deterministic checks applied before an order reaches matching.
+  max_open_orders_per_account: 1000 # Rejects an account whose projected resting-order count would exceed this value.
+  max_open_notional_per_account: 100000000000000000 # Rejects projected raw resting price-times-quantity exposure above this value.
+  startup_reference_price: 6500000 # Uses $65,000.00 as the price-band reference until the first trade occurs.
+  price_band_bps: 1000 # Allows prices within 1,000 basis points, or 10%, of the active reference price.
+runtime: # Controls how much ingress work the single-writer loop performs per poll.
+  control: # Tunes administrative command and heartbeat processing.
+    heartbeat_timeout_ns: 0 # Disables heartbeat rejection at zero; otherwise sets the allowed gap after the first heartbeat.
+    max_messages_per_poll: 1024 # Limits control frames handled before the runtime gives the gateway a turn.
+  gateway: # Tunes order-entry processing.
+    max_messages_per_poll: 1024 # Limits trading frames handled in one gateway poll to keep runtime phases bounded.

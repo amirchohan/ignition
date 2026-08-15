@@ -1,15 +1,15 @@
-control:
-  listen_addr: "127.0.0.1:19001"
-  max_pending_write_bytes: 1048576
-gateway:
-  listen_addr: "127.0.0.1:19000"
-  max_pending_write_bytes: 1048576
-market_data:
-  bind_addr: "0.0.0.0:0"
-  group_addr: "239.255.0.1:19002"
-  multicast_ttl: 1
-  multicast_loop_v4: true
-  max_pending_datagram_bytes: 1048576
-recording:
-  type: file
-  root_dir: "fixtures/replay/runs"
+control: # Configures the dedicated administrative TCP endpoint.
+  listen_addr: "127.0.0.1:19001" # Sets the local address on which the server accepts one control connection.
+  max_pending_write_bytes: 1048576 # Disconnects the control client if queued responses exceed this byte limit.
+gateway: # Configures the dedicated order-entry and execution-report TCP endpoint.
+  listen_addr: "127.0.0.1:19000" # Sets the local address on which the server accepts one trading connection.
+  max_pending_write_bytes: 1048576 # Disconnects the trading client if queued reports exceed this byte limit.
+market_data: # Configures the outbound UDP multicast feed.
+  bind_addr: "0.0.0.0:0" # Binds the publishing socket to any local interface and an operating-system-selected port.
+  group_addr: "239.255.0.1:19002" # Sets the multicast group and port that receive trade, L1, and L2 messages.
+  multicast_ttl: 1 # Restricts multicast packets to the local network segment.
+  multicast_loop_v4: true # Allows clients on this host to receive the server's multicast packets.
+  max_pending_datagram_bytes: 1048576 # Fails publication if queued multicast datagrams exceed this byte limit.
+recording: # Selects whether accepted live input is persisted for deterministic replay.
+  type: file # Records control and gateway frames to files; use noop to disable recording.
+  root_dir: "fixtures/replay/runs" # Stores each recorded run and its manifest beneath this directory.

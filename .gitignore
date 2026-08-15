@@ -24,8 +24,8 @@
 /fixtures/replay/runs/*
 
 # Preserve the documented golden replay fixture
-!/fixtures/replay/runs/1786693693/
-!/fixtures/replay/runs/1786693693/**
+!/fixtures/replay/runs/1786831955/
+!/fixtures/replay/runs/1786831955/**
 
 # Temporary files
 *.tmp

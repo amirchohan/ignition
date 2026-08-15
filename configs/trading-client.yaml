@@ -1,14 +1,14 @@
-core_config_path: "configs/server.yaml"
-gateway_addr: "127.0.0.1:19000"
-market_data:
-  bind_addr: "0.0.0.0:19002"
-  group_addr: "239.255.0.1:19002"
-synthetic_traffic:
-  # type: noop
-  type: binance
-  symbol: "btcusdt"
-  levels: 20
-  speed_ms: 100
-  reconnect_backoff_ms: 1000
-  buys_account_id: 1
-  sells_account_id: 2
+core_config_path: "configs/server.yaml" # Loads the server's instrument scales so commands encode valid prices and quantities.
+gateway_addr: "127.0.0.1:19000" # Connects order entry and execution-report handling to this TCP address.
+market_data: # Configures the multicast receiver used by the trading client.
+  bind_addr: "0.0.0.0:19002" # Listens for market-data datagrams on this local address and port.
+  group_addr: "239.255.0.1:19002" # Joins this multicast group to receive trade, L1, and L2 messages.
+synthetic_traffic: # Selects and configures an optional source of automatically generated order flow.
+  # Set type to noop and remove the Binance-only fields below to disable synthetic traffic.
+  type: binance # Mirrors Binance depth updates into synthetic Ignition orders.
+  symbol: "btcusdt" # Subscribes to this Binance market symbol.
+  levels: 20 # Requests this many Binance depth levels on each side of the book.
+  speed_ms: 100 # Requests a Binance depth update interval of this many milliseconds.
+  reconnect_backoff_ms: 1000 # Waits this long after a failed connection attempt before retrying.
+  buys_account_id: 1 # Assigns synthetic bid orders to this Ignition account.
+  sells_account_id: 2 # Assigns synthetic ask orders to this Ignition account.

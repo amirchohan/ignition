@@ -20,7 +20,7 @@ core:
   risk:
     max_open_orders_per_account: 1000
     max_open_notional_per_account: 100000000000000000
-    startup_reference_price: 7000000
+    startup_reference_price: 6500000
     price_band_bps: 1000
   runtime:
     control:

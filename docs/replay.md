@@ -92,19 +92,19 @@ artifacts. A run is invalid if neither control nor gateway input exists.
 Replay a run with:
 
 ```bash
-just replay 1786693693
+just replay 1786831955
 ```
 
 The direct command is:
 
 ```bash
-cargo run --bin replay -- --run fixtures/replay/runs/1786693693
+cargo run --bin replay -- --run fixtures/replay/runs/1786831955
 ```
 
 Docker can replay the checked-in run without a local Rust toolchain:
 
 ```bash
-REPLAY_RUN=1786693693 docker compose run --rm replay
+REPLAY_RUN=1786831955 docker compose run --rm replay
 ```
 
 Every invocation creates the next four-digit output directory without
@@ -130,7 +130,7 @@ emitted.
 Compare every numbered output after `0001` with the baseline:
 
 ```bash
-just replay-compare 1786693693
+just replay-compare 1786831955
 ```
 
 The script compares control, gateway, and market-data files with `cmp`. A file
@@ -141,13 +141,16 @@ The checked-in `0001` and `0002` outputs currently share these SHA-256 values:
 
 | Output | SHA-256 |
 | --- | --- |
-| `control.bin` | `de587a9a345d3b3b798c07ef66013e3bebc4bc4fc26a04b5c237f79b3fb0fdd3` |
-| `gateway.bin` | `ef352b73e1b5ecb5ebe39b0a41654fb222a26b29c9d5074d362dd9a3ca34b89b` |
-| `market_data.bin` | `f0b53a90145f1ae56d84631adfb2ae51ad3e5df352e41c826d6b12f8126e2dda` |
+| `control.bin` | `6110add72a6e81a436e86a2f9e0f0ecfd8d1e45697167cfcd4e8caef783a058d` |
+| `gateway.bin` | `7ef2557dbb6dc2e31bfe37d669fc35177c30625e6ae7294e986185d61807a216` |
+| `market_data.bin` | `ecf651fb945db42a171381f934385c31b5ef6fc5b89eef651ff8734a38340558` |
 
-The fixture exercises passive bids/asks, an aggressive IOC trade, cancel,
-mass cancel, control output, execution reports, and market data through the
-normal runtime boundary.
+The fixture exercises passive limit orders, replacement and cancellation,
+an aggressive market IOC, fills and trade prints, L1/L2 publication,
+heartbeats, and a 40-order control snapshot through the normal runtime
+boundary. It does not exercise post-only orders, mass cancel, or kill-switch
+behaviour; those policies are covered by deterministic tests rather than this
+recorded live run.
 
 ## Why Snapshot Is Not a Replay Seed
 

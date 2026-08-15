@@ -59,6 +59,6 @@ services:
 
   replay:
     build: .
-    command: ["replay", "--run", "fixtures/replay/runs/${REPLAY_RUN:-1786693693}"]
+    command: ["replay", "--run", "fixtures/replay/runs/${REPLAY_RUN:-1786831955}"]
     volumes:
       - ./fixtures/replay/runs:/app/fixtures/replay/runs

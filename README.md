@@ -33,6 +33,8 @@ docker compose run --rm control-client
 The default live endpoints are gateway TCP `127.0.0.1:19000`, control TCP
 `127.0.0.1:19001`, and market-data multicast UDP `239.255.0.1:19002`.
 
+For a richer demo, `trading-client` currently consumes Binance market data and generates buy orders for account 1 and sell orders for account 2; manual order entry remains available, and automatic order generation can be disabled by setting `synthetic_traffic.type` to `noop` in `configs/trading-client.yaml`.
+
 ## Documentation
 
 | I want to understand… | Read |
@@ -51,7 +53,7 @@ The SBE XML schema is the byte-level protocol source of truth:
 ## Common Commands
 
 ```bash
-just replay-compare 1786693693
+just replay-compare 1786831955
 just bench
 cargo test
 ```

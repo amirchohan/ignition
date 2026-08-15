@@ -1,4 +1,4 @@
-core_config_path: "configs/server.yaml"
-control_addr: "127.0.0.1:19001"
-heartbeat_interval_ms: 1000
-max_snapshot_rows: 200
+core_config_path: "configs/server.yaml" # Loads the server's instrument definition for decoding snapshot prices and quantities.
+control_addr: "127.0.0.1:19001" # Connects control commands, heartbeats, and snapshots to this TCP address.
+heartbeat_interval_ms: 1000 # Sends one control heartbeat after this many milliseconds have elapsed.
+max_snapshot_rows: 200 # Limits how many snapshot order rows the client retains and displays.
