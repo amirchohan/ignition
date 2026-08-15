@@ -70,8 +70,10 @@ frames or write output frames during the measured run. Output egress is counted
 in memory.
 
 Latency samples are recorded into an HDR histogram from inside the gateway frame
-handler. The timer starts when the complete frame is handed to gateway decoding
-and stops after execution report emission/queueing for that frame. The
+handler and stop after execution report emission/queueing for that frame. Burst
+samples start when the complete frame is handed to gateway decoding, so they
+measure service time. Open-loop samples start at the frame's scheduled arrival,
+so they include any time spent overdue before the gateway can process it. The
 benchmark prints p50, p99, p99.9, p99.99, and max latency in nanoseconds.
 
 Burst mode is the default and releases all pre-generated frames as fast as the
@@ -81,22 +83,21 @@ does not shift later deadlines: overdue frames are released immediately until
 the runtime catches up. This prevents the input schedule from waiting for each
 response before deciding when to send the next order.
 
-Open-loop output includes the configured target rate, the expected inter-arrival
-interval, the raw HDR histogram, and a post-corrected HDR histogram created with
-that interval. The corrected histogram adds the samples that a response-paced
-measurement would otherwise omit during a long operation. Correction happens
-after allocation counters are captured and is therefore excluded from the
-reported hot-path allocation count.
+Open-loop output includes the configured target rate, expected inter-arrival
+interval, and one scheduled-arrival-to-report histogram. Every generated order
+contributes a sample from its intended arrival, so backlog delay is observed
+directly instead of estimated with post-hoc coordinated-omission correction.
 
 Warmup runs before the measured run. Allocation counters are reset immediately
 before the measured run, so reported allocations exclude workload generation,
 runtime construction, and warmup. The measured hot path should report zero
 allocation calls once buffers and book storage are preallocated.
 
-The raw latency timer measures frame handling, not TCP transport or client-side
-round-trip time. Open-loop scheduling and HDR correction are benchmark-only;
-they do not introduce wall-clock time into matching, replay records, or protocol
-output.
+The runtime-owned monotonic `Clock` supplies one nanosecond timebase to benchmark
+scheduling and metrics. Scheduled arrival metadata remains benchmark-local and
+does not replace deterministic receive timestamps or enter matching, replay
+records, or protocol output. Neither mode measures TCP transport or client-side
+round-trip time.
 
 ## Local Result
 
@@ -133,7 +134,7 @@ orders: 100000
 warmup_orders: 10000
 throughput_orders_per_sec: 687802
 
-latency_ns:
+latency_ns_service_time:
   p50: 1700
   p99: 2559
   p99.9: 11079

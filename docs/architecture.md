@@ -126,7 +126,9 @@ The intended flow is:
 `Runtime` owns one monotonic `Clock` and passes it to live control and gateway
 ingress, benchmark scheduling, and metrics. Live receive timestamps are
 nanoseconds from that runtime origin; replay bypasses live timestamp sampling
-and reuses the values stored with each recorded input frame.
+and reuses the values stored with each recorded input frame. Scheduled benchmark
+ingress carries its intended arrival on the same clock to gateway metrics, while
+keeping that benchmark-only timing metadata out of replay and protocol state.
 
 Replay and benchmark traffic exercise the same protocol/runtime boundary as
 live clients, using file and in-memory I/O backends instead of privileged engine

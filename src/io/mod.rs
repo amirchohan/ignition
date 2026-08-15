@@ -34,6 +34,15 @@ pub use in_memory::{InMemoryFrameIo, InMemoryFramePublisher};
 pub use tcp::{TcpFrameIo, TcpFramePublisher};
 pub use udp::{UdpFramePublisher, UdpMulticastConfig};
 
+/// Metric start policy attached to one inbound frame inside the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameLatencyStart {
+    /// Start timing when the gateway handler receives the frame.
+    HandlerEntry,
+    /// Start timing at this benchmark-scheduled arrival on the runtime clock.
+    Scheduled(u64),
+}
+
 /// Runtime-owned endpoint IO adapter.
 #[derive(Debug)]
 pub struct IORuntime {
@@ -115,13 +124,27 @@ impl IORuntime {
     where
         F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
-        self.poll_inner(clock, mode, on_frame, None)
+        self.poll_inner(clock, mode, adapt_untimed_callback(on_frame), None)
     }
 
     /// Poll inbound frames with a maximum number of frames accepted this call.
     pub fn poll_bounded<F, E>(&mut self, clock: &Clock, mode: &mut Mode, on_frame: F, max_frames: usize) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
+    {
+        self.poll_inner(clock, mode, adapt_untimed_callback(on_frame), Some(max_frames))
+    }
+
+    /// Poll bounded ingress while preserving benchmark arrival-time metadata.
+    pub(crate) fn poll_bounded_with_timing<F, E>(
+        &mut self,
+        clock: &Clock,
+        mode: &mut Mode,
+        on_frame: F,
+        max_frames: usize,
+    ) -> Result<bool, FramePollError<E>>
+    where
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
     {
         self.poll_inner(clock, mode, on_frame, Some(max_frames))
     }
@@ -134,7 +157,7 @@ impl IORuntime {
         max_frames: Option<usize>,
     ) -> Result<bool, FramePollError<E>>
     where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
     {
         if matches!(&self.backend, IOBackend::Tcp(_)) {
             self.poll_tcp(clock, mode, on_frame, max_frames)
@@ -156,7 +179,7 @@ impl IORuntime {
         max_frames: Option<usize>,
     ) -> Result<bool, FramePollError<E>>
     where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
     {
         let IOBackend::Tcp(io) = &mut self.backend else {
             return Ok(false);
@@ -185,7 +208,7 @@ impl IORuntime {
             // Endpoint code sees an endpoint-neutral publisher, not the
             // concrete TCP transport object.
             let mut publisher = IOPublisher::Tcp(publisher.reborrow());
-            on_frame(&mut publisher, recv_ts, bytes).map_err(RuntimeFrameError::Handler)
+            on_frame(&mut publisher, recv_ts, FrameLatencyStart::HandlerEntry, bytes).map_err(RuntimeFrameError::Handler)
         };
 
         // TCP owns connection handling and frame assembly. This layer adds
@@ -204,7 +227,7 @@ impl IORuntime {
 
     fn poll_file<F, E>(&mut self, mode: &mut Mode, mut on_frame: F) -> Result<bool, FramePollError<E>>
     where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
     {
         let IOBackend::File(io) = &mut self.backend else {
             return Ok(false);
@@ -235,7 +258,7 @@ impl IORuntime {
         // safe to consume and deliver to endpoint code.
         let record = io.take_peeked().expect("peeked record");
         let mut publisher = IOPublisher::File(FileFramePublisher::new(io));
-        on_frame(&mut publisher, record.recv_ts, &record.frame).map_err(FramePollError::Handler)?;
+        on_frame(&mut publisher, record.recv_ts, FrameLatencyStart::HandlerEntry, &record.frame).map_err(FramePollError::Handler)?;
         io.flush_pending().map_err(FramePollError::Io)?;
 
         // Replay advances only after the endpoint handled the frame.
@@ -251,12 +274,12 @@ impl IORuntime {
         max_frames: Option<usize>,
     ) -> Result<bool, FramePollError<E>>
     where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
     {
         let IOBackend::InMemory(io) = &mut self.backend else {
             return Ok(false);
         };
-        io.poll(clock, self.endpoint, mode, &mut on_frame, max_frames)
+        io.poll_with_timing(clock, self.endpoint, mode, &mut on_frame, max_frames)
     }
 
     /// Queue one outbound frame through this endpoint backend.
@@ -303,6 +326,13 @@ impl IORuntime {
             IOBackend::Noop | IOBackend::Udp(_) | IOBackend::File(_) | IOBackend::InMemory(_) => Err(IoError::ReplayExpectedInLive),
         }
     }
+}
+
+fn adapt_untimed_callback<F, E>(mut on_frame: F) -> impl FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>
+where
+    F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
+{
+    move |publisher, recv_ts, _, frame| on_frame(publisher, recv_ts, frame)
 }
 
 fn flatten_poll_error<E>(result: Result<bool, FramePollError<RuntimeFrameError<E>>>) -> Result<bool, FramePollError<E>> {

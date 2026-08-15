@@ -85,11 +85,6 @@ impl Runtime {
         self.metrics.snapshot()
     }
 
-    /// Return post-run metrics corrected for the expected sample interval.
-    pub fn metrics_snapshot_corrected(&self, expected_interval_ns: u64) -> MetricsSnapshot {
-        self.metrics.snapshot_corrected(expected_interval_ns)
-    }
-
     /// Run the deterministic control-then-gateway phase loop until shutdown completes.
     pub fn run(&mut self) -> Result<(), RuntimeError> {
         tracing::info!("starting matching engine loop");

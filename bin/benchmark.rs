@@ -13,7 +13,7 @@
 //!
 //! Burst mode releases input as fast as the runtime can consume it. Open-loop
 //! mode releases input against absolute deadlines at a configured target rate
-//! and reports raw and coordinated-omission-corrected HDR percentiles.
+//! and measures every response from its scheduled arrival deadline.
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
@@ -83,12 +83,7 @@ fn run(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error::Err
     reset_allocations();
     runtime.run().map_err(runtime_error)?;
     let allocations = AllocationSnapshot::read();
-    let raw_metrics = runtime.metrics_snapshot();
-    let corrected_metrics = args
-        .schedule
-        .expected_interval_ns()
-        .map(|expected_interval_ns| runtime.metrics_snapshot_corrected(expected_interval_ns));
-    print_report(&args, raw_metrics, corrected_metrics, allocations, &environment);
+    print_report(&args, runtime.metrics_snapshot(), allocations, &environment);
     Ok(())
 }
 
@@ -570,19 +565,13 @@ impl EnvironmentSnapshot {
 }
 
 /// Print the benchmark result in a simple stable text format.
-fn print_report(
-    args: &BenchArgs,
-    raw_metrics: MetricsSnapshot,
-    corrected_metrics: Option<MetricsSnapshot>,
-    allocations: AllocationSnapshot,
-    environment: &EnvironmentSnapshot,
-) {
-    let throughput = if raw_metrics.measured_elapsed_ns == 0 {
+fn print_report(args: &BenchArgs, metrics: MetricsSnapshot, allocations: AllocationSnapshot, environment: &EnvironmentSnapshot) {
+    let throughput = if metrics.measured_elapsed_ns == 0 {
         0.0
     } else {
-        raw_metrics.measured_samples as f64 / (raw_metrics.measured_elapsed_ns as f64 / 1_000_000_000.0)
+        metrics.measured_samples as f64 / (metrics.measured_elapsed_ns as f64 / 1_000_000_000.0)
     };
-    let allocs_per_order = allocations.calls as f64 / raw_metrics.measured_samples.max(1) as f64;
+    let allocs_per_order = allocations.calls as f64 / metrics.measured_samples.max(1) as f64;
 
     println!("environment:");
     println!("  cpu_model: {}", environment.cpu_model);
@@ -610,16 +599,11 @@ fn print_report(
     println!("warmup_orders: {}", args.warmup_orders);
     println!("throughput_orders_per_sec: {:.0}", throughput);
     println!();
-    let raw_label = if corrected_metrics.is_some() {
-        "latency_ns_raw"
-    } else {
-        "latency_ns"
+    let latency_label = match args.schedule {
+        Schedule::Burst => "latency_ns_service_time",
+        Schedule::OpenLoop { .. } => "latency_ns_scheduled_arrival_to_report",
     };
-    print_latency(raw_label, raw_metrics);
-    if let Some(corrected_metrics) = corrected_metrics {
-        println!();
-        print_latency("latency_ns_coordinated_omission_corrected", corrected_metrics);
-    }
+    print_latency(latency_label, metrics);
     println!();
     println!("allocations:");
     println!("  calls: {}", allocations.calls);

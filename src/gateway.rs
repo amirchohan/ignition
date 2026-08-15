@@ -25,7 +25,7 @@ use crate::{
         rd::InstrumentSpec,
         trading::order::{AccountId, ExecType, ExecutionReport, OrdStatus, OrderEntry, OrderId},
     },
-    io::{Endpoint, FramePollError, IOConfig, IOPublisher, IORuntime, IoError},
+    io::{Endpoint, FrameLatencyStart, FramePollError, IOConfig, IOPublisher, IORuntime, IoError},
     metrics::MetricsRuntime,
     protocol::{
         ProtocolError,
@@ -170,10 +170,10 @@ impl GatewayRuntime {
             on_order: &mut on_order,
             handled_frame: false,
         };
-        let io_progress = match self.io.poll_bounded(
+        let io_progress = match self.io.poll_bounded_with_timing(
             clock,
             mode,
-            |io_publisher, recv_ts, bytes| session.on_frame(io_publisher, recv_ts, bytes),
+            |io_publisher, recv_ts, latency_start, bytes| session.on_frame(io_publisher, recv_ts, latency_start, bytes),
             self.max_messages_per_poll,
         ) {
             Ok(progress) => progress,
@@ -232,8 +232,17 @@ impl<F, E> GatewaySession<'_, F>
 where
     F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), E>,
 {
-    fn on_frame(&mut self, io_publisher: &mut IOPublisher<'_>, recv_ts: RecvTs, bytes: &[u8]) -> Result<(), GatewayPollError<E>> {
-        let time = self.metrics.start_clock(self.clock);
+    fn on_frame(
+        &mut self,
+        io_publisher: &mut IOPublisher<'_>,
+        recv_ts: RecvTs,
+        latency_start: FrameLatencyStart,
+        bytes: &[u8],
+    ) -> Result<(), GatewayPollError<E>> {
+        let time = match latency_start {
+            FrameLatencyStart::HandlerEntry => self.metrics.start_clock(self.clock),
+            FrameLatencyStart::Scheduled(start_ns) => self.metrics.start_clock_at(start_ns),
+        };
         self.handled_frame = true;
         let mut publisher = GatewayPublisher {
             io: io_publisher,
@@ -366,6 +375,7 @@ mod tests {
     use super::*;
     use crate::{
         domain::{EngineSeq, trading::order::NewOrder},
+        io::InputRecord,
         protocol::{
             MessageKind, SBE_HEADER_LEN, SCHEMA_VERSION, decode_header, encode_header,
             generated::codecs::{
@@ -505,6 +515,59 @@ mod tests {
         assert_eq!(decoder.client_order_id(), 11);
         assert_eq!(decoder.account_id(), 22);
         assert_eq!(decoder.remaining_qty(), 10);
+    }
+
+    #[test]
+    fn scheduled_gateway_latency_includes_backlog_before_report_emission() {
+        let frame = new_order_frame(10);
+        let records = vec![
+            InputRecord {
+                input_seq: 1,
+                endpoint: Endpoint::Gateway,
+                recv_ts: RecvTs::new(1),
+                frame: frame.clone(),
+            },
+            InputRecord {
+                input_seq: 2,
+                endpoint: Endpoint::Gateway,
+                recv_ts: RecvTs::new(2),
+                frame,
+            },
+        ];
+        let mut gateway = GatewayRuntime::new(
+            GatewayConfig {
+                io: IOConfig::ScheduledInMemory {
+                    input: records,
+                    max_frame_len: 4096,
+                    target_rate_per_sec: 1_000,
+                },
+                max_messages_per_poll: 2,
+            },
+            instrument(),
+        )
+        .expect("gateway");
+        let clock = Clock::new();
+        let mut mode = crate::runtime::Mode::Replay { expected_input_seq: 1 };
+        let mut sequencer = Sequencer::default();
+        let mut metrics = MetricsRuntime::in_memory(1);
+        let mut handled = 0_u64;
+
+        gateway
+            .poll(&clock, &mut mode, &mut sequencer, &mut metrics, |entry, publisher, sequencer| {
+                handled += 1;
+                if handled == 1 {
+                    thread::sleep(Duration::from_millis(8));
+                }
+                let OrderEntry::NewOrder(order) = entry else {
+                    panic!("new order");
+                };
+                publisher.publish_execution_report(ack_report(order, sequencer.next_engine_seq()?))
+            })
+            .expect("poll");
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.measured_samples, 1);
+        assert!(snapshot.p50_ns >= 5_000_000);
     }
 
     #[test]

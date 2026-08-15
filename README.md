@@ -162,7 +162,7 @@ A smaller smoke run:
 cargo run --release --bin benchmark -- --orders 10000 --warmup 1000 --workload mixed
 ```
 
-An open-loop run with coordinated-omission-corrected HDR reporting:
+An open-loop run with scheduled-arrival-to-report HDR latency:
 
 ```bash
 just bench-open-loop 100000
@@ -179,8 +179,9 @@ SCHEDULE=open-loop TARGET_RATE=100000 docker compose run --rm benchmark
 The benchmark reports p50, p99, p99.9, p99.99, max latency, throughput, and
 measured allocation counts for the order-entry-to-execution-report hot path.
 Burst mode remains the default. Open-loop mode schedules arrivals independently
-of response time and reports both raw and coordinated-omission-corrected HDR
-percentiles. Methodology and local observed numbers are in `BENCH.md`.
+of response time and measures each order from its intended arrival, directly
+including backlog delay without post-hoc coordinated-omission correction.
+Methodology and local observed numbers are in `BENCH.md`.
 
 ## Microstructure Notes
 

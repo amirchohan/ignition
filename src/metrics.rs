@@ -37,9 +37,14 @@ impl MetricsRuntime {
 
     /// Start one timing sample.
     pub fn start_clock(&self, clock: &Clock) -> MetricsTime {
+        self.start_clock_at(clock.now_ns())
+    }
+
+    /// Start one timing sample at a timestamp from the runtime clock.
+    pub(crate) fn start_clock_at(&self, start_ns: u64) -> MetricsTime {
         match self.backend {
             MetricsBackend::Noop => MetricsTime::Noop,
-            MetricsBackend::InMemory => MetricsTime::Started(clock.now_ns()),
+            MetricsBackend::InMemory => MetricsTime::Started(start_ns),
         }
     }
 
@@ -56,14 +61,6 @@ impl MetricsRuntime {
         match self.backend {
             MetricsBackend::Noop => MetricsSnapshot::default(),
             MetricsBackend::InMemory => self.metrics.snapshot(),
-        }
-    }
-
-    /// Return a post-run snapshot corrected for coordinated omission.
-    pub fn snapshot_corrected(&self, expected_interval_ns: u64) -> MetricsSnapshot {
-        match self.backend {
-            MetricsBackend::Noop => MetricsSnapshot::default(),
-            MetricsBackend::InMemory => self.metrics.snapshot_corrected(expected_interval_ns),
         }
     }
 }
@@ -125,23 +122,14 @@ impl Metrics {
     }
 
     fn snapshot(&self) -> MetricsSnapshot {
-        self.snapshot_from(&self.histogram)
-    }
-
-    fn snapshot_corrected(&self, expected_interval_ns: u64) -> MetricsSnapshot {
-        let histogram = self.histogram.clone_correct(expected_interval_ns);
-        self.snapshot_from(&histogram)
-    }
-
-    fn snapshot_from(&self, histogram: &Histogram<u64>) -> MetricsSnapshot {
         MetricsSnapshot {
             warmup_samples: self.warmup_samples,
             measured_samples: self.measured_samples,
-            p50_ns: percentile(histogram, 50.0),
-            p99_ns: percentile(histogram, 99.0),
-            p999_ns: percentile(histogram, 99.9),
-            p9999_ns: percentile(histogram, 99.99),
-            max_ns: histogram.max(),
+            p50_ns: percentile(&self.histogram, 50.0),
+            p99_ns: percentile(&self.histogram, 99.0),
+            p999_ns: percentile(&self.histogram, 99.9),
+            p9999_ns: percentile(&self.histogram, 99.99),
+            max_ns: self.histogram.max(),
             measured_elapsed_ns: match (self.first_measured_start_ns, self.last_measured_end_ns) {
                 (Some(start_ns), Some(end_ns)) => end_ns.saturating_sub(start_ns),
                 _ => 0,
@@ -202,17 +190,15 @@ mod tests {
     }
 
     #[test]
-    fn corrected_snapshot_adds_expected_interval_samples() {
+    fn scheduled_start_records_queue_delay_directly() {
         let mut metrics = MetricsRuntime::in_memory(0);
-        metrics.metrics.record(0, 100);
+        metrics.metrics.record(1_000, 4_000);
 
-        let raw = metrics.snapshot();
-        let corrected = metrics.snapshot_corrected(10);
+        let snapshot = metrics.snapshot();
 
-        assert_eq!(raw.measured_samples, 1);
-        assert_eq!(raw.measured_elapsed_ns, 100);
-        assert_eq!(corrected.measured_samples, 1);
-        assert!(corrected.p50_ns < raw.p50_ns);
-        assert_eq!(corrected.max_ns, raw.max_ns);
+        assert_eq!(snapshot.measured_samples, 1);
+        assert_eq!(snapshot.measured_elapsed_ns, 3_000);
+        assert!(snapshot.p50_ns >= 3_000);
+        assert!(snapshot.max_ns >= snapshot.p50_ns);
     }
 }

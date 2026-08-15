@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::{clock::Clock, domain::RecvTs, runtime::Mode};
 
-use super::{Endpoint, FramePollError, IOPublisher, InputRecord, IoError};
+use super::{Endpoint, FrameLatencyStart, FramePollError, IOPublisher, InputRecord, IoError};
 
 /// In-memory frame IO used by benchmarks to remove TCP and disk from measured latency.
 #[derive(Debug)]
@@ -63,6 +63,26 @@ impl InMemoryFrameIo {
     where
         F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
+        self.poll_with_timing(
+            clock,
+            endpoint,
+            mode,
+            |publisher, recv_ts, _, frame| on_frame(publisher, recv_ts, frame),
+            max_frames,
+        )
+    }
+
+    pub(crate) fn poll_with_timing<F, E>(
+        &mut self,
+        clock: &Clock,
+        endpoint: Endpoint,
+        mode: &mut Mode,
+        mut on_frame: F,
+        max_frames: Option<usize>,
+    ) -> Result<bool, FramePollError<E>>
+    where
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
+    {
         let mut frames = 0_usize;
         let mut made_progress = false;
         loop {
@@ -74,7 +94,7 @@ impl InMemoryFrameIo {
                 return Ok(made_progress);
             }
 
-            self.schedule.wait_until_due(clock, self.cursor);
+            let latency_start = self.schedule.wait_until_due(clock, self.cursor);
             let record = &self.input[self.cursor];
 
             if record.input_seq != mode.expected_replay_input_seq().map_err(FramePollError::Io)? {
@@ -93,7 +113,7 @@ impl InMemoryFrameIo {
                 &mut self.output_bytes,
                 self.max_frame_len,
             ));
-            on_frame(&mut publisher, record.recv_ts, &record.frame).map_err(FramePollError::Handler)?;
+            on_frame(&mut publisher, record.recv_ts, latency_start, &record.frame).map_err(FramePollError::Handler)?;
             mode.accept_replay_frame(record.input_seq).map_err(FramePollError::Io)?;
             self.cursor += 1;
             frames += 1;
@@ -151,7 +171,7 @@ enum InputSchedule {
 }
 
 impl InputSchedule {
-    fn wait_until_due(&mut self, clock: &Clock, input_index: usize) {
+    fn wait_until_due(&mut self, clock: &Clock, input_index: usize) -> FrameLatencyStart {
         const SPIN_WINDOW: Duration = Duration::from_micros(50);
 
         let Self::OpenLoop {
@@ -159,17 +179,18 @@ impl InputSchedule {
             started_at_ns,
         } = self
         else {
-            return;
+            return FrameLatencyStart::HandlerEntry;
         };
         let start_ns = *started_at_ns.get_or_insert_with(|| clock.now_ns());
         let due_offset_ns = scheduled_offset_ns(input_index as u64, *target_rate_per_sec);
+        let due_ns = start_ns.saturating_add(due_offset_ns);
 
         loop {
-            let elapsed_ns = clock.now_ns().saturating_sub(start_ns);
-            if elapsed_ns >= due_offset_ns {
-                return;
+            let now_ns = clock.now_ns();
+            if now_ns >= due_ns {
+                return FrameLatencyStart::Scheduled(due_ns);
             }
-            let remaining = Duration::from_nanos(due_offset_ns - elapsed_ns);
+            let remaining = Duration::from_nanos(due_ns - now_ns);
             if remaining > SPIN_WINDOW {
                 std::thread::sleep(remaining - SPIN_WINDOW);
             } else {
@@ -243,6 +264,34 @@ mod tests {
     }
 
     #[test]
+    fn burst_input_uses_handler_entry_latency_start() {
+        let clock = Clock::new();
+        let records = vec![InputRecord {
+            input_seq: 1,
+            endpoint: Endpoint::Gateway,
+            recv_ts: RecvTs::new(1),
+            frame: vec![1],
+        }];
+        let mut io = InMemoryFrameIo::new(records, 128);
+        let mut mode = Mode::Replay { expected_input_seq: 1 };
+        let mut latency_start = None;
+
+        io.poll_with_timing(
+            &clock,
+            Endpoint::Gateway,
+            &mut mode,
+            |_, _, observed, _| {
+                latency_start = Some(observed);
+                Ok::<(), std::convert::Infallible>(())
+            },
+            Some(1),
+        )
+        .expect("poll");
+
+        assert_eq!(latency_start, Some(FrameLatencyStart::HandlerEntry));
+    }
+
+    #[test]
     fn scheduled_input_waits_for_absolute_arrival_deadlines() {
         let clock = Clock::new();
         let records = vec![
@@ -276,5 +325,51 @@ mod tests {
 
         assert!(clock.now_ns().saturating_sub(started_ns) >= 5_000_000);
         assert_eq!(mode, Mode::Replay { expected_input_seq: 3 });
+    }
+
+    #[test]
+    fn overdue_input_preserves_its_original_scheduled_arrival() {
+        let clock = Clock::new();
+        let records = vec![
+            InputRecord {
+                input_seq: 1,
+                endpoint: Endpoint::Gateway,
+                recv_ts: RecvTs::new(1),
+                frame: vec![1],
+            },
+            InputRecord {
+                input_seq: 2,
+                endpoint: Endpoint::Gateway,
+                recv_ts: RecvTs::new(2),
+                frame: vec![2],
+            },
+        ];
+        let mut io = InMemoryFrameIo::new_scheduled(records, 128, 1_000).expect("scheduled io");
+        let mut mode = Mode::Replay { expected_input_seq: 1 };
+        let mut arrivals = Vec::new();
+
+        io.poll_with_timing(
+            &clock,
+            Endpoint::Gateway,
+            &mut mode,
+            |_, _, latency_start, _| {
+                arrivals.push((latency_start, clock.now_ns()));
+                if arrivals.len() == 1 {
+                    std::thread::sleep(Duration::from_millis(8));
+                }
+                Ok::<(), std::convert::Infallible>(())
+            },
+            Some(2),
+        )
+        .expect("poll");
+
+        let FrameLatencyStart::Scheduled(first_due_ns) = arrivals[0].0 else {
+            panic!("first scheduled arrival");
+        };
+        let FrameLatencyStart::Scheduled(second_due_ns) = arrivals[1].0 else {
+            panic!("second scheduled arrival");
+        };
+        assert_eq!(second_due_ns - first_due_ns, 1_000_000);
+        assert!(arrivals[1].1.saturating_sub(second_due_ns) >= 5_000_000);
     }
 }
