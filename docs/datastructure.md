@@ -55,6 +55,16 @@ This gives predictable hot-path behavior:
   endpoint buffers and book storage are preallocated.
 - GTC orders remain valid inside the fixed storage envelope even if risk price
   bands move later.
+- Resting insertion preflights the shared order arena and side-local page pool
+  before reserving either resource, so capacity pressure cannot leak an arena
+  slot or partially link an order.
+
+Capacity projection considers the command's actual storage requirement. Market
+and IOC orders never need a resting slot; fully executable GTC orders do not
+either. A crossing GTC with residual quantity may reuse a slot released by a
+fully consumed maker. Priority-losing replacements also account for the
+original slot and for a source page that becomes empty when the original is
+removed.
 
 The dynamic price band/fat-finger policy belongs in the risk/control layer, not
 inside the matching data structure. The matching engine only rejects prices

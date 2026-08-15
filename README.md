@@ -86,6 +86,13 @@ The kill switch is observed before risk and matching for risk-increasing
 commands. Cancels and mass cancels remain available while halted so accounts can
 reduce exposure.
 
+Resting-order and active-page limits are operational bounds. If a new order or
+priority-losing replacement would exceed either bound, it is atomically rejected
+with `KillSwitchActive`. The runtime then performs the existing graceful
+shutdown policy: deterministically drain the book, flush execution and market
+data output, and terminate. No separate capacity reject value or wire-schema
+change is exposed to clients.
+
 ## Running
 
 Format and lint:

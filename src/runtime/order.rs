@@ -4,7 +4,7 @@ use crate::{
         RecvTs, RejectReason, Sequencer,
         trading::order::{ExecType, ExecutionReport, OrdStatus, OrderEntry},
     },
-    engine::{Engine, EngineError},
+    engine::{CapacityResource, Engine, EngineError, EngineExecution},
     gateway::GatewayPublisher,
     market_data::MarketDataRuntime,
     risk::{RiskDecision, RiskRuntime},
@@ -14,6 +14,12 @@ use super::RuntimeError;
 
 /// Order-entry processor for the runtime gateway phase.
 pub(super) struct OrderProcessor;
+
+/// Runtime action produced by processing one normalized order command.
+pub(super) enum OrderProcessOutcome {
+    Continue,
+    GracefulShutdown(CapacityResource),
+}
 
 impl OrderProcessor {
     /// Apply control gating, risk checks, matching, and report publication for one order entry.
@@ -25,7 +31,7 @@ impl OrderProcessor {
         reports: &mut GatewayPublisher<'_, '_>,
         market_data: &mut MarketDataRuntime,
         entry: OrderEntry,
-    ) -> Result<(), RuntimeError> {
+    ) -> Result<OrderProcessOutcome, RuntimeError> {
         let mut emit_report = |report| reports.emit_execution_report(report);
 
         // Only new orders and replaces can add risk. Cancels must keep working
@@ -35,28 +41,33 @@ impl OrderProcessor {
             if reason != RejectReason::None {
                 Self::reject_order_entry(sequencer, &mut emit_report, entry, reason)?;
                 market_data.check_deferred_error()?;
-                return Ok(());
+                return Ok(OrderProcessOutcome::Continue);
             }
         }
 
-        match risk.evaluate(entry, engine) {
+        let outcome = match risk.evaluate(entry, engine) {
             RiskDecision::Accept => {
                 // Accepted orders are handed to the book, which publishes
                 // execution reports and any market-data updates it creates.
-                engine.execute(entry, sequencer, market_data, &mut emit_report)?;
+                let outcome = engine.execute(entry, sequencer, market_data, &mut emit_report)?;
                 if let Some(price) = market_data.take_reference_price_update() {
                     risk.observe_trade_price(price);
+                }
+                match outcome {
+                    EngineExecution::Processed => OrderProcessOutcome::Continue,
+                    EngineExecution::CapacityExceeded(resource) => OrderProcessOutcome::GracefulShutdown(resource),
                 }
             }
             RiskDecision::Reject(reason) => {
                 // Risk rejects still get a sequenced execution report.
                 Self::reject_order_entry(sequencer, &mut emit_report, entry, reason)?;
+                OrderProcessOutcome::Continue
             }
-        }
+        };
 
         // surface any deferred market-data write failure before the next order.
         market_data.check_deferred_error()?;
-        Ok(())
+        Ok(outcome)
     }
 
     /// Publish a sequenced reject report without changing book state.

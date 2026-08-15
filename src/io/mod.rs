@@ -43,6 +43,20 @@ pub(crate) enum FrameLatencyStart {
     Scheduled(u64),
 }
 
+/// Per-frame control returned by an endpoint handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FramePollControl {
+    Continue,
+    Stop,
+}
+
+/// Aggregate result of one controlled ingress poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FramePollStatus {
+    pub(crate) progress: bool,
+    pub(crate) stopped: bool,
+}
+
 /// Runtime-owned endpoint IO adapter.
 #[derive(Debug)]
 pub struct IORuntime {
@@ -135,18 +149,18 @@ impl IORuntime {
         self.poll_inner(clock, mode, adapt_untimed_callback(on_frame), Some(max_frames))
     }
 
-    /// Poll bounded ingress while preserving benchmark arrival-time metadata.
-    pub(crate) fn poll_bounded_with_timing<F, E>(
+    /// Poll bounded ingress and stop after a successfully handled frame on request.
+    pub(crate) fn poll_bounded_controlled_with_timing<F, E>(
         &mut self,
         clock: &Clock,
         mode: &mut Mode,
         on_frame: F,
         max_frames: usize,
-    ) -> Result<bool, FramePollError<E>>
+    ) -> Result<FramePollStatus, FramePollError<E>>
     where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
     {
-        self.poll_inner(clock, mode, on_frame, Some(max_frames))
+        self.poll_inner_controlled(clock, mode, on_frame, Some(max_frames))
     }
 
     fn poll_inner<F, E>(
@@ -159,30 +173,50 @@ impl IORuntime {
     where
         F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
     {
+        self.poll_inner_controlled(clock, mode, adapt_controlled_callback(on_frame), max_frames)
+            .map(|status| status.progress)
+    }
+
+    fn poll_inner_controlled<F, E>(
+        &mut self,
+        clock: &Clock,
+        mode: &mut Mode,
+        on_frame: F,
+        max_frames: Option<usize>,
+    ) -> Result<FramePollStatus, FramePollError<E>>
+    where
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
+    {
         if matches!(&self.backend, IOBackend::Tcp(_)) {
-            self.poll_tcp(clock, mode, on_frame, max_frames)
+            self.poll_tcp_controlled(clock, mode, on_frame, max_frames)
         } else if matches!(&self.backend, IOBackend::File(_)) {
-            self.poll_file(mode, on_frame)
+            self.poll_file_controlled(mode, on_frame)
         } else if matches!(&self.backend, IOBackend::InMemory(_)) {
-            self.poll_in_memory(clock, mode, on_frame, max_frames)
+            self.poll_in_memory_controlled(clock, mode, on_frame, max_frames)
         } else {
             // These backends do not produce inbound frames here.
-            Ok(false)
+            Ok(FramePollStatus {
+                progress: false,
+                stopped: false,
+            })
         }
     }
 
-    fn poll_tcp<F, E>(
+    fn poll_tcp_controlled<F, E>(
         &mut self,
         clock: &Clock,
         mode: &mut Mode,
         mut on_frame: F,
         max_frames: Option<usize>,
-    ) -> Result<bool, FramePollError<E>>
+    ) -> Result<FramePollStatus, FramePollError<E>>
     where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
     {
         let IOBackend::Tcp(io) = &mut self.backend else {
-            return Ok(false);
+            return Ok(FramePollStatus {
+                progress: false,
+                stopped: false,
+            });
         };
 
         let endpoint = self.endpoint;
@@ -214,35 +248,45 @@ impl IORuntime {
         // TCP owns connection handling and frame assembly. This layer adds
         // sequencing, optional recording, and endpoint dispatch.
         let result = match max_frames {
-            Some(max_frames) => io.poll_bounded(clock, &mut callback, max_frames),
-            None => io.poll(clock, &mut callback),
+            Some(max_frames) => io.poll_bounded_controlled(clock, &mut callback, max_frames),
+            None => io.poll_controlled(clock, &mut callback),
         };
-        let progress = flatten_poll_error(result)?;
+        let mut status = flatten_controlled_poll_error(result)?;
         let record_progress = match recorder.as_mut() {
             Some(recorder) => recorder.flush_pending().map_err(FramePollError::Io)?,
             None => false,
         };
-        Ok(progress || record_progress)
+        status.progress |= record_progress;
+        Ok(status)
     }
 
-    fn poll_file<F, E>(&mut self, mode: &mut Mode, mut on_frame: F) -> Result<bool, FramePollError<E>>
+    fn poll_file_controlled<F, E>(&mut self, mode: &mut Mode, mut on_frame: F) -> Result<FramePollStatus, FramePollError<E>>
     where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
     {
         let IOBackend::File(io) = &mut self.backend else {
-            return Ok(false);
+            return Ok(FramePollStatus {
+                progress: false,
+                stopped: false,
+            });
         };
 
         // Replay peeks first so this endpoint does not consume a frame that
         // belongs to another endpoint or a later input sequence.
         let Some(record) = io.peek_record().map_err(FramePollError::Io)?.cloned() else {
-            return Ok(false);
+            return Ok(FramePollStatus {
+                progress: false,
+                stopped: false,
+            });
         };
 
         // If this is not the next global input, another endpoint must run
         // first. Returning no progress lets the runtime poll it.
         if record.input_seq != mode.expected_replay_input_seq().map_err(FramePollError::Io)? {
-            return Ok(false);
+            return Ok(FramePollStatus {
+                progress: false,
+                stopped: false,
+            });
         }
 
         // A matching sequence with the wrong endpoint means the replay file was
@@ -258,28 +302,35 @@ impl IORuntime {
         // safe to consume and deliver to endpoint code.
         let record = io.take_peeked().expect("peeked record");
         let mut publisher = IOPublisher::File(FileFramePublisher::new(io));
-        on_frame(&mut publisher, record.recv_ts, FrameLatencyStart::HandlerEntry, &record.frame).map_err(FramePollError::Handler)?;
+        let control =
+            on_frame(&mut publisher, record.recv_ts, FrameLatencyStart::HandlerEntry, &record.frame).map_err(FramePollError::Handler)?;
         io.flush_pending().map_err(FramePollError::Io)?;
 
         // Replay advances only after the endpoint handled the frame.
         mode.accept_replay_frame(record.input_seq).map_err(FramePollError::Io)?;
-        Ok(true)
+        Ok(FramePollStatus {
+            progress: true,
+            stopped: control == FramePollControl::Stop,
+        })
     }
 
-    fn poll_in_memory<F, E>(
+    fn poll_in_memory_controlled<F, E>(
         &mut self,
         clock: &Clock,
         mode: &mut Mode,
         mut on_frame: F,
         max_frames: Option<usize>,
-    ) -> Result<bool, FramePollError<E>>
+    ) -> Result<FramePollStatus, FramePollError<E>>
     where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
     {
         let IOBackend::InMemory(io) = &mut self.backend else {
-            return Ok(false);
+            return Ok(FramePollStatus {
+                progress: false,
+                stopped: false,
+            });
         };
-        io.poll_with_timing(clock, self.endpoint, mode, &mut on_frame, max_frames)
+        io.poll_controlled_with_timing(clock, self.endpoint, mode, &mut on_frame, max_frames)
     }
 
     /// Queue one outbound frame through this endpoint backend.
@@ -335,9 +386,23 @@ where
     move |publisher, recv_ts, _, frame| on_frame(publisher, recv_ts, frame)
 }
 
-fn flatten_poll_error<E>(result: Result<bool, FramePollError<RuntimeFrameError<E>>>) -> Result<bool, FramePollError<E>> {
+fn adapt_controlled_callback<F, E>(
+    mut on_frame: F,
+) -> impl FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>
+where
+    F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
+{
+    move |publisher, recv_ts, latency_start, frame| {
+        on_frame(publisher, recv_ts, latency_start, frame)?;
+        Ok(FramePollControl::Continue)
+    }
+}
+
+fn flatten_controlled_poll_error<E>(
+    result: Result<FramePollStatus, FramePollError<RuntimeFrameError<E>>>,
+) -> Result<FramePollStatus, FramePollError<E>> {
     match result {
-        Ok(progress) => Ok(progress),
+        Ok(status) => Ok(status),
         Err(FramePollError::Io(error)) => Err(FramePollError::Io(error)),
         Err(FramePollError::Handler(RuntimeFrameError::Io(error))) => Err(FramePollError::Io(error)),
         Err(FramePollError::Handler(RuntimeFrameError::Handler(error))) => Err(FramePollError::Handler(error)),

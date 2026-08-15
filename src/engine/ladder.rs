@@ -63,6 +63,14 @@ impl Bitmap {
         self.words.iter().any(|word| *word != 0)
     }
 
+    /// Return whether `bit` is the only occupied position.
+    fn contains_only(&self, bit: usize) -> bool {
+        self.words.iter().enumerate().all(|(word_index, word)| {
+            let expected = if word_index == bit / 64 { 1_u64 << (bit % 64) } else { 0 };
+            *word == expected
+        })
+    }
+
     /// Find the lowest set bit at or after `bit`.
     fn next_set_from(&self, bit: usize) -> Option<usize> {
         let mut word_index = bit / 64;
@@ -225,6 +233,20 @@ impl SideLadder {
     pub(crate) fn get_level(&self, key: LevelKey) -> Option<&PriceLevel> {
         let page_handle = self.page_slots.get(key.page_index).and_then(|slot| *slot)?;
         self.page_pool.pages[page_handle].levels.get(key.offset)
+    }
+
+    /// Return whether `key` can be addressed without exhausting the active-page pool.
+    pub(crate) fn can_rest_at(&self, key: LevelKey) -> bool {
+        self.page_slots[key.page_index].is_some() || !self.page_pool.free.is_empty()
+    }
+
+    /// Return whether removing one order at `key` would release its active page.
+    pub(crate) fn page_released_after_removing_order(&self, key: LevelKey) -> bool {
+        let Some(page_handle) = self.page_slots[key.page_index] else {
+            return false;
+        };
+        let page = &self.page_pool.pages[page_handle];
+        page.levels[key.offset].order_count == 1 && page.occupied.contains_only(key.offset)
     }
 
     /// Return a mutable level, activating its page from the pool if needed.

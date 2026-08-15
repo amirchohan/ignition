@@ -10,7 +10,7 @@ use std::{
 
 use crate::{clock::Clock, domain::RecvTs, protocol::SBE_HEADER_LEN};
 
-use super::{FramePollError, IoError};
+use super::{FramePollControl, FramePollError, FramePollStatus, IoError};
 
 /// Raw frame publisher borrowed during transport polling.
 #[derive(Debug)]
@@ -170,12 +170,20 @@ impl TcpFrameIo {
         }
     }
 
-    fn read_available<F, E>(&mut self, clock: &Clock, mut on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
+    fn read_available_controlled<F, E>(
+        &mut self,
+        clock: &Clock,
+        mut on_frame: F,
+        max_frames: Option<usize>,
+    ) -> Result<FramePollStatus, FramePollError<E>>
     where
-        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
+        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>,
     {
         if self.active.is_none() {
-            return Ok(false);
+            return Ok(FramePollStatus {
+                progress: false,
+                stopped: false,
+            });
         }
 
         let mut made_progress = false;
@@ -183,25 +191,37 @@ impl TcpFrameIo {
         loop {
             let read_result = match self.active.as_mut() {
                 Some(stream) => stream.read(&mut buf),
-                None => return Ok(made_progress),
+                None => {
+                    return Ok(FramePollStatus {
+                        progress: made_progress,
+                        stopped: false,
+                    });
+                }
             };
             match read_result {
                 Ok(0) => {
                     self.disconnect_active();
-                    return Ok(true);
+                    return Ok(FramePollStatus {
+                        progress: true,
+                        stopped: false,
+                    });
                 }
                 Ok(read) => {
                     made_progress = true;
                     self.read_buf.extend_from_slice(&buf[..read]);
-                    if self.drain_complete_frames(clock, &mut on_frame, max_frames)? {
+                    let (return_from_poll, stopped) = self.drain_complete_frames_controlled(clock, &mut on_frame, max_frames)?;
+                    if return_from_poll {
                         self.compact_read_buf();
-                        return Ok(true);
+                        return Ok(FramePollStatus { progress: true, stopped });
                     }
                     self.compact_read_buf();
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     self.compact_read_buf();
-                    return Ok(made_progress);
+                    return Ok(FramePollStatus {
+                        progress: made_progress,
+                        stopped: false,
+                    });
                 }
                 Err(error) => {
                     self.disconnect_active();
@@ -211,9 +231,14 @@ impl TcpFrameIo {
         }
     }
 
-    fn drain_complete_frames<F, E>(&mut self, clock: &Clock, on_frame: &mut F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
+    fn drain_complete_frames_controlled<F, E>(
+        &mut self,
+        clock: &Clock,
+        on_frame: &mut F,
+        max_frames: Option<usize>,
+    ) -> Result<(bool, bool), FramePollError<E>>
     where
-        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
+        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>,
     {
         let Self {
             active,
@@ -229,10 +254,10 @@ impl TcpFrameIo {
         let mut frames = 0_usize;
         loop {
             if max_frames.is_some_and(|max_frames| frames >= max_frames) {
-                return Ok(true);
+                return Ok((true, false));
             }
             if read_buf.len() - *read_start < SBE_HEADER_LEN {
-                return Ok(false);
+                return Ok((false, false));
             }
             let block_len = u16::from_le_bytes([read_buf[*read_start], read_buf[*read_start + 1]]) as usize;
             let frame_len = SBE_HEADER_LEN + block_len;
@@ -248,7 +273,7 @@ impl TcpFrameIo {
                 }));
             }
             if read_buf.len() - *read_start < frame_len {
-                return Ok(false);
+                return Ok((false, false));
             }
 
             let frame_start = *read_start;
@@ -262,8 +287,11 @@ impl TcpFrameIo {
                 write_len,
                 max_pending_write_bytes: *max_pending_write_bytes,
             };
-            on_frame(&mut publisher, recv_ts, &read_buf[frame_start..frame_end]).map_err(FramePollError::Handler)?;
+            let control = on_frame(&mut publisher, recv_ts, &read_buf[frame_start..frame_end]).map_err(FramePollError::Handler)?;
             frames += 1;
+            if control == FramePollControl::Stop {
+                return Ok((true, true));
+            }
         }
     }
 
@@ -333,32 +361,61 @@ impl TcpFrameIo {
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
-        self.poll_inner(clock, on_frame, None)
+        self.poll_controlled(clock, adapt_controlled_callback(on_frame))
+            .map(|status| status.progress)
     }
 
     pub fn poll_bounded<F, E>(&mut self, clock: &Clock, on_frame: F, max_frames: usize) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
-        self.poll_inner(clock, on_frame, Some(max_frames))
+        self.poll_bounded_controlled(clock, adapt_controlled_callback(on_frame), max_frames)
+            .map(|status| status.progress)
     }
 
-    fn poll_inner<F, E>(&mut self, clock: &Clock, on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
+    pub(crate) fn poll_controlled<F, E>(&mut self, clock: &Clock, on_frame: F) -> Result<FramePollStatus, FramePollError<E>>
     where
-        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
+        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>,
+    {
+        self.poll_inner_controlled(clock, on_frame, None)
+    }
+
+    pub(crate) fn poll_bounded_controlled<F, E>(
+        &mut self,
+        clock: &Clock,
+        on_frame: F,
+        max_frames: usize,
+    ) -> Result<FramePollStatus, FramePollError<E>>
+    where
+        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>,
+    {
+        self.poll_inner_controlled(clock, on_frame, Some(max_frames))
+    }
+
+    fn poll_inner_controlled<F, E>(
+        &mut self,
+        clock: &Clock,
+        on_frame: F,
+        max_frames: Option<usize>,
+    ) -> Result<FramePollStatus, FramePollError<E>>
+    where
+        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>,
     {
         // First accept any waiting client so new input can be read this tick.
         let accepted = self.accept_available().map_err(FramePollError::Io)?;
 
         // Then read whatever bytes are available and call the handler for each
         // complete frame. Partial frames stay buffered for a later poll.
-        let read = self.read_available(clock, on_frame, max_frames)?;
+        let read = self.read_available_controlled(clock, on_frame, max_frames)?;
 
         // Finally push out anything endpoint code queued while handling input.
         let flushed = self.flush_writes().map_err(FramePollError::Io)?;
 
         // The scheduler only needs to know whether this poll did useful work.
-        Ok(accepted || read || flushed)
+        Ok(FramePollStatus {
+            progress: accepted || read.progress || flushed,
+            stopped: read.stopped,
+        })
     }
 
     pub fn publish(&mut self, frame: &[u8]) -> Result<(), IoError> {
@@ -381,6 +438,16 @@ impl TcpFrameIo {
             write_len: &mut self.write_len,
             max_pending_write_bytes: self.max_pending_write_bytes,
         }
+    }
+}
+
+fn adapt_controlled_callback<F, E>(mut on_frame: F) -> impl FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>
+where
+    F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
+{
+    move |publisher, recv_ts, frame| {
+        on_frame(publisher, recv_ts, frame)?;
+        Ok(FramePollControl::Continue)
     }
 }
 

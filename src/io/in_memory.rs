@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::{clock::Clock, domain::RecvTs, runtime::Mode};
 
-use super::{Endpoint, FrameLatencyStart, FramePollError, IOPublisher, InputRecord, IoError};
+use super::{Endpoint, FrameLatencyStart, FramePollControl, FramePollError, FramePollStatus, IOPublisher, InputRecord, IoError};
 
 /// In-memory frame IO used by benchmarks to remove TCP and disk from measured latency.
 #[derive(Debug)]
@@ -83,22 +83,55 @@ impl InMemoryFrameIo {
     where
         F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
     {
+        self.poll_controlled_with_timing(
+            clock,
+            endpoint,
+            mode,
+            |publisher, recv_ts, latency_start, frame| {
+                on_frame(publisher, recv_ts, latency_start, frame)?;
+                Ok(FramePollControl::Continue)
+            },
+            max_frames,
+        )
+        .map(|status| status.progress)
+    }
+
+    pub(crate) fn poll_controlled_with_timing<F, E>(
+        &mut self,
+        clock: &Clock,
+        endpoint: Endpoint,
+        mode: &mut Mode,
+        mut on_frame: F,
+        max_frames: Option<usize>,
+    ) -> Result<FramePollStatus, FramePollError<E>>
+    where
+        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
+    {
         let mut frames = 0_usize;
         let mut made_progress = false;
         loop {
             if max_frames.is_some_and(|max_frames| frames >= max_frames) {
-                return Ok(made_progress);
+                return Ok(FramePollStatus {
+                    progress: made_progress,
+                    stopped: false,
+                });
             }
 
             if self.input.get(self.cursor).is_none() {
-                return Ok(made_progress);
+                return Ok(FramePollStatus {
+                    progress: made_progress,
+                    stopped: false,
+                });
             }
 
             let latency_start = self.schedule.wait_until_due(clock, self.cursor);
             let record = &self.input[self.cursor];
 
             if record.input_seq != mode.expected_replay_input_seq().map_err(FramePollError::Io)? {
-                return Ok(made_progress);
+                return Ok(FramePollStatus {
+                    progress: made_progress,
+                    stopped: false,
+                });
             }
 
             if record.endpoint != endpoint {
@@ -113,11 +146,17 @@ impl InMemoryFrameIo {
                 &mut self.output_bytes,
                 self.max_frame_len,
             ));
-            on_frame(&mut publisher, record.recv_ts, latency_start, &record.frame).map_err(FramePollError::Handler)?;
+            let control = on_frame(&mut publisher, record.recv_ts, latency_start, &record.frame).map_err(FramePollError::Handler)?;
             mode.accept_replay_frame(record.input_seq).map_err(FramePollError::Io)?;
             self.cursor += 1;
             frames += 1;
             made_progress = true;
+            if control == FramePollControl::Stop {
+                return Ok(FramePollStatus {
+                    progress: true,
+                    stopped: true,
+                });
+            }
         }
     }
 
@@ -289,6 +328,46 @@ mod tests {
         .expect("poll");
 
         assert_eq!(latency_start, Some(FrameLatencyStart::HandlerEntry));
+    }
+
+    #[test]
+    fn controlled_poll_stops_after_accepting_the_triggering_record() {
+        let clock = Clock::new();
+        let records = (1..=2)
+            .map(|input_seq| InputRecord {
+                input_seq,
+                endpoint: Endpoint::Gateway,
+                recv_ts: RecvTs::new(input_seq),
+                frame: vec![input_seq as u8],
+            })
+            .collect();
+        let mut io = InMemoryFrameIo::new(records, 128);
+        let mut mode = Mode::Replay { expected_input_seq: 1 };
+        let mut handled = 0;
+
+        let status = io
+            .poll_controlled_with_timing(
+                &clock,
+                Endpoint::Gateway,
+                &mut mode,
+                |_, _, _, _| {
+                    handled += 1;
+                    Ok::<FramePollControl, std::convert::Infallible>(FramePollControl::Stop)
+                },
+                Some(2),
+            )
+            .expect("controlled poll");
+
+        assert_eq!(handled, 1);
+        assert_eq!(
+            status,
+            FramePollStatus {
+                progress: true,
+                stopped: true
+            }
+        );
+        assert_eq!(mode, Mode::Replay { expected_input_seq: 2 });
+        assert!(!io.input_exhausted());
     }
 
     #[test]

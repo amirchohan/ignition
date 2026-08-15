@@ -12,7 +12,7 @@ mod startup;
 pub use mode::Mode;
 pub use startup::RuntimeBuildError;
 
-use self::order::OrderProcessor;
+use self::order::{OrderProcessOutcome, OrderProcessor};
 use self::snapshot::SnapshotProcessor;
 use crate::{
     clock::Clock,
@@ -21,8 +21,8 @@ use crate::{
         Sequencer,
         control::{ControlRequest, KillSwitchAction},
     },
-    engine::{Engine, EngineConfig, EngineError},
-    gateway::{GatewayError, GatewayPollError, GatewayRuntime},
+    engine::{CapacityResource, Engine, EngineConfig, EngineError},
+    gateway::{GatewayError, GatewayPollControl, GatewayPollError, GatewayRuntime},
     io::IoError,
     market_data::{MarketDataError, MarketDataRuntime},
     metrics::{MetricsRuntime, MetricsSnapshot},
@@ -113,57 +113,40 @@ impl Runtime {
         let mut shutdown_requested = false;
         let mut handled_control_request = false;
 
-        let Runtime {
-            clock,
-            control,
-            gateway,
-            market_data,
-            risk,
-            engine,
-            sequencer,
-            metrics: _,
-            terminal,
-            mode,
-        } = self;
-        // poll every ready control frame before touching order entry. Normal
-        // control state is updated inside `ControlRuntime`; this closure only
-        // handles work that needs runtime-owned engine or market-data state.
-        let control_progress = control.poll(clock, mode, sequencer, |request, publisher, sequencer| {
-            handled_control_request = true;
-            match request {
-                ControlRequest::KillSwitch(request) => {
-                    // a shutdown request means "drain after this control batch."
-                    // Remember it here; the book work happens below, after the
-                    // control socket has finished reading the current frames.
-                    if request.action == KillSwitchAction::Shutdown {
-                        shutdown_requested = true;
+        let control_progress = {
+            let Runtime {
+                clock,
+                control,
+                market_data,
+                risk,
+                engine,
+                sequencer,
+                mode,
+                ..
+            } = self;
+            // poll every ready control frame before touching order entry. Normal
+            // control state is updated inside `ControlRuntime`; this closure only
+            // handles work that needs runtime-owned engine or market-data state.
+            control.poll(clock, mode, sequencer, |request, publisher, sequencer| {
+                handled_control_request = true;
+                match request {
+                    ControlRequest::KillSwitch(request) => {
+                        // a shutdown request means "drain after this control batch."
+                        if request.action == KillSwitchAction::Shutdown {
+                            shutdown_requested = true;
+                        }
+                    }
+                    ControlRequest::Heartbeat(_) => {}
+                    ControlRequest::Snapshot(snapshot) => {
+                        SnapshotProcessor::process(engine, risk, market_data, sequencer, publisher, snapshot)?;
                     }
                 }
-                ControlRequest::Heartbeat(_) => {}
-                ControlRequest::Snapshot(snapshot) => {
-                    SnapshotProcessor::process(engine, risk, market_data, sequencer, publisher, snapshot)?;
-                }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?
+        };
 
         if shutdown_requested {
-            // shutdown is terminal: cancel all resting orders, publish the
-            // resulting reports and market data, then stop the run loop.
-            {
-                let mut emit_report = |report| gateway.emit_execution_report(report);
-                engine.drain_all(sequencer, market_data, &mut emit_report)?;
-                if let Some(price) = market_data.take_reference_price_update() {
-                    risk.observe_trade_price(price);
-                }
-            }
-            // deferred sink errors are surfaced before the final flush so a
-            // failed drain cannot be hidden by marking the runtime terminal.
-            gateway.check_deferred_error()?;
-            market_data.check_deferred_error()?;
-            gateway.flush_pending()?;
-            market_data.flush_pending()?;
-            *terminal = true;
+            self.complete_shutdown()?;
             return Ok(true);
         }
 
@@ -173,39 +156,74 @@ impl Runtime {
     /// Poll order-entry ingress, matching output, and market-data egress.
     fn poll_gateway(&mut self) -> Result<bool, RuntimeError> {
         let mut handled_order = false;
-        let Runtime {
-            clock,
-            mode,
-            control,
-            gateway,
-            market_data,
-            risk,
-            engine,
-            sequencer,
-            metrics,
-            ..
-        } = self;
-        // the gateway may hand us several ready orders in one poll. Process
-        // them one at a time so reports, book changes, and market data stay in
-        // the same order as the incoming frames.
-        let gateway_progress = gateway
-            .poll(clock, mode, sequencer, metrics, |entry, publisher, sequencer| {
-                handled_order = true;
-                // the same sequencer is passed through the gateway callback so
-                // protocol rejects and engine reports share one monotonic stream.
-                OrderProcessor::process(control, risk, engine, sequencer, publisher, market_data, entry)?;
-                Ok::<(), RuntimeError>(())
-            })
-            .map_err(|error| match error {
-                GatewayPollError::Gateway(error) => RuntimeError::Gateway(error),
-                GatewayPollError::Handler(error) => error,
-            })?;
+        let mut capacity_shutdown = None;
+        let gateway_progress = {
+            let Runtime {
+                clock,
+                mode,
+                control,
+                gateway,
+                market_data,
+                risk,
+                engine,
+                sequencer,
+                metrics,
+                ..
+            } = self;
+            // Process frames in ingress order and stop the batch immediately
+            // after a capacity-triggering command has been fully accepted.
+            gateway
+                .poll_controlled(clock, mode, sequencer, metrics, |entry, publisher, sequencer| {
+                    handled_order = true;
+                    let outcome = OrderProcessor::process(control, risk, engine, sequencer, publisher, market_data, entry)?;
+                    Ok::<GatewayPollControl, RuntimeError>(match outcome {
+                        OrderProcessOutcome::Continue => GatewayPollControl::Continue,
+                        OrderProcessOutcome::GracefulShutdown(resource) => {
+                            capacity_shutdown = Some(resource);
+                            GatewayPollControl::Stop
+                        }
+                    })
+                })
+                .map_err(|error| match error {
+                    GatewayPollError::Gateway(error) => RuntimeError::Gateway(error),
+                    GatewayPollError::Handler(error) => error,
+                })?
+        };
+
+        if let Some(resource) = capacity_shutdown {
+            tracing::error!(
+                resource = capacity_resource_label(resource),
+                "book capacity exhausted; initiating graceful shutdown"
+            );
+            self.complete_shutdown()?;
+            return Ok(true);
+        }
 
         // Matching queues market-data packets while orders are processed. Flush
         // them before leaving the gateway phase so the next control poll sees a
         // fully published view of the work just completed.
-        let market_data_progress = market_data.flush_pending()?;
+        let market_data_progress = self.market_data.flush_pending()?;
         Ok(gateway_progress || market_data_progress || handled_order)
+    }
+
+    /// Drain book state and flush every resulting output before termination.
+    fn complete_shutdown(&mut self) -> Result<(), RuntimeError> {
+        {
+            let mut emit_report = |report| self.gateway.emit_execution_report(report);
+            self.engine
+                .drain_all(&mut self.sequencer, &mut self.market_data, &mut emit_report)?;
+            if let Some(price) = self.market_data.take_reference_price_update() {
+                self.risk.observe_trade_price(price);
+            }
+        }
+        // Deferred sink errors are surfaced before the final flush so a
+        // failed drain cannot be hidden by marking the runtime terminal.
+        self.gateway.check_deferred_error()?;
+        self.market_data.check_deferred_error()?;
+        self.gateway.flush_pending()?;
+        self.market_data.flush_pending()?;
+        self.terminal = true;
+        Ok(())
     }
 
     /// Handle a run-loop iteration that may have made no IO/runtime progress.
@@ -232,6 +250,13 @@ impl Runtime {
         // Live mode yields when both ingress endpoints are idle.
         std::thread::yield_now();
         Ok(true)
+    }
+}
+
+const fn capacity_resource_label(resource: CapacityResource) -> &'static str {
+    match resource {
+        CapacityResource::RestingOrders => "resting_orders",
+        CapacityResource::ActivePages => "active_pages",
     }
 }
 
@@ -367,7 +392,7 @@ mod tests {
 
     fn runtime_with_orders(orders: impl IntoIterator<Item = OrderEntry>, risk_config: RiskConfig) -> Option<(Runtime, TcpStream)> {
         let control = new_control()?;
-        runtime_with_control_and_orders(control, orders, risk_config)
+        runtime_with_control_and_orders(control, orders, risk_config, engine_config())
     }
 
     fn runtime_without_gateway_client(risk_config: RiskConfig) -> Option<Runtime> {
@@ -412,6 +437,7 @@ mod tests {
         control: ControlRuntime,
         orders: impl IntoIterator<Item = OrderEntry>,
         risk_config: RiskConfig,
+        engine_config: EngineConfig,
     ) -> Option<(Runtime, TcpStream)> {
         let market_data = new_market_data()?;
         let gateway_addr = reserve_loopback_addr()?;
@@ -439,7 +465,7 @@ mod tests {
         Some(
             Runtime::new(
                 Mode::default(),
-                engine_config(),
+                engine_config,
                 risk_config,
                 control,
                 gateway,
@@ -530,7 +556,7 @@ mod tests {
         })?;
         let client = TcpStream::connect(bind_addr).expect("connect");
         client.set_read_timeout(Some(Duration::from_secs(1))).expect("timeout");
-        let (runtime, gateway_client) = runtime_with_control_and_orders(control, orders, risk_config)?;
+        let (runtime, gateway_client) = runtime_with_control_and_orders(control, orders, risk_config, engine_config())?;
         Some((runtime, client, gateway_client))
     }
 
@@ -898,8 +924,8 @@ mod tests {
 
         assert!(made_progress);
         assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].engine_seq.raw(), 1);
-        assert_eq!(reports[1].engine_seq.raw(), 2);
+        assert_eq!(reports[0].engine_seq.raw(), 3);
+        assert_eq!(reports[1].engine_seq.raw(), 4);
         assert_eq!(reports[1].reject_reason, RejectReason::RiskOpenOrderLimit);
         assert_eq!(runtime.engine.resting_order_count(), 1);
     }
@@ -1297,6 +1323,42 @@ mod tests {
         assert_eq!(runtime.engine.resting_order_count(), 0);
         assert_eq!(reports.last().expect("drain cancel").reject_reason, RejectReason::None);
         assert_eq!(reports.last().expect("drain cancel").ord_status, OrdStatus::Canceled);
+    }
+
+    #[test]
+    fn capacity_pressure_rejects_trigger_drains_and_stops_buffered_ingress() {
+        let Some(control) = new_control() else {
+            return;
+        };
+        let capacity_config = EngineConfig::new(instrument(), 100, 10_000, 1024, 1, 100, 1).expect("capacity config");
+        let Some((mut runtime, mut gateway_client)) = runtime_with_control_and_orders(
+            control,
+            [
+                new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
+                new_order(2, 2, Side::Buy, TimeInForce::Gtc, 1_001, 10),
+                cancel(3, 1, 1),
+            ],
+            risk_config(10, 1_000_000),
+            capacity_config,
+        ) else {
+            return;
+        };
+
+        runtime.poll_gateway().expect("capacity shutdown");
+        let reports = read_execution_reports(&mut gateway_client, 3);
+
+        assert!(runtime.terminal);
+        assert_eq!(runtime.engine.resting_order_count(), 0);
+        assert_eq!(runtime.mode, Mode::Live { next_input_seq: 3 });
+        assert_eq!(
+            reports.iter().map(|report| report.client_order_id.raw()).collect::<Vec<_>>(),
+            vec![1, 2, 1]
+        );
+        assert_eq!(reports[1].exec_type, ExecType::Rejected);
+        assert_eq!(reports[1].ord_status, OrdStatus::Rejected);
+        assert_eq!(reports[1].reject_reason, RejectReason::KillSwitchActive);
+        assert_eq!(reports[2].exec_type, ExecType::Canceled);
+        assert!(reports.windows(2).all(|pair| pair[0].engine_seq.raw() < pair[1].engine_seq.raw()));
     }
 
     #[test]

@@ -25,7 +25,7 @@ use crate::{
         rd::InstrumentSpec,
         trading::order::{AccountId, ExecType, ExecutionReport, OrdStatus, OrderEntry, OrderId},
     },
-    io::{Endpoint, FrameLatencyStart, FramePollError, IOConfig, IOPublisher, IORuntime, IoError},
+    io::{Endpoint, FrameLatencyStart, FramePollControl, FramePollError, IOConfig, IOPublisher, IORuntime, IoError},
     metrics::MetricsRuntime,
     protocol::{
         ProtocolError,
@@ -117,6 +117,13 @@ pub struct GatewayRuntime {
     first_error: Option<GatewayError>,
 }
 
+/// Control returned by the runtime after one normalized order-entry frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatewayPollControl {
+    Continue,
+    Stop,
+}
+
 impl GatewayRuntime {
     /// Open the configured trading I/O and preallocate buffers.
     ///
@@ -161,6 +168,24 @@ impl GatewayRuntime {
     where
         F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), E>,
     {
+        self.poll_controlled(clock, mode, sequencer, metrics, |entry, publisher, sequencer| {
+            on_order(entry, publisher, sequencer)?;
+            Ok(GatewayPollControl::Continue)
+        })
+    }
+
+    /// Poll order entry until the frame budget is reached or the handler stops the batch.
+    pub(crate) fn poll_controlled<F, E>(
+        &mut self,
+        clock: &Clock,
+        mode: &mut crate::runtime::Mode,
+        sequencer: &mut Sequencer,
+        metrics: &mut MetricsRuntime,
+        mut on_order: F,
+    ) -> Result<bool, GatewayPollError<E>>
+    where
+        F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<GatewayPollControl, E>,
+    {
         let mut session = GatewaySession {
             encode_buf: &mut self.encode_buf,
             instrument: self.instrument,
@@ -170,7 +195,7 @@ impl GatewayRuntime {
             on_order: &mut on_order,
             handled_frame: false,
         };
-        let io_progress = match self.io.poll_bounded_with_timing(
+        let io_status = match self.io.poll_bounded_controlled_with_timing(
             clock,
             mode,
             |io_publisher, recv_ts, latency_start, bytes| session.on_frame(io_publisher, recv_ts, latency_start, bytes),
@@ -183,7 +208,7 @@ impl GatewayRuntime {
             Err(FramePollError::Handler(error)) => return Err(error),
         };
 
-        Ok(io_progress || session.handled_frame)
+        Ok(io_status.progress || session.handled_frame)
     }
 
     /// Flush queued order-entry egress outside normal polling.
@@ -230,7 +255,7 @@ struct GatewaySession<'a, F> {
 
 impl<F, E> GatewaySession<'_, F>
 where
-    F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), E>,
+    F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<GatewayPollControl, E>,
 {
     fn on_frame(
         &mut self,
@@ -238,7 +263,7 @@ where
         recv_ts: RecvTs,
         latency_start: FrameLatencyStart,
         bytes: &[u8],
-    ) -> Result<(), GatewayPollError<E>> {
+    ) -> Result<FramePollControl, GatewayPollError<E>> {
         let time = match latency_start {
             FrameLatencyStart::HandlerEntry => self.metrics.start_clock(self.clock),
             FrameLatencyStart::Scheduled(start_ns) => self.metrics.start_clock_at(start_ns),
@@ -250,17 +275,25 @@ where
             first_error: None,
         };
 
-        let result = match decode_order_entry(bytes) {
+        let control = match decode_order_entry(bytes) {
             Ok(wire) => match normalize_order_entry(wire, recv_ts, &self.instrument) {
-                Ok(entry) => (self.on_order)(entry, &mut publisher, self.sequencer).map_err(GatewayPollError::Handler),
-                Err(error) => publish_order_shape_reject(self.sequencer, wire, error.reject_reason(), &mut publisher),
+                Ok(entry) => (self.on_order)(entry, &mut publisher, self.sequencer).map_err(GatewayPollError::Handler)?,
+                Err(error) => {
+                    publish_order_shape_reject(self.sequencer, wire, error.reject_reason(), &mut publisher)?;
+                    GatewayPollControl::Continue
+                }
             },
-            Err(error) => publish_protocol_error(self.sequencer, error, bytes, recv_ts, &mut publisher),
+            Err(error) => {
+                publish_protocol_error(self.sequencer, error, bytes, recv_ts, &mut publisher)?;
+                GatewayPollControl::Continue
+            }
         };
-        result?;
         publisher.check_deferred_error().map_err(GatewayPollError::Gateway)?;
         self.metrics.stop_clock(self.clock, time);
-        Ok(())
+        Ok(match control {
+            GatewayPollControl::Continue => FramePollControl::Continue,
+            GatewayPollControl::Stop => FramePollControl::Stop,
+        })
     }
 }
 

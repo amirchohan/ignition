@@ -52,6 +52,14 @@ order would execute against resting liquidity from the same account, the
 incoming command is rejected with `SelfTradePrevention` before any trade or book
 mutation occurs. Resting orders are preserved.
 
+Configured book-capacity exhaustion uses the existing operational kill-switch
+surface rather than adding a public reject code. Before a new order or
+priority-losing replacement mutates the book, the engine projects whether its
+residual needs a resting-order slot and ladder page. If either bounded resource
+is unavailable, the command is rejected with `KillSwitchActive`; the runtime
+then drains resting orders, flushes outputs, and terminates gracefully. The
+triggering command itself emits no trades or market-data mutations.
+
 ## Cancels
 
 `CancelOrder` removes the original resting order when it is active for the same

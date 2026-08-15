@@ -44,6 +44,24 @@ pub struct Engine {
     accounts: AccountTable,
 }
 
+/// Result of one engine command needed by the owning runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineExecution {
+    /// Command completed without exhausting a bounded book resource.
+    Processed,
+    /// Command was rejected before mutation because a bounded resource was full.
+    CapacityExceeded(CapacityResource),
+}
+
+/// Fixed-capacity resource that prevented an order from resting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityResource {
+    /// Shared resting-order arena.
+    RestingOrders,
+    /// Side-local active ladder-page pool.
+    ActivePages,
+}
+
 /// Read-only resting-order view exposed across the engine boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RestingOrderView {
@@ -107,14 +125,86 @@ impl Engine {
         sequencer: &mut Sequencer,
         market_data: &mut MarketDataRuntime,
         emit_report: &mut impl FnMut(ExecutionReport),
-    ) -> Result<(), EngineError> {
+    ) -> Result<EngineExecution, EngineError> {
+        if let Some(resource) = self.capacity_pressure(entry) {
+            let rejected = match entry {
+                OrderEntry::NewOrder(order) => self.reject_new(order, RejectReason::KillSwitchActive, sequencer, emit_report),
+                OrderEntry::CancelReplace(replace) => self.reject_replace(replace, RejectReason::KillSwitchActive, sequencer, emit_report),
+                OrderEntry::CancelOrder(_) | OrderEntry::MassCancel(_) => unreachable!("cancel commands do not consume capacity"),
+            };
+            rejected.map_err(engine_error)?;
+            return Ok(EngineExecution::CapacityExceeded(resource));
+        }
+
         let result = match entry {
             OrderEntry::NewOrder(order) => self.on_new_order(order, sequencer, market_data, emit_report),
             OrderEntry::CancelOrder(cancel) => self.on_cancel_order(cancel, sequencer, market_data, emit_report),
             OrderEntry::CancelReplace(replace) => self.on_cancel_replace(replace, sequencer, market_data, emit_report),
             OrderEntry::MassCancel(cancel) => self.on_mass_cancel(cancel, sequencer, market_data, emit_report),
         };
-        result.map_err(engine_error)
+        result.map_err(engine_error)?;
+        Ok(EngineExecution::Processed)
+    }
+
+    /// Identify capacity pressure before a command can mutate the book.
+    fn capacity_pressure(&self, entry: OrderEntry) -> Option<CapacityResource> {
+        match entry {
+            OrderEntry::NewOrder(order) => self.new_order_capacity_pressure(order),
+            OrderEntry::CancelReplace(replace) => self.replace_capacity_pressure(replace),
+            OrderEntry::CancelOrder(_) | OrderEntry::MassCancel(_) => None,
+        }
+    }
+
+    fn new_order_capacity_pressure(&self, order: NewOrder) -> Option<CapacityResource> {
+        if !self.accounts.contains(order.account_id) || self.order_index.contains_key(&order.client_order_id) {
+            return None;
+        }
+        if order.order_type != OrderType::Limit || order.time_in_force == TimeInForce::Ioc {
+            return None;
+        }
+        let price = order.price?;
+        if !self.price_in_storage(price) || (order.time_in_force == TimeInForce::PostOnly && self.would_cross(order.side, order.price)) {
+            return None;
+        }
+
+        let projection = self.project_order(order.account_id, order.side, order.price, order.qty.raw());
+        if projection.residual_qty == 0 {
+            return None;
+        }
+
+        // A residual after any execution means every encountered maker was
+        // fully removed, so at least one shared arena slot will be reusable.
+        if !self.orders.has_free_slot() && projection.executable_qty == 0 {
+            return Some(CapacityResource::RestingOrders);
+        }
+
+        let key = self.side(order.side).key_for_price(price).ok()?;
+        (!self.side(order.side).can_rest_at(key)).then_some(CapacityResource::ActivePages)
+    }
+
+    fn replace_capacity_pressure(&self, replace: CancelReplace) -> Option<CapacityResource> {
+        if !self.price_in_storage(replace.price)
+            || (self.order_index.contains_key(&replace.client_order_id) && replace.client_order_id != replace.orig_client_order_id)
+        {
+            return None;
+        }
+        let handle = self.order_index.get(&replace.orig_client_order_id).copied()?;
+        let current = self.orders.get(handle).copied()?;
+        if current.account_id != replace.account_id || (current.price == replace.price && replace.qty.raw() <= current.remaining_qty) {
+            return None;
+        }
+
+        let projection = self.project_order(replace.account_id, current.side, Some(replace.price), replace.qty.raw());
+        if projection.residual_qty == 0 {
+            return None;
+        }
+
+        let target_key = self.side(current.side).key_for_price(replace.price).ok()?;
+        if self.side(current.side).can_rest_at(target_key) {
+            return None;
+        }
+        let source_key = self.side(current.side).key_for_price(current.price).ok()?;
+        (!self.side(current.side).page_released_after_removing_order(source_key)).then_some(CapacityResource::ActivePages)
     }
 
     /// Return the current best bid price and aggregate quantity.
@@ -700,6 +790,11 @@ impl Engine {
     /// Insert an order into the resting indexes.
     fn rest_order(&mut self, order_id: OrderId, account_id: AccountId, side: Side, price: Price, remaining_qty: u64) -> DomainResult<u64> {
         let key = self.side(side).key_for_price(price)?;
+        // Check both bounded resources before reserving either one. The engine
+        // is single-writer, so availability cannot change before insertion.
+        if !self.orders.has_free_slot() || !self.side(side).can_rest_at(key) {
+            return Err(DomainError::InvalidInstrumentSpec);
+        }
         let order = RestingOrder {
             order_id,
             account_id,
@@ -1494,8 +1589,12 @@ mod tests {
         }
 
         fn new_noop() -> Self {
+            Self::new_noop_with_config(config())
+        }
+
+        fn new_noop_with_config(engine_config: EngineConfig) -> Self {
             Self {
-                engine: Engine::new(config()).expect("engine"),
+                engine: Engine::new(engine_config).expect("engine"),
                 sequencer: Sequencer::default(),
                 market_data: MarketDataRuntime::new(MarketDataFeedConfig { io: IOConfig::Noop }).expect("market data"),
             }
@@ -1530,13 +1629,17 @@ mod tests {
         }
 
         fn execute(&mut self, entry: OrderEntry, events: &mut Vec<TradingEvent>, label: &str) {
+            let _ = self.execute_outcome(entry, events, label);
+        }
+
+        fn execute_outcome(&mut self, entry: OrderEntry, events: &mut Vec<TradingEvent>, label: &str) -> EngineExecution {
             events.clear();
             let mut emit_report = |report| {
                 events.push(report);
             };
             self.engine
                 .execute(entry, &mut self.sequencer, &mut self.market_data, &mut emit_report)
-                .expect(label);
+                .expect(label)
         }
 
         fn flush_market_data(&mut self) {
@@ -1792,6 +1895,175 @@ mod tests {
         assert_rows_are_in_book_order(&rows);
         assert_best_quotes_match_rows(engine, &rows);
         assert_account_aggregates_match_rows(engine);
+    }
+
+    fn capacity_config(max_resting_orders: u32, page_size: u32, max_active_pages: u32) -> EngineConfig {
+        EngineConfig::new(instrument(), 100, 10_000, page_size, max_resting_orders, 100, max_active_pages).expect("capacity config")
+    }
+
+    #[test]
+    fn full_order_arena_rejects_without_mutation_and_reuses_slot_after_cancel() {
+        let mut engine = TestEngine::new_noop_with_config(capacity_config(1, 1024, 2));
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1000), 10, 1),
+            &mut events,
+            "fill arena",
+        );
+        let before = resting_rows(&engine);
+
+        let outcome = engine.execute_outcome(
+            new_order(2, 2, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1001), 5, 2),
+            &mut events,
+            "capacity reject",
+        );
+
+        assert_eq!(outcome, EngineExecution::CapacityExceeded(CapacityResource::RestingOrders));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reject_reason, RejectReason::KillSwitchActive);
+        assert_eq!(resting_rows(&engine), before);
+        assert_core_book_invariants(&engine);
+
+        execute(&mut engine, cancel(3, 1, 1), &mut events, "cancel after pressure");
+        execute(
+            &mut engine,
+            new_order(4, 2, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1001), 5, 4),
+            &mut events,
+            "reuse slot",
+        );
+        assert_eq!(resting_rows(&engine)[0].0, 4);
+    }
+
+    #[test]
+    fn full_page_pool_rejects_without_leaking_the_reserved_order_slot() {
+        let mut engine = TestEngine::new_noop_with_config(capacity_config(2, 2, 1));
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1000), 10, 1),
+            &mut events,
+            "activate page",
+        );
+        let before = resting_rows(&engine);
+
+        let outcome = engine.execute_outcome(
+            new_order(2, 2, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1002), 5, 2),
+            &mut events,
+            "page reject",
+        );
+
+        assert_eq!(outcome, EngineExecution::CapacityExceeded(CapacityResource::ActivePages));
+        assert_eq!(events[0].reject_reason, RejectReason::KillSwitchActive);
+        assert_eq!(resting_rows(&engine), before);
+        assert_eq!(engine.account_open_order_count(2), Some(0));
+
+        execute(&mut engine, cancel(3, 1, 1), &mut events, "release page");
+        execute(
+            &mut engine,
+            new_order(4, 2, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1002), 5, 4),
+            &mut events,
+            "slot remains reusable",
+        );
+        assert_eq!(resting_rows(&engine)[0].0, 4);
+    }
+
+    #[test]
+    fn full_arena_allows_crossing_gtc_to_reuse_a_filled_maker_slot() {
+        let mut engine = TestEngine::new_noop_with_config(capacity_config(1, 1024, 1));
+        let mut events = Vec::new();
+        execute(
+            &mut engine,
+            new_order(1, 1, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some(1000), 5, 1),
+            &mut events,
+            "rest maker",
+        );
+
+        let outcome = engine.execute_outcome(
+            new_order(2, 2, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1000), 10, 2),
+            &mut events,
+            "cross and rest",
+        );
+
+        assert_eq!(outcome, EngineExecution::Processed);
+        assert_eq!(resting_rows(&engine), vec![(2, 2, Side::Buy, 1000, 5)]);
+        assert!(events.iter().all(|report| report.reject_reason == RejectReason::None));
+    }
+
+    #[test]
+    fn exhausted_storage_does_not_block_commands_that_need_no_new_resource() {
+        let mut arena_full = TestEngine::new_noop_with_config(capacity_config(1, 2, 1));
+        let mut events = Vec::new();
+        execute(
+            &mut arena_full,
+            new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1000), 10, 1),
+            &mut events,
+            "fill storage",
+        );
+
+        let outcome = arena_full.execute_outcome(replace(11, 1, 1, 1000, 8), &mut events, "preserve replace");
+        assert_eq!(outcome, EngineExecution::Processed);
+        let outcome = arena_full.execute_outcome(
+            new_order(2, 2, Side::Sell, OrderType::Limit, TimeInForce::Ioc, Some(1000), 3, 2),
+            &mut events,
+            "ioc needs no storage",
+        );
+        assert_eq!(outcome, EngineExecution::Processed);
+        assert_eq!(resting_rows(&arena_full), vec![(11, 1, Side::Buy, 1000, 5)]);
+
+        let mut page_full = TestEngine::new_noop_with_config(capacity_config(2, 2, 1));
+        execute(
+            &mut page_full,
+            new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1000), 10, 1),
+            &mut events,
+            "activate page",
+        );
+        let outcome = page_full.execute_outcome(
+            new_order(2, 2, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1001), 5, 2),
+            &mut events,
+            "reuse active page",
+        );
+        assert_eq!(outcome, EngineExecution::Processed);
+        assert_eq!(page_full.resting_order_count(), 2);
+    }
+
+    #[test]
+    fn replacement_capacity_preflight_accounts_for_source_page_release() {
+        let mut blocked = TestEngine::new_noop_with_config(capacity_config(3, 2, 1));
+        let mut events = Vec::new();
+        for (id, price_raw) in [(1, 1000), (2, 1001)] {
+            execute(
+                &mut blocked,
+                new_order(
+                    id,
+                    id as u32,
+                    Side::Buy,
+                    OrderType::Limit,
+                    TimeInForce::Gtc,
+                    Some(price_raw),
+                    10,
+                    id,
+                ),
+                &mut events,
+                "seed shared page",
+            );
+        }
+        let before = resting_rows(&blocked);
+        let outcome = blocked.execute_outcome(replace(11, 1, 1, 1002, 10), &mut events, "blocked replace");
+        assert_eq!(outcome, EngineExecution::CapacityExceeded(CapacityResource::ActivePages));
+        assert_eq!(events[0].reject_reason, RejectReason::KillSwitchActive);
+        assert_eq!(resting_rows(&blocked), before);
+
+        let mut reusable = TestEngine::new_noop_with_config(capacity_config(2, 2, 1));
+        execute(
+            &mut reusable,
+            new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1000), 10, 1),
+            &mut events,
+            "seed sole page",
+        );
+        let outcome = reusable.execute_outcome(replace(11, 1, 1, 1002, 10), &mut events, "reuse source page");
+        assert_eq!(outcome, EngineExecution::Processed);
+        assert_eq!(resting_rows(&reusable), vec![(11, 1, Side::Buy, 1002, 10)]);
     }
 
     #[test]

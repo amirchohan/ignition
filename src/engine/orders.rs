@@ -126,6 +126,11 @@ impl OrderArena {
         self.active
     }
 
+    /// Return whether another resting order can be stored without growing the arena.
+    pub(crate) const fn has_free_slot(&self) -> bool {
+        self.free_head.is_some()
+    }
+
     /// Return a slot only when the handle generation still matches.
     fn valid_slot(&self, handle: OrderHandle) -> Option<&OrderSlot> {
         let slot = self.slots.get(handle.index())?;
