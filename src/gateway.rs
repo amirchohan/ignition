@@ -25,7 +25,7 @@ use crate::{
         rd::InstrumentSpec,
         trading::order::{AccountId, ExecType, ExecutionReport, OrdStatus, OrderEntry, OrderId},
     },
-    io::{Endpoint, FrameLatencyStart, FramePollControl, FramePollError, IOConfig, IOPublisher, IORuntime, IoError},
+    io::{Endpoint, FrameLatencyStart, FramePollControl, FramePollError, IOConfig, IOPublisher, IORuntime, InboundFrame, IoError},
     metrics::MetricsRuntime,
     protocol::{
         ProtocolError,
@@ -195,12 +195,9 @@ impl GatewayRuntime {
             on_order: &mut on_order,
             handled_frame: false,
         };
-        let io_status = match self.io.poll_bounded_controlled_with_timing(
-            clock,
-            mode,
-            |io_publisher, recv_ts, latency_start, bytes| session.on_frame(io_publisher, recv_ts, latency_start, bytes),
-            self.max_messages_per_poll,
-        ) {
+        let io_status = match self.io.poll(clock, mode, self.max_messages_per_poll, |io_publisher, frame| {
+            session.on_frame(io_publisher, frame)
+        }) {
             Ok(progress) => progress,
             Err(FramePollError::Io(error)) => {
                 return Err(GatewayPollError::Gateway(error.into()));
@@ -257,14 +254,8 @@ impl<F, E> GatewaySession<'_, F>
 where
     F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<GatewayPollControl, E>,
 {
-    fn on_frame(
-        &mut self,
-        io_publisher: &mut IOPublisher<'_>,
-        recv_ts: RecvTs,
-        latency_start: FrameLatencyStart,
-        bytes: &[u8],
-    ) -> Result<FramePollControl, GatewayPollError<E>> {
-        let time = match latency_start {
+    fn on_frame(&mut self, io_publisher: &mut IOPublisher<'_>, frame: InboundFrame<'_>) -> Result<FramePollControl, GatewayPollError<E>> {
+        let time = match frame.latency_start {
             FrameLatencyStart::HandlerEntry => self.metrics.start_clock(self.clock),
             FrameLatencyStart::Scheduled(start_ns) => self.metrics.start_clock_at(start_ns),
         };
@@ -275,8 +266,8 @@ where
             first_error: None,
         };
 
-        let control = match decode_order_entry(bytes) {
-            Ok(wire) => match normalize_order_entry(wire, recv_ts, &self.instrument) {
+        let control = match decode_order_entry(frame.bytes) {
+            Ok(wire) => match normalize_order_entry(wire, frame.recv_ts, &self.instrument) {
                 Ok(entry) => (self.on_order)(entry, &mut publisher, self.sequencer).map_err(GatewayPollError::Handler)?,
                 Err(error) => {
                     publish_order_shape_reject(self.sequencer, wire, error.reject_reason(), &mut publisher)?;
@@ -284,7 +275,7 @@ where
                 }
             },
             Err(error) => {
-                publish_protocol_error(self.sequencer, error, bytes, recv_ts, &mut publisher)?;
+                publish_protocol_error(self.sequencer, error, frame.bytes, frame.recv_ts, &mut publisher)?;
                 GatewayPollControl::Continue
             }
         };

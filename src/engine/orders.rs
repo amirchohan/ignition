@@ -7,16 +7,16 @@
 //!
 //! # Main components
 //!
-//! - [`OrderHandle`] identifies one arena slot and the generation of the order
-//!   that occupied it. The generation prevents a handle retained from an older
-//!   order from resolving after that slot has been reused.
+//! - [`OrderArena`] owns every slot, the freelist head, and the current number
+//!   of occupied slots.
 //! - [`RestingOrder`] stores the order's visible state and two independent sets
 //!   of intrusive links: one for FIFO order at its price level and one for the
 //!   owning account's active-order chain.
+//! - [`OrderHandle`] identifies one arena slot and the generation of the order
+//!   that occupied it. The generation prevents a handle retained from an older
+//!   order from resolving after that slot has been reused.
 //! - `OrderSlot` is the physical arena entry. An occupied slot contains an
 //!   order; a free slot instead carries the next index in the freelist.
-//! - [`OrderArena`] owns every slot, the freelist head, and the current number
-//!   of occupied slots.
 //!
 //! # Allocation and reuse
 //!
@@ -47,49 +47,6 @@
 //! and `capacity.rs` checks whether the freelist has a slot available.
 
 use crate::domain::trading::order::{AccountId, OrderId, Side};
-
-/// Stable reference to one generation of an arena slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct OrderHandle {
-    /// Physical slot index inside `OrderArena`.
-    index: u32,
-    /// Slot generation captured when the order was allocated.
-    generation: u32,
-}
-
-/// Resting order node linked into price-level and account chains.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RestingOrder {
-    /// Client-assigned order ID for the resting order.
-    pub(crate) order_id: OrderId,
-    /// Account that owns the resting order.
-    pub(crate) account_id: AccountId,
-    /// Side where this order rests.
-    pub(crate) side: Side,
-    /// Limit price where this order rests.
-    pub(crate) price: crate::domain::Price,
-    /// Leaves quantity still visible and available to match.
-    pub(crate) remaining_qty: u64,
-    /// Older FIFO neighbor at the same price level.
-    pub(crate) level_prev: Option<OrderHandle>,
-    /// Newer FIFO neighbor at the same price level.
-    pub(crate) level_next: Option<OrderHandle>,
-    /// Previous live order in the owning account's chain.
-    pub(crate) account_prev: Option<OrderHandle>,
-    /// Next live order in the owning account's chain.
-    pub(crate) account_next: Option<OrderHandle>,
-}
-
-/// One physical slot, represented either as an order or a freelist node.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OrderSlot {
-    /// Generation required for a handle to resolve this slot.
-    generation: u32,
-    /// Resting order stored in this slot, if occupied.
-    order: Option<RestingOrder>,
-    /// Next freelist index when this slot is unoccupied.
-    next_free: Option<u32>,
-}
 
 /// Fixed-capacity owner of all resting-order slots.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,6 +146,49 @@ impl OrderArena {
         let slot = self.slots.get_mut(handle.index as usize)?;
         (slot.generation == handle.generation).then_some(slot)
     }
+}
+
+/// Resting order node linked into price-level and account chains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RestingOrder {
+    /// Client-assigned order ID for the resting order.
+    pub(crate) order_id: OrderId,
+    /// Account that owns the resting order.
+    pub(crate) account_id: AccountId,
+    /// Side where this order rests.
+    pub(crate) side: Side,
+    /// Limit price where this order rests.
+    pub(crate) price: crate::domain::Price,
+    /// Leaves quantity still visible and available to match.
+    pub(crate) remaining_qty: u64,
+    /// Older FIFO neighbor at the same price level.
+    pub(crate) level_prev: Option<OrderHandle>,
+    /// Newer FIFO neighbor at the same price level.
+    pub(crate) level_next: Option<OrderHandle>,
+    /// Previous live order in the owning account's chain.
+    pub(crate) account_prev: Option<OrderHandle>,
+    /// Next live order in the owning account's chain.
+    pub(crate) account_next: Option<OrderHandle>,
+}
+
+/// Stable reference to one generation of an arena slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct OrderHandle {
+    /// Physical slot index inside `OrderArena`.
+    index: u32,
+    /// Slot generation captured when the order was allocated.
+    generation: u32,
+}
+
+/// One physical slot, represented either as an order or a freelist node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrderSlot {
+    /// Generation required for a handle to resolve this slot.
+    generation: u32,
+    /// Resting order stored in this slot, if occupied.
+    order: Option<RestingOrder>,
+    /// Next freelist index when this slot is unoccupied.
+    next_free: Option<u32>,
 }
 
 #[cfg(test)]

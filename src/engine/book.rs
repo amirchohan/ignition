@@ -190,9 +190,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Update an existing order in place without changing FIFO priority.
+    /// Update an existing order in place and return its price level's aggregate quantity.
     #[inline]
-    pub(super) fn preserve_priority_replace(&mut self, handle: OrderHandle, replace: CancelReplace, old_qty: u64) -> DomainResult<()> {
+    pub(super) fn preserve_priority_replace(&mut self, handle: OrderHandle, replace: CancelReplace, old_qty: u64) -> DomainResult<u64> {
         let current = self.orders.get(handle).copied().ok_or(DomainError::Malformed)?;
         let key = self.side(current.side).key_for_price(current.price)?;
         let order = self.orders.get_mut(handle).ok_or(DomainError::Malformed)?;
@@ -203,14 +203,17 @@ impl Engine {
         self.accounts
             .replace_order_id(replace.account_id, replace.orig_client_order_id, replace.client_order_id, handle);
 
-        let level = self.side_mut(current.side).get_level_mut_or_activate(key)?;
-        // this path only permits a same-price quantity reduction, so both
-        // visible aggregates decrease by the removed quantity.
-        level.total_qty -= old_qty - replace.qty.raw();
+        let level_qty = {
+            let level = self.side_mut(current.side).get_level_mut_or_activate(key)?;
+            // this path only permits a same-price quantity reduction, so both
+            // visible aggregates decrease by the removed quantity.
+            level.total_qty -= old_qty - replace.qty.raw();
+            level.total_qty
+        };
         if let Some(account) = self.accounts.get_mut(current.account_id) {
             account.open_notional -= raw_notional(current.price, old_qty - replace.qty.raw());
         }
-        Ok(())
+        Ok(level_qty)
     }
 
     /// Remove one resting order from every index and free its arena slot.

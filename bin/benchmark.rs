@@ -103,6 +103,7 @@ fn build_runtime(
     let metrics = MetricsRuntime::new(metrics_override.unwrap_or(config.metrics), 0);
     let control = ControlRuntime::new(ControlConfig {
         heartbeat_timeout_ns: 0,
+        max_messages_per_poll: 1024,
         io: IOConfig::Noop,
     })?;
     let benchmark_io = match args.schedule {

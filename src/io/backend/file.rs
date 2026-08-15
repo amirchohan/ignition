@@ -1,8 +1,21 @@
-//! Deterministic file-backed frame input/output.
+//! Deterministic replay input, live-input recording, and output capture files.
 //!
-//! File records wrap raw protocol frames with replay metadata. The wrapped
-//! metadata is not part of the wire protocol; it exists so replay can preserve
-//! global input ordering and injected receive timestamps.
+//! [`FileFrameIo`] owns optional buffered input and output files. Its one-record
+//! lookahead keeps the next [`InputRecord`] available until [`Mode`] says that
+//! record's global sequence is due for this endpoint. [`FileFramePublisher`]
+//! lends the same output writer to a frame handler, so replies use the ordinary
+//! publisher interface without acquiring another file or buffer.
+//!
+//! Input records wrap raw protocol frames with an input sequence, endpoint tag,
+//! receive timestamp, and length. This wrapper belongs only to capture and
+//! replay; it does not change the binary order-entry protocol. Output captures
+//! use a length prefix followed by the untouched encoded frame.
+//!
+//! The parent backend coordinates endpoint validation and replay sequencing
+//! with `Mode`. A record is consumed only when its sequence is due, and replay
+//! advances only after its handler succeeds. File replay deliberately delivers
+//! at most one record per poll so separately owned endpoint files can alternate
+//! according to the single global sequence.
 
 use std::{
     fs::File,
@@ -10,23 +23,32 @@ use std::{
     path::PathBuf,
 };
 
-use crate::domain::RecvTs;
+use crate::{domain::RecvTs, runtime::Mode};
 
-use super::{Endpoint, InputRecord, IoError};
+use super::{
+    Endpoint, FrameLatencyStart, FramePollControl, FramePollError, FramePollStatus, IOPublisher, InboundFrame, InputRecord, IoError,
+};
 
+/// Bytes preceding a frame in one deterministic input record.
 const RECORD_HEADER_LEN: usize = 21;
 
-/// File-backed frame IO.
+/// Owner of optional replay input and capture output files.
 #[derive(Debug)]
 pub struct FileFrameIo {
+    /// Buffered replay source, or `None` for an output-only instance.
     input: Option<BufReader<File>>,
+    /// Buffered capture sink, or `None` for an input-only instance.
     output: Option<BufWriter<File>>,
+    /// One record retained until global replay order permits delivery.
     peeked: Option<InputRecord>,
+    /// Maximum frame payload accepted from the replay file.
     max_frame_len: usize,
+    /// Whether buffered output has changed since the last successful flush.
     output_dirty: bool,
 }
 
 impl FileFrameIo {
+    /// Open the configured replay source and capture sink.
     pub fn open(input_path: Option<PathBuf>, output_path: Option<PathBuf>, max_frame_len: usize) -> Result<Self, IoError> {
         let input = match input_path {
             Some(path) => Some(BufReader::new(File::open(path).map_err(IoError::Open)?)),
@@ -45,21 +67,62 @@ impl FileFrameIo {
         })
     }
 
-    pub fn peek_record(&mut self) -> Result<Option<&InputRecord>, IoError> {
-        if self.peeked.is_none() {
-            self.peeked = self.read_record()?;
+    /// Deliver the next globally due record for this endpoint, if one exists.
+    pub(crate) fn poll<F, E>(
+        &mut self,
+        endpoint: Endpoint,
+        mode: &mut Mode,
+        _max_frames: usize,
+        mut on_frame: F,
+    ) -> Result<FramePollStatus, FramePollError<E>>
+    where
+        F: FnMut(&mut IOPublisher<'_>, InboundFrame<'_>) -> Result<FramePollControl, E>,
+    {
+        // file replay intentionally accepts at most one record per call. the
+        // main runtime uses that behavior to alternate globally sequenced
+        // records between endpoint-specific files.
+        let Some(record) = self.peek_record().map_err(FramePollError::Io)? else {
+            return Ok(FramePollStatus::IDLE);
+        };
+
+        if record.input_seq != mode.expected_replay_input_seq().map_err(FramePollError::Io)? {
+            return Ok(FramePollStatus::IDLE);
         }
-        Ok(self.peeked.as_ref())
+        if record.endpoint != endpoint {
+            return Err(FramePollError::Io(IoError::EndpointMismatch {
+                configured: endpoint,
+                record: record.endpoint,
+            }));
+        }
+
+        let Some(record) = self.peeked.take() else {
+            return Ok(FramePollStatus::IDLE);
+        };
+        let mut publisher = IOPublisher::File(FileFramePublisher::new(self));
+        let control = on_frame(
+            &mut publisher,
+            InboundFrame {
+                recv_ts: record.recv_ts,
+                latency_start: FrameLatencyStart::HandlerEntry,
+                bytes: &record.frame,
+            },
+        )
+        .map_err(FramePollError::Handler)?;
+        self.flush_pending().map_err(FramePollError::Io)?;
+        mode.accept_replay_frame(record.input_seq).map_err(FramePollError::Io)?;
+
+        Ok(FramePollStatus {
+            progress: true,
+            stopped: control == FramePollControl::Stop,
+        })
     }
 
-    pub fn take_peeked(&mut self) -> Option<InputRecord> {
-        self.peeked.take()
-    }
-
+    /// Return whether no buffered or unread replay record remains.
     pub fn input_exhausted(&mut self) -> Result<bool, IoError> {
         Ok(self.peek_record()?.is_none())
     }
 
+    /// Append one length-prefixed output frame when a capture sink is configured.
     pub fn queue_frame(&mut self, frame: &[u8]) -> Result<(), IoError> {
         let Some(output) = self.output.as_mut() else {
             return Ok(());
@@ -69,6 +132,7 @@ impl FileFrameIo {
         Ok(())
     }
 
+    /// Append one metadata-wrapped live input record to the configured sink.
     pub fn record_input(&mut self, record: &InputRecord) -> Result<(), IoError> {
         let Some(output) = self.output.as_mut() else {
             return Ok(());
@@ -78,6 +142,7 @@ impl FileFrameIo {
         Ok(())
     }
 
+    /// Flush dirty capture output, reporting whether bytes were pending.
     pub fn flush_pending(&mut self) -> Result<bool, IoError> {
         let Some(output) = self.output.as_mut() else {
             return Ok(false);
@@ -90,6 +155,15 @@ impl FileFrameIo {
         Ok(true)
     }
 
+    /// Return the next replay record without consuming it.
+    pub(crate) fn peek_record(&mut self) -> Result<Option<&InputRecord>, IoError> {
+        if self.peeked.is_none() {
+            self.peeked = self.read_record()?;
+        }
+        Ok(self.peeked.as_ref())
+    }
+
+    /// Read and decode the next complete replay record from the input file.
     fn read_record(&mut self) -> Result<Option<InputRecord>, IoError> {
         let Some(input) = self.input.as_mut() else {
             return Ok(None);
@@ -126,25 +200,30 @@ impl FileFrameIo {
 /// File-backed publisher borrowed while replaying one frame.
 #[derive(Debug)]
 pub struct FileFramePublisher<'a> {
+    /// File backend whose output writer remains owned by the runtime.
     io: &'a mut FileFrameIo,
 }
 
 impl<'a> FileFramePublisher<'a> {
+    /// Borrow a file backend for output during one frame callback.
     pub fn new(io: &'a mut FileFrameIo) -> Self {
         Self { io }
     }
 
+    /// Queue and flush one output frame before returning.
     pub fn publish(&mut self, frame: &[u8]) -> Result<(), IoError> {
         self.io.queue_frame(frame)?;
         self.io.flush_pending()?;
         Ok(())
     }
 
+    /// Queue one output frame for the runtime's next flush.
     pub fn queue_frame(&mut self, frame: &[u8]) -> Result<(), IoError> {
         self.io.queue_frame(frame)
     }
 }
 
+/// Write one metadata-wrapped input record in the stable replay-file layout.
 fn write_input_record(output: &mut BufWriter<File>, record: &InputRecord) -> Result<(), std::io::Error> {
     output.write_all(&record.input_seq.to_le_bytes())?;
     output.write_all(&[record.endpoint.as_u8()])?;
@@ -154,6 +233,7 @@ fn write_input_record(output: &mut BufWriter<File>, record: &InputRecord) -> Res
     Ok(())
 }
 
+/// Write one length-prefixed encoded frame to an output capture.
 fn write_output_frame(output: &mut BufWriter<File>, frame: &[u8]) -> Result<(), std::io::Error> {
     output.write_all(&(frame.len() as u32).to_le_bytes())?;
     output.write_all(frame)?;
@@ -183,7 +263,7 @@ mod tests {
         {
             let mut io = FileFrameIo::open(Some(path.clone()), None, 128).expect("reader");
             assert_eq!(io.peek_record().expect("peek"), Some(&record));
-            assert_eq!(io.take_peeked(), Some(record));
+            assert_eq!(io.peeked.take(), Some(record));
             assert!(io.input_exhausted().expect("exhausted"));
         }
 

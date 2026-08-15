@@ -28,6 +28,7 @@ risk:
 control:
   type: file
   heartbeat_timeout_ns: 0
+  max_messages_per_poll: 1024
   max_frame_len: 4096
 gateway:
   type: file

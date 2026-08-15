@@ -29,6 +29,7 @@ risk:
 control:
   type: noop
   heartbeat_timeout_ns: 0
+  max_messages_per_poll: 1024
 gateway:
   type: noop
   max_messages_per_poll: 1024

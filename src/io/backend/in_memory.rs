@@ -1,26 +1,47 @@
-//! In-memory frame input/output for benchmark replay.
+//! Allocation-free frame replay and output accounting for benchmarks.
 //!
-//! This backend removes TCP and disk from measured hot-path latency while still
-//! delivering raw protocol frames through the normal endpoint callback path.
+//! [`InMemoryFrameIo`] owns a fixed vector of [`InputRecord`] values, a cursor
+//! into that vector, output counters, and an [`InputSchedule`]. It delivers the
+//! same borrowed [`InboundFrame`] and publisher interface as live or file I/O,
+//! while excluding socket and disk costs from measured hot-path latency.
+//!
+//! Burst input becomes available immediately. Open-loop input derives every
+//! absolute due time from one start timestamp and the record index, avoiding
+//! cumulative rounding or handler-time drift. [`InMemoryFramePublisher`] owns
+//! no storage; it borrows the backend's counters and validates output sizes.
+//!
+//! The parent backend and [`Mode`] still enforce endpoint identity and global
+//! replay sequence. Records remain in their original order, the cursor advances
+//! only after successful handling, and output counting uses saturating totals so
+//! benchmark traffic cannot wrap the counters.
 
 use std::time::Duration;
 
-use crate::{clock::Clock, domain::RecvTs, runtime::Mode};
+use crate::{clock::Clock, runtime::Mode};
 
-use super::{Endpoint, FrameLatencyStart, FramePollControl, FramePollError, FramePollStatus, IOPublisher, InputRecord, IoError};
+use super::{
+    Endpoint, FrameLatencyStart, FramePollControl, FramePollError, FramePollStatus, IOPublisher, InboundFrame, InputRecord, IoError,
+};
 
-/// In-memory frame IO used by benchmarks to remove TCP and disk from measured latency.
+/// Owner of benchmark replay records, scheduling state, and output counters.
 #[derive(Debug)]
 pub struct InMemoryFrameIo {
+    /// Replay records retained in deterministic delivery order.
     input: Vec<InputRecord>,
+    /// Index of the next record eligible for delivery.
     cursor: usize,
+    /// Number of output frames accepted by this backend.
     output_frames: u64,
+    /// Total encoded bytes accepted by this backend.
     output_bytes: u64,
+    /// Maximum accepted input and output frame length.
     max_frame_len: usize,
+    /// Release policy applied before inspecting the next record.
     schedule: InputSchedule,
 }
 
 impl InMemoryFrameIo {
+    /// Create a replay backend whose records are available as a burst.
     pub fn new(input: Vec<InputRecord>, max_frame_len: usize) -> Self {
         Self {
             input,
@@ -32,6 +53,7 @@ impl InMemoryFrameIo {
         }
     }
 
+    /// Create an open-loop replay backend at the requested frames-per-second rate.
     pub fn new_scheduled(input: Vec<InputRecord>, max_frame_len: usize, target_rate_per_sec: u64) -> Result<Self, IoError> {
         if !(1..=1_000_000_000).contains(&target_rate_per_sec) {
             return Err(IoError::Configure(std::io::Error::new(
@@ -52,65 +74,22 @@ impl InMemoryFrameIo {
         })
     }
 
-    pub fn poll<F, E>(
+    /// Deliver up to `max_frames` globally due records for this endpoint.
+    pub(crate) fn poll<F, E>(
         &mut self,
         clock: &Clock,
         endpoint: Endpoint,
         mode: &mut Mode,
+        max_frames: usize,
         mut on_frame: F,
-        max_frames: Option<usize>,
-    ) -> Result<bool, FramePollError<E>>
-    where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
-    {
-        self.poll_with_timing(
-            clock,
-            endpoint,
-            mode,
-            |publisher, recv_ts, _, frame| on_frame(publisher, recv_ts, frame),
-            max_frames,
-        )
-    }
-
-    pub(crate) fn poll_with_timing<F, E>(
-        &mut self,
-        clock: &Clock,
-        endpoint: Endpoint,
-        mode: &mut Mode,
-        mut on_frame: F,
-        max_frames: Option<usize>,
-    ) -> Result<bool, FramePollError<E>>
-    where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
-    {
-        self.poll_controlled_with_timing(
-            clock,
-            endpoint,
-            mode,
-            |publisher, recv_ts, latency_start, frame| {
-                on_frame(publisher, recv_ts, latency_start, frame)?;
-                Ok(FramePollControl::Continue)
-            },
-            max_frames,
-        )
-        .map(|status| status.progress)
-    }
-
-    pub(crate) fn poll_controlled_with_timing<F, E>(
-        &mut self,
-        clock: &Clock,
-        endpoint: Endpoint,
-        mode: &mut Mode,
-        mut on_frame: F,
-        max_frames: Option<usize>,
     ) -> Result<FramePollStatus, FramePollError<E>>
     where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
+        F: FnMut(&mut IOPublisher<'_>, InboundFrame<'_>) -> Result<FramePollControl, E>,
     {
         let mut frames = 0_usize;
         let mut made_progress = false;
         loop {
-            if max_frames.is_some_and(|max_frames| frames >= max_frames) {
+            if frames >= max_frames {
                 return Ok(FramePollStatus {
                     progress: made_progress,
                     stopped: false,
@@ -127,6 +106,7 @@ impl InMemoryFrameIo {
             let latency_start = self.schedule.wait_until_due(clock, self.cursor);
             let record = &self.input[self.cursor];
 
+            // checking the shared replay sequence before advancing preserves global ordering across endpoint runtimes.
             if record.input_seq != mode.expected_replay_input_seq().map_err(FramePollError::Io)? {
                 return Ok(FramePollStatus {
                     progress: made_progress,
@@ -146,7 +126,16 @@ impl InMemoryFrameIo {
                 &mut self.output_bytes,
                 self.max_frame_len,
             ));
-            let control = on_frame(&mut publisher, record.recv_ts, latency_start, &record.frame).map_err(FramePollError::Handler)?;
+            let control = on_frame(
+                &mut publisher,
+                InboundFrame {
+                    recv_ts: record.recv_ts,
+                    latency_start,
+                    bytes: &record.frame,
+                },
+            )
+            .map_err(FramePollError::Handler)?;
+            // the cursor advances only after both endpoint handling and replay acceptance succeed.
             mode.accept_replay_frame(record.input_seq).map_err(FramePollError::Io)?;
             self.cursor += 1;
             frames += 1;
@@ -160,20 +149,12 @@ impl InMemoryFrameIo {
         }
     }
 
-    pub fn peek_record(&self) -> Option<&InputRecord> {
-        self.input.get(self.cursor)
-    }
-
-    pub fn take_peeked(&mut self) -> Option<InputRecord> {
-        let record = self.input.get(self.cursor).cloned()?;
-        self.cursor += 1;
-        Some(record)
-    }
-
+    /// Return whether every replay record has been accepted.
     pub fn input_exhausted(&self) -> bool {
         self.cursor >= self.input.len()
     }
 
+    /// Validate and count one output frame without retaining its bytes.
     pub fn queue_frame(&mut self, frame: &[u8]) -> Result<(), IoError> {
         if frame.len() > self.max_frame_len {
             return Err(IoError::FrameTooLarge {
@@ -186,31 +167,30 @@ impl InMemoryFrameIo {
         Ok(())
     }
 
-    pub const fn flush_pending(&self) -> bool {
-        false
-    }
-
-    pub const fn output_frames(&self) -> u64 {
-        self.output_frames
-    }
-
-    pub const fn output_bytes(&self) -> u64 {
-        self.output_bytes
+    /// Report no flush progress because output is counted synchronously.
+    pub const fn flush_pending(&self) -> Result<bool, IoError> {
+        Ok(false)
     }
 }
 
 /// Benchmark input release policy.
 #[derive(Debug)]
 enum InputSchedule {
+    /// Make every record immediately eligible.
     Burst,
+    /// Release records against absolute deadlines at a fixed open-loop rate.
     OpenLoop {
+        /// Requested frames per second, constrained to one nanosecond or slower intervals.
         target_rate_per_sec: u64,
+        /// Runtime-clock origin captured when the first record is polled.
         started_at_ns: Option<u64>,
     },
 }
 
 impl InputSchedule {
+    /// Wait until one record is due and return its latency start policy.
     fn wait_until_due(&mut self, clock: &Clock, input_index: usize) -> FrameLatencyStart {
+        /// Final interval reserved for active waiting near a scheduled deadline.
         const SPIN_WINDOW: Duration = Duration::from_micros(50);
 
         let Self::OpenLoop {
@@ -221,6 +201,7 @@ impl InputSchedule {
             return FrameLatencyStart::HandlerEntry;
         };
         let start_ns = *started_at_ns.get_or_insert_with(|| clock.now_ns());
+        // absolute offsets prevent handler duration and fractional intervals from accumulating schedule drift.
         let due_offset_ns = scheduled_offset_ns(input_index as u64, *target_rate_per_sec);
         let due_ns = start_ns.saturating_add(due_offset_ns);
 
@@ -230,6 +211,7 @@ impl InputSchedule {
                 return FrameLatencyStart::Scheduled(due_ns);
             }
             let remaining = Duration::from_nanos(due_ns - now_ns);
+            // sleeping most of a long wait limits CPU use while the final spin protects sub-millisecond precision.
             if remaining > SPIN_WINDOW {
                 std::thread::sleep(remaining - SPIN_WINDOW);
             } else {
@@ -239,6 +221,7 @@ impl InputSchedule {
     }
 }
 
+/// Return an index-based nanosecond offset without cumulative rounding error.
 fn scheduled_offset_ns(input_index: u64, target_rate_per_sec: u64) -> u64 {
     let offset = u128::from(input_index) * 1_000_000_000_u128 / u128::from(target_rate_per_sec);
     offset.min(u128::from(u64::MAX)) as u64
@@ -247,12 +230,16 @@ fn scheduled_offset_ns(input_index: u64, target_rate_per_sec: u64) -> u64 {
 /// In-memory frame publisher borrowed during benchmark replay.
 #[derive(Debug)]
 pub struct InMemoryFramePublisher<'a> {
+    /// Borrowed count of accepted output frames.
     output_frames: &'a mut u64,
+    /// Borrowed total of accepted encoded output bytes.
     output_bytes: &'a mut u64,
+    /// Maximum frame length accepted by the owning backend.
     max_frame_len: usize,
 }
 
 impl<'a> InMemoryFramePublisher<'a> {
+    /// Borrow an in-memory backend's output counters for one callback.
     pub fn new(output_frames: &'a mut u64, output_bytes: &'a mut u64, max_frame_len: usize) -> Self {
         Self {
             output_frames,
@@ -261,10 +248,12 @@ impl<'a> InMemoryFramePublisher<'a> {
         }
     }
 
+    /// Validate and count one output frame immediately.
     pub fn publish(&mut self, frame: &[u8]) -> Result<(), IoError> {
         self.queue_frame(frame)
     }
 
+    /// Validate and count one output frame without retaining its bytes.
     pub fn queue_frame(&mut self, frame: &[u8]) -> Result<(), IoError> {
         if frame.len() > self.max_frame_len {
             return Err(IoError::FrameTooLarge {
@@ -281,6 +270,7 @@ impl<'a> InMemoryFramePublisher<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::RecvTs;
 
     #[test]
     fn scheduled_offsets_start_at_zero_and_preserve_fractional_intervals() {
@@ -315,16 +305,10 @@ mod tests {
         let mut mode = Mode::Replay { expected_input_seq: 1 };
         let mut latency_start = None;
 
-        io.poll_with_timing(
-            &clock,
-            Endpoint::Gateway,
-            &mut mode,
-            |_, _, observed, _| {
-                latency_start = Some(observed);
-                Ok::<(), std::convert::Infallible>(())
-            },
-            Some(1),
-        )
+        io.poll(&clock, Endpoint::Gateway, &mut mode, 1, |_, frame| {
+            latency_start = Some(frame.latency_start);
+            Ok::<FramePollControl, std::convert::Infallible>(FramePollControl::Continue)
+        })
         .expect("poll");
 
         assert_eq!(latency_start, Some(FrameLatencyStart::HandlerEntry));
@@ -346,16 +330,10 @@ mod tests {
         let mut handled = 0;
 
         let status = io
-            .poll_controlled_with_timing(
-                &clock,
-                Endpoint::Gateway,
-                &mut mode,
-                |_, _, _, _| {
-                    handled += 1;
-                    Ok::<FramePollControl, std::convert::Infallible>(FramePollControl::Stop)
-                },
-                Some(2),
-            )
+            .poll(&clock, Endpoint::Gateway, &mut mode, 2, |_, _| {
+                handled += 1;
+                Ok::<FramePollControl, std::convert::Infallible>(FramePollControl::Stop)
+            })
             .expect("controlled poll");
 
         assert_eq!(handled, 1);
@@ -391,16 +369,13 @@ mod tests {
         let mut mode = Mode::Replay { expected_input_seq: 1 };
         let started_ns = clock.now_ns();
 
-        assert!(
-            io.poll(
-                &clock,
-                Endpoint::Gateway,
-                &mut mode,
-                |_, _, _| Ok::<(), std::convert::Infallible>(()),
-                Some(2),
-            )
-            .expect("poll")
-        );
+        let status = io
+            .poll(&clock, Endpoint::Gateway, &mut mode, 2, |_, _| {
+                Ok::<FramePollControl, std::convert::Infallible>(FramePollControl::Continue)
+            })
+            .expect("poll");
+
+        assert!(status.progress);
 
         assert!(clock.now_ns().saturating_sub(started_ns) >= 5_000_000);
         assert_eq!(mode, Mode::Replay { expected_input_seq: 3 });
@@ -427,19 +402,13 @@ mod tests {
         let mut mode = Mode::Replay { expected_input_seq: 1 };
         let mut arrivals = Vec::new();
 
-        io.poll_with_timing(
-            &clock,
-            Endpoint::Gateway,
-            &mut mode,
-            |_, _, latency_start, _| {
-                arrivals.push((latency_start, clock.now_ns()));
-                if arrivals.len() == 1 {
-                    std::thread::sleep(Duration::from_millis(8));
-                }
-                Ok::<(), std::convert::Infallible>(())
-            },
-            Some(2),
-        )
+        io.poll(&clock, Endpoint::Gateway, &mut mode, 2, |_, frame| {
+            arrivals.push((frame.latency_start, clock.now_ns()));
+            if arrivals.len() == 1 {
+                std::thread::sleep(Duration::from_millis(8));
+            }
+            Ok::<FramePollControl, std::convert::Infallible>(FramePollControl::Continue)
+        })
         .expect("poll");
 
         let FrameLatencyStart::Scheduled(first_due_ns) = arrivals[0].0 else {

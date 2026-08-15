@@ -13,6 +13,8 @@
 //!
 //! # Main components
 //!
+//! - [`SideLadder`] ties the mapping, page pool, page-level occupancy bitmap,
+//!   and cached best price together for one side of the book.
 //! - [`PriceLevel`] stores aggregate quantity, order count, and the FIFO
 //!   endpoints for one price. Actual resting orders live in `OrderArena`.
 //! - [`LevelKey`] is the translated address of one price: logical page index,
@@ -23,8 +25,6 @@
 //!   occupancy bitmap.
 //! - `PagePool` owns every physical page available to one side and a freelist
 //!   of page handles that are not currently assigned to a logical price range.
-//! - [`SideLadder`] ties the mapping, page pool, page-level occupancy bitmap,
-//!   and cached best price together for one side of the book.
 //!
 //! # How lookups work
 //!
@@ -53,181 +53,6 @@
 use crate::domain::{DomainError, DomainResult, Price, trading::order::Side};
 
 use super::{EngineConfig, orders::OrderHandle};
-
-/// Visible aggregates and FIFO endpoints for one price level.
-///
-/// The level does not own order nodes. Its handles point into `OrderArena`,
-/// where neighboring orders carry the rest of the FIFO links.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct PriceLevel {
-    /// Oldest resting order at this price.
-    pub(crate) head: Option<OrderHandle>,
-    /// Newest resting order at this price.
-    pub(crate) tail: Option<OrderHandle>,
-    /// Aggregate visible quantity at this price.
-    pub(crate) total_qty: u64,
-    /// Number of resting orders at this price.
-    pub(crate) order_count: u32,
-}
-
-impl PriceLevel {
-    /// Return whether this level has no visible resting orders.
-    pub(crate) const fn is_empty(self) -> bool {
-        self.order_count == 0
-    }
-}
-
-/// Logical address and absolute price of one level inside the paged ladder.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LevelKey {
-    /// Absolute page index inside this side's storage envelope.
-    pub(crate) page_index: usize,
-    /// Price-level offset inside the page.
-    pub(crate) offset: usize,
-    /// Integer price represented by the page and offset.
-    pub(crate) price: Price,
-}
-
-/// Packed occupancy bits used to skip empty levels and logical pages.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Bitmap {
-    /// Packed 64-bit occupancy words.
-    words: Vec<u64>,
-}
-
-impl Bitmap {
-    /// Create an empty bitmap with enough words for `bits` entries.
-    fn new(bits: usize) -> Self {
-        Self {
-            // round up so a final partial word still has storage for every bit.
-            words: vec![0; bits.div_ceil(64)],
-        }
-    }
-
-    /// Mark one bit as occupied.
-    fn set(&mut self, bit: usize) {
-        self.words[bit / 64] |= 1_u64 << (bit % 64);
-    }
-
-    /// Mark one bit as empty.
-    fn clear(&mut self, bit: usize) {
-        self.words[bit / 64] &= !(1_u64 << (bit % 64));
-    }
-
-    /// Return whether any bit is occupied.
-    fn any(&self) -> bool {
-        self.words.iter().any(|word| *word != 0)
-    }
-
-    /// Return whether `bit` is the only occupied position.
-    fn contains_only(&self, bit: usize) -> bool {
-        self.words.iter().enumerate().all(|(word_index, word)| {
-            let expected = if word_index == bit / 64 { 1_u64 << (bit % 64) } else { 0 };
-            *word == expected
-        })
-    }
-
-    /// Find the lowest set bit at or after `bit`.
-    fn next_set_from(&self, bit: usize) -> Option<usize> {
-        let mut word_index = bit / 64;
-        let mut word = *self.words.get(word_index)?;
-        // ignore occupied bits before the requested start point in the first word.
-        word &= !0_u64 << (bit % 64);
-
-        loop {
-            if word != 0 {
-                return Some(word_index * 64 + word.trailing_zeros() as usize);
-            }
-            word_index += 1;
-            word = *self.words.get(word_index)?;
-        }
-    }
-
-    /// Find the highest set bit at or before `bit`.
-    fn prev_set_from(&self, bit: usize) -> Option<usize> {
-        let mut word_index = bit / 64;
-        let mut word = *self.words.get(word_index)?;
-        let keep_bits = bit % 64;
-        // ignore occupied bits after the requested start point in the first word.
-        word &= u64::MAX >> (63 - keep_bits);
-
-        loop {
-            if word != 0 {
-                return Some(word_index * 64 + (63 - word.leading_zeros() as usize));
-            }
-            if word_index == 0 {
-                return None;
-            }
-            word_index -= 1;
-            word = self.words[word_index];
-        }
-    }
-}
-
-/// Reusable dense group of adjacent price levels.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Page {
-    /// Fixed-size price levels for this page.
-    levels: Box<[PriceLevel]>,
-    /// Occupancy bitmap for non-empty levels in this page.
-    occupied: Bitmap,
-}
-
-impl Page {
-    /// Allocate one page with `page_size` empty price levels.
-    fn new(page_size: usize) -> Self {
-        Self {
-            levels: vec![PriceLevel::default(); page_size].into_boxed_slice(),
-            occupied: Bitmap::new(page_size),
-        }
-    }
-
-    /// Clear all levels and occupancy before returning a page to the pool.
-    fn reset(&mut self) {
-        for level in &mut self.levels {
-            *level = PriceLevel::default();
-        }
-        for word in &mut self.occupied.words {
-            *word = 0;
-        }
-    }
-}
-
-/// Preallocated physical pages and handles that are currently free.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PagePool {
-    /// Preallocated pages available to this side.
-    pages: Vec<Page>,
-    /// Handles of pages that are currently inactive.
-    free: Vec<usize>,
-}
-
-impl PagePool {
-    /// Preallocate all page storage used by this side.
-    fn new(max_active_pages: usize, page_size: usize) -> Self {
-        let mut pages = Vec::with_capacity(max_active_pages);
-        let mut free = Vec::with_capacity(max_active_pages);
-        for index in 0..max_active_pages {
-            pages.push(Page::new(page_size));
-            // reverse insertion makes pop activate handles in ascending order,
-            // keeping page reuse deterministic.
-            free.push(max_active_pages - 1 - index);
-        }
-
-        Self { pages, free }
-    }
-
-    /// Reserve a page for an occupied price range.
-    fn activate(&mut self) -> Option<usize> {
-        self.free.pop()
-    }
-
-    /// Return a page to the reusable pool.
-    fn release(&mut self, handle: usize) {
-        self.pages[handle].reset();
-        self.free.push(handle);
-    }
-}
 
 /// One book side backed by a bounded pool of paged price levels.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,6 +278,181 @@ impl SideLadder {
             offset,
             price: Price::new_unchecked(raw),
         })
+    }
+}
+
+/// Visible aggregates and FIFO endpoints for one price level.
+///
+/// The level does not own order nodes. Its handles point into `OrderArena`,
+/// where neighboring orders carry the rest of the FIFO links.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PriceLevel {
+    /// Oldest resting order at this price.
+    pub(crate) head: Option<OrderHandle>,
+    /// Newest resting order at this price.
+    pub(crate) tail: Option<OrderHandle>,
+    /// Aggregate visible quantity at this price.
+    pub(crate) total_qty: u64,
+    /// Number of resting orders at this price.
+    pub(crate) order_count: u32,
+}
+
+impl PriceLevel {
+    /// Return whether this level has no visible resting orders.
+    pub(crate) const fn is_empty(self) -> bool {
+        self.order_count == 0
+    }
+}
+
+/// Logical address and absolute price of one level inside the paged ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LevelKey {
+    /// Absolute page index inside this side's storage envelope.
+    pub(crate) page_index: usize,
+    /// Price-level offset inside the page.
+    pub(crate) offset: usize,
+    /// Integer price represented by the page and offset.
+    pub(crate) price: Price,
+}
+
+/// Packed occupancy bits used to skip empty levels and logical pages.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Bitmap {
+    /// Packed 64-bit occupancy words.
+    words: Vec<u64>,
+}
+
+impl Bitmap {
+    /// Create an empty bitmap with enough words for `bits` entries.
+    fn new(bits: usize) -> Self {
+        Self {
+            // round up so a final partial word still has storage for every bit.
+            words: vec![0; bits.div_ceil(64)],
+        }
+    }
+
+    /// Mark one bit as occupied.
+    fn set(&mut self, bit: usize) {
+        self.words[bit / 64] |= 1_u64 << (bit % 64);
+    }
+
+    /// Mark one bit as empty.
+    fn clear(&mut self, bit: usize) {
+        self.words[bit / 64] &= !(1_u64 << (bit % 64));
+    }
+
+    /// Return whether any bit is occupied.
+    fn any(&self) -> bool {
+        self.words.iter().any(|word| *word != 0)
+    }
+
+    /// Return whether `bit` is the only occupied position.
+    fn contains_only(&self, bit: usize) -> bool {
+        self.words.iter().enumerate().all(|(word_index, word)| {
+            let expected = if word_index == bit / 64 { 1_u64 << (bit % 64) } else { 0 };
+            *word == expected
+        })
+    }
+
+    /// Find the lowest set bit at or after `bit`.
+    fn next_set_from(&self, bit: usize) -> Option<usize> {
+        let mut word_index = bit / 64;
+        let mut word = *self.words.get(word_index)?;
+        // ignore occupied bits before the requested start point in the first word.
+        word &= !0_u64 << (bit % 64);
+
+        loop {
+            if word != 0 {
+                return Some(word_index * 64 + word.trailing_zeros() as usize);
+            }
+            word_index += 1;
+            word = *self.words.get(word_index)?;
+        }
+    }
+
+    /// Find the highest set bit at or before `bit`.
+    fn prev_set_from(&self, bit: usize) -> Option<usize> {
+        let mut word_index = bit / 64;
+        let mut word = *self.words.get(word_index)?;
+        let keep_bits = bit % 64;
+        // ignore occupied bits after the requested start point in the first word.
+        word &= u64::MAX >> (63 - keep_bits);
+
+        loop {
+            if word != 0 {
+                return Some(word_index * 64 + (63 - word.leading_zeros() as usize));
+            }
+            if word_index == 0 {
+                return None;
+            }
+            word_index -= 1;
+            word = self.words[word_index];
+        }
+    }
+}
+
+/// Reusable dense group of adjacent price levels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Page {
+    /// Fixed-size price levels for this page.
+    levels: Box<[PriceLevel]>,
+    /// Occupancy bitmap for non-empty levels in this page.
+    occupied: Bitmap,
+}
+
+impl Page {
+    /// Allocate one page with `page_size` empty price levels.
+    fn new(page_size: usize) -> Self {
+        Self {
+            levels: vec![PriceLevel::default(); page_size].into_boxed_slice(),
+            occupied: Bitmap::new(page_size),
+        }
+    }
+
+    /// Clear all levels and occupancy before returning a page to the pool.
+    fn reset(&mut self) {
+        for level in &mut self.levels {
+            *level = PriceLevel::default();
+        }
+        for word in &mut self.occupied.words {
+            *word = 0;
+        }
+    }
+}
+
+/// Preallocated physical pages and handles that are currently free.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PagePool {
+    /// Preallocated pages available to this side.
+    pages: Vec<Page>,
+    /// Handles of pages that are currently inactive.
+    free: Vec<usize>,
+}
+
+impl PagePool {
+    /// Preallocate all page storage used by this side.
+    fn new(max_active_pages: usize, page_size: usize) -> Self {
+        let mut pages = Vec::with_capacity(max_active_pages);
+        let mut free = Vec::with_capacity(max_active_pages);
+        for index in 0..max_active_pages {
+            pages.push(Page::new(page_size));
+            // reverse insertion makes pop activate handles in ascending order,
+            // keeping page reuse deterministic.
+            free.push(max_active_pages - 1 - index);
+        }
+
+        Self { pages, free }
+    }
+
+    /// Reserve a page for an occupied price range.
+    fn activate(&mut self) -> Option<usize> {
+        self.free.pop()
+    }
+
+    /// Return a page to the reusable pool.
+    fn release(&mut self, handle: usize) {
+        self.pages[handle].reset();
+        self.free.push(handle);
     }
 }
 

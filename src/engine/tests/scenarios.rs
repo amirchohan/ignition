@@ -459,6 +459,45 @@ fn same_price_qty_reduction_replace_preserves_priority() {
 }
 
 #[test]
+fn same_price_qty_reduction_publishes_aggregate_l2_qty() {
+    let path = temp_path("replace-aggregate-l2");
+    let mut engine = TestEngine::new_file_market_data(path.clone());
+    let mut events = Vec::new();
+    execute(
+        &mut engine,
+        new_order(1, 1, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some(1000), 10, 1),
+        &mut events,
+        "rest first",
+    );
+    execute(
+        &mut engine,
+        new_order(2, 2, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some(1000), 10, 2),
+        &mut events,
+        "rest second",
+    );
+    execute(&mut engine, replace(11, 1, 1, 1000, 5), &mut events, "reduce first");
+
+    engine.flush_market_data();
+    let captured = read_market_data(&path);
+    let _ = std::fs::remove_file(path);
+    let level_quantities = captured
+        .iter()
+        .filter_map(|event| match event {
+            CapturedMarketData::L2 {
+                side: Side::Sell,
+                price: 1000,
+                qty,
+                ..
+            } => Some(*qty),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(level_quantities, vec![10, 20, 15]);
+    assert_eq!(engine.best_ask(), Some((price(1000), 15)));
+}
+
+#[test]
 fn same_price_same_qty_replace_does_not_emit_market_data() {
     let Some(mut engine) = TestEngine::new() else {
         return;

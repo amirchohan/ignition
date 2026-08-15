@@ -29,6 +29,7 @@ control:
   type: tcp
   bind_addr: "0.0.0.0:19001"
   heartbeat_timeout_ns: 0
+  max_messages_per_poll: 1024
   max_frame_len: 4096
   max_pending_write_bytes: 1048576
 gateway:

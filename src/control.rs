@@ -27,7 +27,7 @@ use crate::{
             KillSwitchAction,
         },
     },
-    io::{Endpoint, FramePollError, IOConfig, IOPublisher, IORuntime, IoError},
+    io::{Endpoint, FramePollControl, FramePollError, IOConfig, IOPublisher, IORuntime, IoError},
     protocol::{
         ProtocolError,
         wire::control::{WireDecodeError, decode_control_request, encode_control_event},
@@ -41,6 +41,8 @@ pub struct ControlConfig {
     pub heartbeat_timeout_ns: u64,
     /// Endpoint IO backend.
     pub io: IOConfig,
+    /// Maximum inbound frames processed in one runtime poll.
+    pub max_messages_per_poll: usize,
 }
 
 /// Borrowed control egress handle for the current poll callback.
@@ -79,6 +81,7 @@ pub struct ControlRuntime {
     io: IORuntime,
     encode_buf: Vec<u8>,
     state: ControlState,
+    max_messages_per_poll: usize,
 }
 
 impl ControlRuntime {
@@ -94,6 +97,7 @@ impl ControlRuntime {
             io,
             encode_buf: vec![0_u8; encode_len],
             state: ControlState::new(config.heartbeat_timeout_ns),
+            max_messages_per_poll: config.max_messages_per_poll.max(1),
         })
     }
 
@@ -112,7 +116,12 @@ impl ControlRuntime {
     where
         F: FnMut(ControlRequest, &mut ControlPublisher<'_, '_>, &mut Sequencer) -> Result<(), ControlError>,
     {
-        let ControlRuntime { io, encode_buf, state } = self;
+        let ControlRuntime {
+            io,
+            encode_buf,
+            state,
+            max_messages_per_poll,
+        } = self;
         let mut session = ControlPollSession {
             state,
             encode_buf,
@@ -120,15 +129,16 @@ impl ControlRuntime {
             on_request: &mut on_request,
             shutdown_seen: false,
         };
-        let io_progress = match io.poll(clock, mode, |io_publisher, recv_ts, bytes| {
-            session.on_frame(io_publisher, recv_ts, bytes)
+        let io_status = match io.poll(clock, mode, *max_messages_per_poll, |io_publisher, frame| {
+            session.on_frame(io_publisher, frame.recv_ts, frame.bytes)?;
+            Ok(FramePollControl::Continue)
         }) {
-            Ok(progress) => progress,
+            Ok(status) => status,
             Err(FramePollError::Io(error)) => return Err(error.into()),
             Err(FramePollError::Handler(error)) => return Err(error),
         };
 
-        Ok(io_progress)
+        Ok(io_status.progress)
     }
 
     /// Return the current pre-risk reject reason for risk-increasing orders.
@@ -366,6 +376,7 @@ impl From<DomainError> for ControlError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::io::InputRecord;
     use crate::protocol::{
         MessageKind, SBE_HEADER_LEN, decode_header, encode_header,
         generated::codecs::{
@@ -392,6 +403,7 @@ mod tests {
         let bind_addr = reserve_loopback_addr()?;
         let config = ControlConfig {
             heartbeat_timeout_ns: 0,
+            max_messages_per_poll: 1024,
             io: IOConfig::Tcp {
                 bind_addr: bind_addr.to_string(),
                 max_frame_len: 4096,
@@ -527,6 +539,58 @@ mod tests {
                 })
                 .expect("second poll")
         );
+    }
+
+    #[test]
+    fn poll_respects_configured_frame_budget() {
+        let mut control = ControlRuntime::new(ControlConfig {
+            heartbeat_timeout_ns: 0,
+            max_messages_per_poll: 1,
+            io: IOConfig::InMemory {
+                input: vec![
+                    InputRecord {
+                        input_seq: 1,
+                        endpoint: Endpoint::Control,
+                        recv_ts: RecvTs::new(10),
+                        frame: heartbeat_frame(1),
+                    },
+                    InputRecord {
+                        input_seq: 2,
+                        endpoint: Endpoint::Control,
+                        recv_ts: RecvTs::new(11),
+                        frame: heartbeat_frame(2),
+                    },
+                ],
+                max_frame_len: 4096,
+            },
+        })
+        .expect("control");
+        let clock = Clock::new();
+        let mut mode = Mode::Replay { expected_input_seq: 1 };
+        let mut sequencer = Sequencer::default();
+        let mut requests = Vec::new();
+
+        assert!(
+            control
+                .poll(&clock, &mut mode, &mut sequencer, |request, _, _| {
+                    requests.push(request);
+                    Ok(())
+                })
+                .expect("first poll")
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(mode, Mode::Replay { expected_input_seq: 2 });
+
+        assert!(
+            control
+                .poll(&clock, &mut mode, &mut sequencer, |request, _, _| {
+                    requests.push(request);
+                    Ok(())
+                })
+                .expect("second poll")
+        );
+        assert_eq!(requests.len(), 2);
+        assert_eq!(mode, Mode::Replay { expected_input_seq: 3 });
     }
 
     #[test]

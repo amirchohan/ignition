@@ -480,6 +480,7 @@ mod tests {
     fn control_config() -> ControlConfig {
         ControlConfig {
             heartbeat_timeout_ns: 0,
+            max_messages_per_poll: 1024,
             io: IOConfig::Tcp {
                 bind_addr: "127.0.0.1:0".to_owned(),
                 max_frame_len: 4096,
@@ -547,6 +548,7 @@ mod tests {
         let bind_addr = reserve_loopback_addr()?;
         let control = new_control_with_config(ControlConfig {
             heartbeat_timeout_ns: 0,
+            max_messages_per_poll: 1024,
             io: IOConfig::Tcp {
                 bind_addr: bind_addr.to_string(),
                 max_frame_len: 4096,
@@ -1047,6 +1049,7 @@ mod tests {
         let market_data_path = temp_path("replay-market-data-output");
         let control = ControlRuntime::new(ControlConfig {
             heartbeat_timeout_ns: 0,
+            max_messages_per_poll: 1024,
             io: IOConfig::File {
                 input_path: None,
                 output_path: None,
@@ -1169,6 +1172,7 @@ mod tests {
 
         let control = new_control_with_config(ControlConfig {
             heartbeat_timeout_ns: 100_000_000,
+            max_messages_per_poll: 1024,
             io: IOConfig::Tcp {
                 bind_addr: control_addr.to_string(),
                 max_frame_len: 4096,
@@ -1222,6 +1226,7 @@ mod tests {
 
         let control = ControlRuntime::new(ControlConfig {
             heartbeat_timeout_ns: 10,
+            max_messages_per_poll: 1024,
             io: IOConfig::InMemory {
                 input: vec![InputRecord {
                     input_seq: 1,
@@ -1490,6 +1495,7 @@ mod tests {
 
             let control = ControlRuntime::new(ControlConfig {
                 heartbeat_timeout_ns: 0,
+                max_messages_per_poll: 1024,
                 io: IOConfig::Noop,
             })
             .expect("control");

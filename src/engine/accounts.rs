@@ -14,19 +14,17 @@
 //!
 //! # Main components
 //!
+//! - [`AccountTable`] owns all account state and the active-order lookup. The
+//!   account array is dense because account IDs are bounded at startup; the
+//!   order lookup is pre-sized to the engine's maximum resting-order count.
+//! - [`AccountBookState`] is the small amount of state maintained for one
+//!   account. It stores the ends of that account's active-order chain plus its
+//!   current resting-order count and raw open notional.
 //! - `AccountOrderKey` is the internal key for one live order. It packs the
 //!   account ID into the upper 64 bits of a `u128` and the client order ID into
 //!   the lower 64 bits. No identifier bits are discarded, so two distinct
 //!   `(account_id, client_order_id)` pairs cannot become the same key before
 //!   the hash map hashes them.
-
-//! - [`AccountBookState`] is the small amount of state maintained for one
-//!   account. It stores the ends of that account's active-order chain plus its
-//!   current resting-order count and raw open notional.
-
-//! - [`AccountTable`] owns all account state and the active-order lookup. The
-//!   account array is dense because account IDs are bounded at startup; the
-//!   order lookup is pre-sized to the engine's maximum resting-order count.
 //!
 //! # Relationship to order storage
 //!
@@ -41,43 +39,6 @@ use crate::domain::trading::order::{AccountId, OrderId};
 use hashbrown::HashMap;
 
 use super::orders::OrderHandle;
-
-/// Internal identity of one currently resting order within its owning account.
-/// This is a packed value rather than a tuple so the hash map handles one small,
-/// copyable integer key. Packing is lossless: the account occupies the upper
-/// half and the client order ID occupies the lower half.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct AccountOrderKey(
-    /// Account ID in the upper 64 bits and client order ID in the lower 64 bits.
-    u128,
-);
-
-impl AccountOrderKey {
-    /// Pack both identifiers without losing any bits.
-    const fn new(account_id: AccountId, client_order_id: OrderId) -> Self {
-        // distinct ID pairs produce distinct packed values because every bit of
-        // both wire identifiers is preserved. the hash map still performs normal
-        // hashing and collision resolution on this value.
-        Self((account_id.raw() as u128) << u64::BITS | client_order_id.raw() as u128)
-    }
-}
-
-/// Book state maintained for one configured account.
-///
-/// The chain endpoints allow the engine to reach only this account's orders.
-/// Counts and notional are updated alongside book mutations so risk and control
-/// queries do not need to scan the order book.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AccountBookState {
-    /// Oldest reachable live order in this account's intrusive order chain.
-    pub(crate) head: Option<OrderHandle>,
-    /// Newest reachable live order in this account's intrusive order chain.
-    pub(crate) tail: Option<OrderHandle>,
-    /// Number of this account's orders that are currently resting on the book.
-    pub(crate) open_order_count: u32,
-    /// Sum of raw `price * remaining_qty` across this account's resting orders.
-    pub(crate) open_notional: u128,
-}
 
 /// Owner of per-account book state and account-scoped live-order lookup.
 ///
@@ -179,5 +140,41 @@ impl AccountTable {
         let removed = self.remove_order(account_id, old_client_order_id);
         debug_assert_eq!(removed, Some(handle), "replacement must rekey its original live order");
         self.insert_order(account_id, new_client_order_id, handle);
+    }
+}
+/// Book state maintained for one configured account.
+///
+/// The chain endpoints allow the engine to reach only this account's orders.
+/// Counts and notional are updated alongside book mutations so risk and control
+/// queries do not need to scan the order book.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AccountBookState {
+    /// Oldest reachable live order in this account's intrusive order chain.
+    pub(crate) head: Option<OrderHandle>,
+    /// Newest reachable live order in this account's intrusive order chain.
+    pub(crate) tail: Option<OrderHandle>,
+    /// Number of this account's orders that are currently resting on the book.
+    pub(crate) open_order_count: u32,
+    /// Sum of raw `price * remaining_qty` across this account's resting orders.
+    pub(crate) open_notional: u128,
+}
+
+/// Internal identity of one currently resting order within its owning account.
+/// This is a packed value rather than a tuple so the hash map handles one small,
+/// copyable integer key. Packing is lossless: the account occupies the upper
+/// half and the client order ID occupies the lower half.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AccountOrderKey(
+    /// Account ID in the upper 64 bits and client order ID in the lower 64 bits.
+    u128,
+);
+
+impl AccountOrderKey {
+    /// Pack both identifiers without losing any bits.
+    const fn new(account_id: AccountId, client_order_id: OrderId) -> Self {
+        // distinct ID pairs produce distinct packed values because every bit of
+        // both wire identifiers is preserved. the hash map still performs normal
+        // hashing and collision resolution on this value.
+        Self((account_id.raw() as u128) << u64::BITS | client_order_id.raw() as u128)
     }
 }

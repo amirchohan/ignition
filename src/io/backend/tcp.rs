@@ -1,7 +1,21 @@
-//! Reusable nonblocking framed I/O.
+//! Nonblocking framed TCP input and output for one active client.
 //!
-//! This module owns transport mechanics only. Endpoint modules decide how to
-//! decode and encode the SBE payload carried by each complete frame.
+//! [`TcpFrameIo`] owns the listener, the accepted client, an accumulated read
+//! buffer, and a fixed-capacity write ring. It accepts at most one active client
+//! while continuing to drain the listener backlog. [`TcpFramePublisher`] is a
+//! borrowed view of that client's write state, allowing an endpoint callback to
+//! respond while the input frame remains borrowed from the read buffer.
+//!
+//! Reads may contain partial or multiple SBE frames. The SBE block length in
+//! each header determines the complete frame boundary; incomplete bytes remain
+//! buffered for the next poll. Polling stops at its frame budget or when the
+//! callback requests it. Output preserves byte order in a bounded ring and a
+//! client is disconnected on overflow or terminal transport failure so stale
+//! bytes cannot leak into a later connection.
+//!
+//! The parent backend assigns global input sequences and optionally records
+//! accepted live frames. Endpoint modules above this transport decode and
+//! encode the SBE messages; this module treats every complete frame as bytes.
 
 use std::{
     io::{Read, Write},
@@ -10,19 +24,294 @@ use std::{
 
 use crate::{clock::Clock, domain::RecvTs, protocol::SBE_HEADER_LEN};
 
-use super::{FramePollControl, FramePollError, FramePollStatus, IoError};
+use super::{FrameLatencyStart, FramePollControl, FramePollError, FramePollStatus, InboundFrame, IoError};
+
+/// Owner of a nonblocking listener, one active client, and framed byte buffers.
+#[derive(Debug)]
+pub struct TcpFrameIo {
+    /// Nonblocking listener kept open across client sessions.
+    listener: TcpListener,
+    /// Sole client allowed to exchange frames with this runtime.
+    active: Option<TcpStream>,
+    /// Accumulated input bytes containing zero or more complete frames.
+    read_buf: Vec<u8>,
+    /// Index of the first input byte not yet delivered.
+    read_start: usize,
+    /// Fixed-size circular buffer for unsent output bytes.
+    write_buf: Vec<u8>,
+    /// Index of the first unsent output byte.
+    write_head: usize,
+    /// Number of unsent bytes in the output ring.
+    write_len: usize,
+    /// Maximum accepted complete SBE frame length.
+    max_frame_len: usize,
+    /// Maximum number of output bytes retained between flushes.
+    max_pending_write_bytes: usize,
+}
+
+impl TcpFrameIo {
+    /// Bind a nonblocking listener with bounded input frames and pending output.
+    pub fn bind(bind_addr: &str, max_frame_len: usize, max_pending_write_bytes: usize) -> Result<Self, IoError> {
+        let listener = TcpListener::bind(bind_addr).map_err(IoError::Bind)?;
+        listener.set_nonblocking(true).map_err(IoError::Configure)?;
+        Ok(Self {
+            listener,
+            active: None,
+            read_buf: Vec::with_capacity(max_frame_len),
+            read_start: 0,
+            write_buf: vec![0_u8; max_pending_write_bytes],
+            write_head: 0,
+            write_len: 0,
+            max_frame_len,
+            max_pending_write_bytes,
+        })
+    }
+
+    /// Return the listener's resolved local address.
+    pub fn local_addr(&self) -> Result<SocketAddr, IoError> {
+        self.listener.local_addr().map_err(IoError::LocalAddr)
+    }
+
+    /// Accept, read, dispatch up to `max_frames`, and flush queued responses.
+    pub(crate) fn poll<F, E>(&mut self, clock: &Clock, max_frames: usize, on_frame: F) -> Result<FramePollStatus, FramePollError<E>>
+    where
+        F: FnMut(&mut TcpFramePublisher<'_>, InboundFrame<'_>) -> Result<FramePollControl, E>,
+    {
+        // accepting first lets a newly connected client contribute input during the same runtime tick.
+        let accepted = self.accept_available().map_err(FramePollError::Io)?;
+
+        // partial frames must stay buffered because TCP does not preserve application frame boundaries.
+        let read = self.read_available(clock, on_frame, max_frames)?;
+
+        // flushing after dispatch gives callback-generated responses a send opportunity in the same tick.
+        let flushed = self.flush_pending().map_err(FramePollError::Io)?;
+
+        Ok(FramePollStatus {
+            progress: accepted || read.progress || flushed,
+            stopped: read.stopped,
+        })
+    }
+
+    /// Queue one frame on the active client's output ring.
+    pub fn queue_frame(&mut self, frame: &[u8]) -> Result<(), IoError> {
+        self.publisher().queue_frame(frame)
+    }
+
+    /// Flush the active client's pending output bytes.
+    pub fn flush_pending(&mut self) -> Result<bool, IoError> {
+        self.publisher().flush_pending()
+    }
+
+    /// Drain pending accepts while retaining only the first active client.
+    fn accept_available(&mut self) -> Result<bool, IoError> {
+        let mut made_progress = false;
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(true).map_err(IoError::Configure)?;
+                    made_progress = true;
+                    if self.active.is_none() {
+                        self.active = Some(stream);
+                    }
+                    // dropping additional accepted streams enforces a single active client without blocking the listener.
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return Ok(made_progress);
+                }
+                Err(error) => return Err(IoError::Read(error)),
+            }
+        }
+    }
+
+    /// Read available bytes and dispatch complete frames within the poll budget.
+    fn read_available<F, E>(&mut self, clock: &Clock, mut on_frame: F, max_frames: usize) -> Result<FramePollStatus, FramePollError<E>>
+    where
+        F: FnMut(&mut TcpFramePublisher<'_>, InboundFrame<'_>) -> Result<FramePollControl, E>,
+    {
+        if self.active.is_none() {
+            return Ok(FramePollStatus {
+                progress: false,
+                stopped: false,
+            });
+        }
+
+        let mut made_progress = false;
+        let mut buf = [0_u8; 4096];
+        loop {
+            let read_result = match self.active.as_mut() {
+                Some(stream) => stream.read(&mut buf),
+                None => {
+                    return Ok(FramePollStatus {
+                        progress: made_progress,
+                        stopped: false,
+                    });
+                }
+            };
+            match read_result {
+                Ok(0) => {
+                    // eof ends the session and invalidates both partial input and queued output.
+                    self.disconnect_active();
+                    return Ok(FramePollStatus {
+                        progress: true,
+                        stopped: false,
+                    });
+                }
+                Ok(read) => {
+                    made_progress = true;
+                    self.read_buf.extend_from_slice(&buf[..read]);
+                    let (return_from_poll, stopped) = self.dispatch_complete_frames(clock, &mut on_frame, max_frames)?;
+                    if return_from_poll {
+                        self.compact_read_buf();
+                        return Ok(FramePollStatus { progress: true, stopped });
+                    }
+                    self.compact_read_buf();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    self.compact_read_buf();
+                    return Ok(FramePollStatus {
+                        progress: made_progress,
+                        stopped: false,
+                    });
+                }
+                Err(error) => {
+                    self.disconnect_active();
+                    return Err(FramePollError::Io(IoError::Read(error)));
+                }
+            }
+        }
+    }
+
+    /// Deliver complete buffered frames and report whether polling should return.
+    fn dispatch_complete_frames<F, E>(
+        &mut self,
+        clock: &Clock,
+        on_frame: &mut F,
+        max_frames: usize,
+    ) -> Result<(bool, bool), FramePollError<E>>
+    where
+        F: FnMut(&mut TcpFramePublisher<'_>, InboundFrame<'_>) -> Result<FramePollControl, E>,
+    {
+        let Self {
+            active,
+            read_buf,
+            read_start,
+            write_buf,
+            write_head,
+            write_len,
+            max_frame_len,
+            max_pending_write_bytes,
+            ..
+        } = self;
+        let mut frames = 0_usize;
+        loop {
+            if frames >= max_frames {
+                return Ok((true, false));
+            }
+            if read_buf.len() - *read_start < SBE_HEADER_LEN {
+                return Ok((false, false));
+            }
+            let block_len = u16::from_le_bytes([read_buf[*read_start], read_buf[*read_start + 1]]) as usize;
+            // the protocol header is part of the delivered frame but its block length describes only the following body.
+            let frame_len = SBE_HEADER_LEN + block_len;
+            if frame_len > *max_frame_len {
+                // clearing all session state prevents bytes following an invalid frame from being interpreted as a new frame.
+                *active = None;
+                read_buf.clear();
+                *read_start = 0;
+                *write_head = 0;
+                *write_len = 0;
+                return Err(FramePollError::Io(IoError::FrameTooLarge {
+                    frame_len,
+                    max_frame_len: *max_frame_len,
+                }));
+            }
+            if read_buf.len() - *read_start < frame_len {
+                return Ok((false, false));
+            }
+
+            let frame_start = *read_start;
+            let frame_end = frame_start + frame_len;
+            let recv_ts = RecvTs::new(clock.now_ns());
+            // advancing before the callback allows the frame slice and mutable output state to be borrowed independently.
+            *read_start = frame_end;
+            let mut publisher = TcpFramePublisher {
+                active,
+                write_buf,
+                write_head,
+                write_len,
+                max_pending_write_bytes: *max_pending_write_bytes,
+            };
+            let control = on_frame(
+                &mut publisher,
+                InboundFrame {
+                    recv_ts,
+                    latency_start: FrameLatencyStart::HandlerEntry,
+                    bytes: &read_buf[frame_start..frame_end],
+                },
+            )
+            .map_err(FramePollError::Handler)?;
+            frames += 1;
+            if control == FramePollControl::Stop {
+                return Ok((true, true));
+            }
+        }
+    }
+
+    /// Move undelivered input to the front without changing its byte order.
+    fn compact_read_buf(&mut self) {
+        if self.read_start == 0 {
+            return;
+        }
+        if self.read_start == self.read_buf.len() {
+            self.read_buf.clear();
+            self.read_start = 0;
+            return;
+        }
+
+        let remaining = self.read_buf.len() - self.read_start;
+        self.read_buf.copy_within(self.read_start.., 0);
+        self.read_buf.truncate(remaining);
+        self.read_start = 0;
+    }
+
+    /// Drop the active client and reset all session-owned buffered state.
+    fn disconnect_active(&mut self) {
+        self.active = None;
+        self.read_buf.clear();
+        self.read_start = 0;
+        self.write_head = 0;
+        self.write_len = 0;
+    }
+
+    /// Borrow the active client's output state through the publisher interface.
+    fn publisher(&mut self) -> TcpFramePublisher<'_> {
+        TcpFramePublisher {
+            active: &mut self.active,
+            write_buf: &mut self.write_buf,
+            write_head: &mut self.write_head,
+            write_len: &mut self.write_len,
+            max_pending_write_bytes: self.max_pending_write_bytes,
+        }
+    }
+}
 
 /// Raw frame publisher borrowed during transport polling.
 #[derive(Debug)]
 pub struct TcpFramePublisher<'a> {
+    /// Borrowed active client receiving queued bytes.
     active: &'a mut Option<TcpStream>,
+    /// Fixed-size circular buffer owned by the TCP runtime.
     write_buf: &'a mut Vec<u8>,
+    /// Index of the first unsent byte in the circular buffer.
     write_head: &'a mut usize,
+    /// Number of unsent bytes currently in the circular buffer.
     write_len: &'a mut usize,
+    /// Configured upper bound for pending output bytes.
     max_pending_write_bytes: usize,
 }
 
 impl TcpFramePublisher<'_> {
+    /// Create a shorter-lived publisher over the same TCP output state.
     pub fn reborrow(&mut self) -> TcpFramePublisher<'_> {
         TcpFramePublisher {
             active: self.active,
@@ -33,6 +322,7 @@ impl TcpFramePublisher<'_> {
         }
     }
 
+    /// Flush prior output, queue one frame, and attempt to flush it immediately.
     pub fn publish(&mut self, frame: &[u8]) -> Result<(), IoError> {
         self.flush_pending()?;
         self.queue_frame(frame)?;
@@ -40,9 +330,11 @@ impl TcpFramePublisher<'_> {
         Ok(())
     }
 
+    /// Append one frame to the active client's bounded output ring.
     pub fn queue_frame(&mut self, frame: &[u8]) -> Result<(), IoError> {
         let pending_bytes = self.write_len.saturating_add(frame.len());
         if pending_bytes > self.max_pending_write_bytes {
+            // disconnecting also discards queued bytes so a future client cannot receive another session's output.
             self.disconnect_active();
             return Err(IoError::PendingWriteLimit {
                 pending_bytes,
@@ -53,9 +345,11 @@ impl TcpFramePublisher<'_> {
         Ok(())
     }
 
+    /// Write pending bytes until the socket blocks or the ring is empty.
     pub fn flush_pending(&mut self) -> Result<bool, IoError> {
         let mut made_progress = false;
         let Some(stream) = self.active.as_mut() else {
+            // output has no valid recipient once the active session is absent.
             *self.write_head = 0;
             *self.write_len = 0;
             return Ok(false);
@@ -63,6 +357,7 @@ impl TcpFramePublisher<'_> {
 
         while *self.write_len != 0 {
             let write_cap = self.write_buf.len();
+            // only the contiguous head segment can be passed to one socket write when the ring wraps.
             let contiguous = if *self.write_head + *self.write_len <= write_cap {
                 *self.write_len
             } else {
@@ -91,12 +386,14 @@ impl TcpFramePublisher<'_> {
         Ok(made_progress)
     }
 
+    /// Drop the active session and all output owned by that session.
     fn disconnect_active(&mut self) {
         *self.active = None;
         *self.write_head = 0;
         *self.write_len = 0;
     }
 
+    /// Copy bytes into the free tail of the circular output buffer.
     fn push_write_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -111,343 +408,6 @@ impl TcpFramePublisher<'_> {
             self.write_buf[..bytes.len() - first].copy_from_slice(&bytes[first..]);
         }
         *self.write_len += bytes.len();
-    }
-}
-
-/// Nonblocking TCP listener with one active client.
-#[derive(Debug)]
-pub struct TcpFrameIo {
-    listener: TcpListener,
-    active: Option<TcpStream>,
-    read_buf: Vec<u8>,
-    read_start: usize,
-    write_buf: Vec<u8>,
-    write_head: usize,
-    write_len: usize,
-    max_frame_len: usize,
-    max_pending_write_bytes: usize,
-}
-
-impl TcpFrameIo {
-    pub fn bind(bind_addr: &str, max_frame_len: usize, max_pending_write_bytes: usize) -> Result<Self, IoError> {
-        let listener = TcpListener::bind(bind_addr).map_err(IoError::Bind)?;
-        listener.set_nonblocking(true).map_err(IoError::Configure)?;
-        Ok(Self {
-            listener,
-            active: None,
-            read_buf: Vec::with_capacity(max_frame_len),
-            read_start: 0,
-            write_buf: vec![0_u8; max_pending_write_bytes],
-            write_head: 0,
-            write_len: 0,
-            max_frame_len,
-            max_pending_write_bytes,
-        })
-    }
-
-    pub fn local_addr(&self) -> Result<SocketAddr, IoError> {
-        self.listener.local_addr().map_err(IoError::LocalAddr)
-    }
-
-    fn accept_available(&mut self) -> Result<bool, IoError> {
-        let mut made_progress = false;
-        loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    stream.set_nonblocking(true).map_err(IoError::Configure)?;
-                    made_progress = true;
-                    if self.active.is_none() {
-                        self.active = Some(stream);
-                    }
-                    // Dropping additional accepted streams enforces a single
-                    // active control client without blocking the listener.
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Ok(made_progress);
-                }
-                Err(error) => return Err(IoError::Read(error)),
-            }
-        }
-    }
-
-    fn read_available_controlled<F, E>(
-        &mut self,
-        clock: &Clock,
-        mut on_frame: F,
-        max_frames: Option<usize>,
-    ) -> Result<FramePollStatus, FramePollError<E>>
-    where
-        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>,
-    {
-        if self.active.is_none() {
-            return Ok(FramePollStatus {
-                progress: false,
-                stopped: false,
-            });
-        }
-
-        let mut made_progress = false;
-        let mut buf = [0_u8; 4096];
-        loop {
-            let read_result = match self.active.as_mut() {
-                Some(stream) => stream.read(&mut buf),
-                None => {
-                    return Ok(FramePollStatus {
-                        progress: made_progress,
-                        stopped: false,
-                    });
-                }
-            };
-            match read_result {
-                Ok(0) => {
-                    self.disconnect_active();
-                    return Ok(FramePollStatus {
-                        progress: true,
-                        stopped: false,
-                    });
-                }
-                Ok(read) => {
-                    made_progress = true;
-                    self.read_buf.extend_from_slice(&buf[..read]);
-                    let (return_from_poll, stopped) = self.drain_complete_frames_controlled(clock, &mut on_frame, max_frames)?;
-                    if return_from_poll {
-                        self.compact_read_buf();
-                        return Ok(FramePollStatus { progress: true, stopped });
-                    }
-                    self.compact_read_buf();
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    self.compact_read_buf();
-                    return Ok(FramePollStatus {
-                        progress: made_progress,
-                        stopped: false,
-                    });
-                }
-                Err(error) => {
-                    self.disconnect_active();
-                    return Err(FramePollError::Io(IoError::Read(error)));
-                }
-            }
-        }
-    }
-
-    fn drain_complete_frames_controlled<F, E>(
-        &mut self,
-        clock: &Clock,
-        on_frame: &mut F,
-        max_frames: Option<usize>,
-    ) -> Result<(bool, bool), FramePollError<E>>
-    where
-        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>,
-    {
-        let Self {
-            active,
-            read_buf,
-            read_start,
-            write_buf,
-            write_head,
-            write_len,
-            max_frame_len,
-            max_pending_write_bytes,
-            ..
-        } = self;
-        let mut frames = 0_usize;
-        loop {
-            if max_frames.is_some_and(|max_frames| frames >= max_frames) {
-                return Ok((true, false));
-            }
-            if read_buf.len() - *read_start < SBE_HEADER_LEN {
-                return Ok((false, false));
-            }
-            let block_len = u16::from_le_bytes([read_buf[*read_start], read_buf[*read_start + 1]]) as usize;
-            let frame_len = SBE_HEADER_LEN + block_len;
-            if frame_len > *max_frame_len {
-                *active = None;
-                read_buf.clear();
-                *read_start = 0;
-                *write_head = 0;
-                *write_len = 0;
-                return Err(FramePollError::Io(IoError::FrameTooLarge {
-                    frame_len,
-                    max_frame_len: *max_frame_len,
-                }));
-            }
-            if read_buf.len() - *read_start < frame_len {
-                return Ok((false, false));
-            }
-
-            let frame_start = *read_start;
-            let frame_end = frame_start + frame_len;
-            let recv_ts = RecvTs::new(clock.now_ns());
-            *read_start = frame_end;
-            let mut publisher = TcpFramePublisher {
-                active,
-                write_buf,
-                write_head,
-                write_len,
-                max_pending_write_bytes: *max_pending_write_bytes,
-            };
-            let control = on_frame(&mut publisher, recv_ts, &read_buf[frame_start..frame_end]).map_err(FramePollError::Handler)?;
-            frames += 1;
-            if control == FramePollControl::Stop {
-                return Ok((true, true));
-            }
-        }
-    }
-
-    fn compact_read_buf(&mut self) {
-        if self.read_start == 0 {
-            return;
-        }
-        if self.read_start == self.read_buf.len() {
-            self.read_buf.clear();
-            self.read_start = 0;
-            return;
-        }
-
-        let remaining = self.read_buf.len() - self.read_start;
-        self.read_buf.copy_within(self.read_start.., 0);
-        self.read_buf.truncate(remaining);
-        self.read_start = 0;
-    }
-
-    fn flush_writes(&mut self) -> Result<bool, IoError> {
-        let mut made_progress = false;
-        let Some(stream) = self.active.as_mut() else {
-            self.write_head = 0;
-            self.write_len = 0;
-            return Ok(false);
-        };
-
-        while self.write_len != 0 {
-            let write_cap = self.write_buf.len();
-            let contiguous = if self.write_head + self.write_len <= write_cap {
-                self.write_len
-            } else {
-                write_cap - self.write_head
-            };
-            match stream.write(&self.write_buf[self.write_head..self.write_head + contiguous]) {
-                Ok(0) => return Ok(made_progress),
-                Ok(written) => {
-                    made_progress = true;
-                    self.write_head = (self.write_head + written) % write_cap;
-                    self.write_len -= written;
-                    if self.write_len == 0 {
-                        self.write_head = 0;
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Ok(made_progress);
-                }
-                Err(error) => {
-                    self.disconnect_active();
-                    return Err(IoError::Write(error));
-                }
-            }
-        }
-
-        Ok(made_progress)
-    }
-
-    fn disconnect_active(&mut self) {
-        self.active = None;
-        self.read_buf.clear();
-        self.read_start = 0;
-        self.write_head = 0;
-        self.write_len = 0;
-    }
-
-    pub fn poll<F, E>(&mut self, clock: &Clock, on_frame: F) -> Result<bool, FramePollError<E>>
-    where
-        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
-    {
-        self.poll_controlled(clock, adapt_controlled_callback(on_frame))
-            .map(|status| status.progress)
-    }
-
-    pub fn poll_bounded<F, E>(&mut self, clock: &Clock, on_frame: F, max_frames: usize) -> Result<bool, FramePollError<E>>
-    where
-        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
-    {
-        self.poll_bounded_controlled(clock, adapt_controlled_callback(on_frame), max_frames)
-            .map(|status| status.progress)
-    }
-
-    pub(crate) fn poll_controlled<F, E>(&mut self, clock: &Clock, on_frame: F) -> Result<FramePollStatus, FramePollError<E>>
-    where
-        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>,
-    {
-        self.poll_inner_controlled(clock, on_frame, None)
-    }
-
-    pub(crate) fn poll_bounded_controlled<F, E>(
-        &mut self,
-        clock: &Clock,
-        on_frame: F,
-        max_frames: usize,
-    ) -> Result<FramePollStatus, FramePollError<E>>
-    where
-        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>,
-    {
-        self.poll_inner_controlled(clock, on_frame, Some(max_frames))
-    }
-
-    fn poll_inner_controlled<F, E>(
-        &mut self,
-        clock: &Clock,
-        on_frame: F,
-        max_frames: Option<usize>,
-    ) -> Result<FramePollStatus, FramePollError<E>>
-    where
-        F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>,
-    {
-        // First accept any waiting client so new input can be read this tick.
-        let accepted = self.accept_available().map_err(FramePollError::Io)?;
-
-        // Then read whatever bytes are available and call the handler for each
-        // complete frame. Partial frames stay buffered for a later poll.
-        let read = self.read_available_controlled(clock, on_frame, max_frames)?;
-
-        // Finally push out anything endpoint code queued while handling input.
-        let flushed = self.flush_writes().map_err(FramePollError::Io)?;
-
-        // The scheduler only needs to know whether this poll did useful work.
-        Ok(FramePollStatus {
-            progress: accepted || read.progress || flushed,
-            stopped: read.stopped,
-        })
-    }
-
-    pub fn publish(&mut self, frame: &[u8]) -> Result<(), IoError> {
-        self.publisher().publish(frame)
-    }
-
-    pub fn queue_frame(&mut self, frame: &[u8]) -> Result<(), IoError> {
-        self.publisher().queue_frame(frame)
-    }
-
-    pub fn flush_pending(&mut self) -> Result<bool, IoError> {
-        self.flush_writes()
-    }
-
-    fn publisher(&mut self) -> TcpFramePublisher<'_> {
-        TcpFramePublisher {
-            active: &mut self.active,
-            write_buf: &mut self.write_buf,
-            write_head: &mut self.write_head,
-            write_len: &mut self.write_len,
-            max_pending_write_bytes: self.max_pending_write_bytes,
-        }
-    }
-}
-
-fn adapt_controlled_callback<F, E>(mut on_frame: F) -> impl FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<FramePollControl, E>
-where
-    F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
-{
-    move |publisher, recv_ts, frame| {
-        on_frame(publisher, recv_ts, frame)?;
-        Ok(FramePollControl::Continue)
     }
 }
 
@@ -479,14 +439,15 @@ mod tests {
     }
 
     fn poll_once(io: &mut TcpFrameIo, clock: &Clock, out: &mut Vec<CapturedFrame>) -> bool {
-        io.poll(clock, |_, recv_ts, bytes| {
+        io.poll(clock, 128, |_, frame| {
             out.push(CapturedFrame {
-                recv_ts,
-                bytes: bytes.to_vec(),
+                recv_ts: frame.recv_ts,
+                bytes: frame.bytes.to_vec(),
             });
-            Ok::<(), std::convert::Infallible>(())
+            Ok::<FramePollControl, std::convert::Infallible>(FramePollControl::Continue)
         })
         .expect("poll")
+        .progress
     }
 
     fn poll_until_frame(io: &mut TcpFrameIo, clock: &Clock, out: &mut Vec<CapturedFrame>) {
@@ -561,13 +522,17 @@ mod tests {
         let output = frame(MessageKind::HeartbeatStatus, &[9, 8, 7, 6]);
 
         for _ in 0..100 {
-            io.poll(&clock, |_, _, _| Ok::<(), std::convert::Infallible>(())).expect("accept");
+            io.poll(&clock, 128, |_, _| {
+                Ok::<FramePollControl, std::convert::Infallible>(FramePollControl::Continue)
+            })
+            .expect("accept");
             if io.active.is_some() {
                 break;
             }
             thread::sleep(Duration::from_millis(1));
         }
-        io.publish(&output).expect("publish");
+        io.queue_frame(&output).expect("queue");
+        io.flush_pending().expect("publish");
 
         let mut read = vec![0_u8; output.len()];
         client.read_exact(&mut read).expect("read output");

@@ -159,6 +159,7 @@ impl RiskRuntimeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ControlRuntimeConfig {
     pub heartbeat_timeout_ns: u64,
+    pub max_messages_per_poll: usize,
     #[serde(flatten)]
     pub backend: ControlBackendConfig,
 }
@@ -169,6 +170,7 @@ impl ControlRuntimeConfig {
         ControlConfig {
             heartbeat_timeout_ns: self.heartbeat_timeout_ns,
             io: self.backend.validate(),
+            max_messages_per_poll: self.max_messages_per_poll,
         }
     }
 
@@ -541,6 +543,7 @@ risk:
 control:
   type: noop
   heartbeat_timeout_ns: 0
+  max_messages_per_poll: 1024
 gateway:
   type: noop
   max_messages_per_poll: 1024

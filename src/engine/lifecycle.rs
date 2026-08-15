@@ -300,9 +300,9 @@ impl Engine {
 
         if current.price == replace.price && replace.qty.raw() <= current.remaining_qty {
             // same-price reductions stay in the existing FIFO position.
-            self.preserve_priority_replace(handle, replace, current.remaining_qty)?;
+            let level_qty = self.preserve_priority_replace(handle, replace, current.remaining_qty)?;
             if replace.qty.raw() != current.remaining_qty {
-                self.publish_book_update(current.side, current.price, replace.qty.raw(), sequencer, market_data)?;
+                self.publish_book_update(current.side, current.price, level_qty, sequencer, market_data)?;
             }
             self.push_report(
                 sequencer,

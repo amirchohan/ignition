@@ -1,67 +1,54 @@
-//! Endpoint I/O for live traffic, replay traffic, and captured output.
+//! Framed endpoint I/O for live traffic, deterministic replay, and benchmarks.
 //!
-//! Each endpoint runtime owns one `IORuntime`. The endpoint runtime asks this
-//! module for complete frames, then the endpoint runtime decodes those bytes
-//! into control, gateway, or market-data messages.
+//! This module is the transport boundary between the control, gateway, and
+//! market-data runtimes and the byte-oriented mechanisms that carry their
+//! frames. It owns framing, bounded polling, output buffering, live-input
+//! recording, and replay ordering. It does not decode business messages or
+//! mutate matching-engine state.
 //!
-//! In live mode, TCP reads bytes from a client connection and turns them into
-//! complete frames. When a frame is ready, `Mode` assigns the next input
-//! sequence number. If recording is enabled, the frame, endpoint, receive
-//! timestamp, and input sequence are written to a file before the endpoint
-//! handles the frame.
+//! # Main components
 //!
-//! In replay mode, file I/O looks at the next recorded frame without consuming
-//! it. The frame is only delivered when its input sequence is the next sequence
-//! expected by `Mode` and the recorded endpoint matches this `IORuntime`. After
-//! the endpoint handles the frame successfully, the replay input sequence moves
-//! forward.
+//! - [`IORuntime`] is the endpoint-facing facade. It owns exactly one
+//!   [`IOBackend`], its logical [`Endpoint`], and an optional file recorder.
+//! - [`IOConfig`] selects and sizes the concrete backend at startup.
+//! - [`InputRecord`] carries the metadata required to reproduce one inbound
+//!   frame deterministically.
+//! - [`IOPublisher`] is a short-lived borrowed view of backend-owned output
+//!   state, passed to an endpoint handler while an inbound frame is borrowed.
 //!
-//! Endpoint code sends responses through `IOPublisher`. This module only moves
-//! framed bytes in and out; it does not decode business messages or update the
-//! matching engine.
+//! # Data flow and invariants
+//!
+//! Live TCP input is framed first, assigned a global input sequence by
+//! [`Mode`], optionally recorded, and only then handed to its endpoint. Replay
+//! backends peek without consuming until the record's sequence is globally due
+//! and its endpoint matches the runtime. The replay sequence advances only
+//! after the handler succeeds. This keeps live recordings and replay behavior
+//! aligned across independently polled endpoint runtimes.
+//!
+//! Polling is bounded so one endpoint cannot monopolize a runtime tick. Output
+//! is queued into storage owned by the selected backend and flushed explicitly.
+//! The clock supplies receive or scheduled-arrival timestamps; protocol modules
+//! above this layer remain responsible for interpreting the frame bytes.
 
 use std::path::PathBuf;
 
 use crate::{clock::Clock, domain::RecvTs, runtime::Mode};
 
-pub mod file;
-pub mod in_memory;
-pub mod tcp;
-pub mod udp;
+mod backend;
 
-pub use file::{FileFrameIo, FileFramePublisher};
-pub use in_memory::{InMemoryFrameIo, InMemoryFramePublisher};
-pub use tcp::{TcpFrameIo, TcpFramePublisher};
-pub use udp::{UdpFramePublisher, UdpMulticastConfig};
+pub use backend::{
+    FileFrameIo, FileFramePublisher, IOBackend, IOPublisher, InMemoryFrameIo, InMemoryFramePublisher, TcpFrameIo, TcpFramePublisher,
+    UdpFramePublisher, UdpMulticastConfig,
+};
 
-/// Metric start policy attached to one inbound frame inside the runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FrameLatencyStart {
-    /// Start timing when the gateway handler receives the frame.
-    HandlerEntry,
-    /// Start timing at this benchmark-scheduled arrival on the runtime clock.
-    Scheduled(u64),
-}
-
-/// Per-frame control returned by an endpoint handler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FramePollControl {
-    Continue,
-    Stop,
-}
-
-/// Aggregate result of one controlled ingress poll.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FramePollStatus {
-    pub(crate) progress: bool,
-    pub(crate) stopped: bool,
-}
-
-/// Runtime-owned endpoint IO adapter.
+/// Endpoint-facing owner of one configured I/O backend and optional recorder.
 #[derive(Debug)]
 pub struct IORuntime {
+    /// Logical destination used to validate and record inbound frames.
     endpoint: Endpoint,
+    /// Concrete transport or replay mechanism selected at startup.
     backend: IOBackend,
+    /// Optional file sink that records accepted live input before handling.
     recorder: Option<FileFrameIo>,
 }
 
@@ -69,54 +56,7 @@ impl IORuntime {
     /// Build an endpoint IO adapter from a mode, endpoint, and backend config.
     pub fn new(endpoint: Endpoint, config: IOConfig) -> Result<Self, IoError> {
         let startup_log = IOStartupLog::from_config(&config);
-        let (backend, recorder) = match config {
-            IOConfig::Noop => (IOBackend::Noop, None),
-            IOConfig::Tcp {
-                bind_addr,
-                max_frame_len,
-                max_pending_write_bytes,
-                record_path,
-            } => {
-                let io = TcpFrameIo::bind(&bind_addr, max_frame_len, max_pending_write_bytes)?;
-                let recorder = match record_path {
-                    Some(path) => Some(FileFrameIo::open(None, Some(path), max_frame_len)?),
-                    None => None,
-                };
-                (IOBackend::Tcp(io), recorder)
-            }
-            IOConfig::Udp {
-                bind_addr,
-                group_addr,
-                multicast_ttl,
-                multicast_loop_v4,
-                max_datagram_len,
-                max_pending_datagram_bytes,
-            } => (
-                IOBackend::Udp(UdpFramePublisher::bind_multicast(UdpMulticastConfig {
-                    bind_addr,
-                    group_addr,
-                    multicast_ttl,
-                    multicast_loop_v4,
-                    max_datagram_len,
-                    max_pending_datagram_bytes,
-                })?),
-                None,
-            ),
-            IOConfig::File {
-                input_path,
-                output_path,
-                max_frame_len,
-            } => (IOBackend::File(FileFrameIo::open(input_path, output_path, max_frame_len)?), None),
-            IOConfig::InMemory { input, max_frame_len } => (IOBackend::InMemory(InMemoryFrameIo::new(input, max_frame_len)), None),
-            IOConfig::ScheduledInMemory {
-                input,
-                max_frame_len,
-                target_rate_per_sec,
-            } => (
-                IOBackend::InMemory(InMemoryFrameIo::new_scheduled(input, max_frame_len, target_rate_per_sec)?),
-                None,
-            ),
-        };
+        let (backend, recorder) = IOBackend::open(config)?;
 
         tracing::info!(
             "{}Runtime started. ingress: {} | egress: {}. Recorder: {}",
@@ -133,226 +73,29 @@ impl IORuntime {
         })
     }
 
-    /// Poll inbound frames without an explicit frame budget.
-    pub fn poll<F, E>(&mut self, clock: &Clock, mode: &mut Mode, on_frame: F) -> Result<bool, FramePollError<E>>
-    where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
-    {
-        self.poll_inner(clock, mode, adapt_untimed_callback(on_frame), None)
-    }
-
-    /// Poll inbound frames with a maximum number of frames accepted this call.
-    pub fn poll_bounded<F, E>(&mut self, clock: &Clock, mode: &mut Mode, on_frame: F, max_frames: usize) -> Result<bool, FramePollError<E>>
-    where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
-    {
-        self.poll_inner(clock, mode, adapt_untimed_callback(on_frame), Some(max_frames))
-    }
-
-    /// Poll bounded ingress and stop after a successfully handled frame on request.
-    pub(crate) fn poll_bounded_controlled_with_timing<F, E>(
+    /// Poll bounded ingress until the budget is reached or the handler stops the batch.
+    pub(crate) fn poll<F, E>(
         &mut self,
         clock: &Clock,
         mode: &mut Mode,
-        on_frame: F,
         max_frames: usize,
-    ) -> Result<FramePollStatus, FramePollError<E>>
-    where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
-    {
-        self.poll_inner_controlled(clock, mode, on_frame, Some(max_frames))
-    }
-
-    fn poll_inner<F, E>(
-        &mut self,
-        clock: &Clock,
-        mode: &mut Mode,
         on_frame: F,
-        max_frames: Option<usize>,
-    ) -> Result<bool, FramePollError<E>>
-    where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
-    {
-        self.poll_inner_controlled(clock, mode, adapt_controlled_callback(on_frame), max_frames)
-            .map(|status| status.progress)
-    }
-
-    fn poll_inner_controlled<F, E>(
-        &mut self,
-        clock: &Clock,
-        mode: &mut Mode,
-        on_frame: F,
-        max_frames: Option<usize>,
     ) -> Result<FramePollStatus, FramePollError<E>>
     where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
+        F: FnMut(&mut IOPublisher<'_>, InboundFrame<'_>) -> Result<FramePollControl, E>,
     {
-        if matches!(&self.backend, IOBackend::Tcp(_)) {
-            self.poll_tcp_controlled(clock, mode, on_frame, max_frames)
-        } else if matches!(&self.backend, IOBackend::File(_)) {
-            self.poll_file_controlled(mode, on_frame)
-        } else if matches!(&self.backend, IOBackend::InMemory(_)) {
-            self.poll_in_memory_controlled(clock, mode, on_frame, max_frames)
-        } else {
-            // These backends do not produce inbound frames here.
-            Ok(FramePollStatus {
-                progress: false,
-                stopped: false,
-            })
-        }
-    }
-
-    fn poll_tcp_controlled<F, E>(
-        &mut self,
-        clock: &Clock,
-        mode: &mut Mode,
-        mut on_frame: F,
-        max_frames: Option<usize>,
-    ) -> Result<FramePollStatus, FramePollError<E>>
-    where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
-    {
-        let IOBackend::Tcp(io) = &mut self.backend else {
-            return Ok(FramePollStatus {
-                progress: false,
-                stopped: false,
-            });
-        };
-
-        let endpoint = self.endpoint;
-        let recorder = &mut self.recorder;
-        let mut callback = |publisher: &mut TcpFramePublisher<'_>, recv_ts, bytes: &[u8]| {
-            // Live input becomes deterministic at this boundary.
-            // Every accepted frame gets one global input sequence.
-            let input_seq = mode.accept_live_frame().map_err(RuntimeFrameError::Io)?;
-
-            // If this endpoint is recording, write exactly what replay
-            // will need later: sequence, endpoint, timestamp, and bytes.
-            if let Some(recorder) = recorder.as_mut() {
-                recorder
-                    .record_input(&InputRecord {
-                        input_seq,
-                        endpoint,
-                        recv_ts,
-                        frame: bytes.to_vec(),
-                    })
-                    .map_err(RuntimeFrameError::Io)?;
-            }
-
-            // Endpoint code sees an endpoint-neutral publisher, not the
-            // concrete TCP transport object.
-            let mut publisher = IOPublisher::Tcp(publisher.reborrow());
-            on_frame(&mut publisher, recv_ts, FrameLatencyStart::HandlerEntry, bytes).map_err(RuntimeFrameError::Handler)
-        };
-
-        // TCP owns connection handling and frame assembly. This layer adds
-        // sequencing, optional recording, and endpoint dispatch.
-        let result = match max_frames {
-            Some(max_frames) => io.poll_bounded_controlled(clock, &mut callback, max_frames),
-            None => io.poll_controlled(clock, &mut callback),
-        };
-        let mut status = flatten_controlled_poll_error(result)?;
-        let record_progress = match recorder.as_mut() {
-            Some(recorder) => recorder.flush_pending().map_err(FramePollError::Io)?,
-            None => false,
-        };
-        status.progress |= record_progress;
-        Ok(status)
-    }
-
-    fn poll_file_controlled<F, E>(&mut self, mode: &mut Mode, mut on_frame: F) -> Result<FramePollStatus, FramePollError<E>>
-    where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
-    {
-        let IOBackend::File(io) = &mut self.backend else {
-            return Ok(FramePollStatus {
-                progress: false,
-                stopped: false,
-            });
-        };
-
-        // Replay peeks first so this endpoint does not consume a frame that
-        // belongs to another endpoint or a later input sequence.
-        let Some(record) = io.peek_record().map_err(FramePollError::Io)?.cloned() else {
-            return Ok(FramePollStatus {
-                progress: false,
-                stopped: false,
-            });
-        };
-
-        // If this is not the next global input, another endpoint must run
-        // first. Returning no progress lets the runtime poll it.
-        if record.input_seq != mode.expected_replay_input_seq().map_err(FramePollError::Io)? {
-            return Ok(FramePollStatus {
-                progress: false,
-                stopped: false,
-            });
-        }
-
-        // A matching sequence with the wrong endpoint means the replay file was
-        // wired to the wrong runtime.
-        if record.endpoint != self.endpoint {
-            return Err(FramePollError::Io(IoError::EndpointMismatch {
-                configured: self.endpoint,
-                record: record.endpoint,
-            }));
-        }
-
-        // Now the frame is known to be this endpoint's next input, so it is
-        // safe to consume and deliver to endpoint code.
-        let record = io.take_peeked().expect("peeked record");
-        let mut publisher = IOPublisher::File(FileFramePublisher::new(io));
-        let control =
-            on_frame(&mut publisher, record.recv_ts, FrameLatencyStart::HandlerEntry, &record.frame).map_err(FramePollError::Handler)?;
-        io.flush_pending().map_err(FramePollError::Io)?;
-
-        // Replay advances only after the endpoint handled the frame.
-        mode.accept_replay_frame(record.input_seq).map_err(FramePollError::Io)?;
-        Ok(FramePollStatus {
-            progress: true,
-            stopped: control == FramePollControl::Stop,
-        })
-    }
-
-    fn poll_in_memory_controlled<F, E>(
-        &mut self,
-        clock: &Clock,
-        mode: &mut Mode,
-        mut on_frame: F,
-        max_frames: Option<usize>,
-    ) -> Result<FramePollStatus, FramePollError<E>>
-    where
-        F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>,
-    {
-        let IOBackend::InMemory(io) = &mut self.backend else {
-            return Ok(FramePollStatus {
-                progress: false,
-                stopped: false,
-            });
-        };
-        io.poll_controlled_with_timing(clock, self.endpoint, mode, &mut on_frame, max_frames)
+        self.backend
+            .poll(self.endpoint, clock, mode, &mut self.recorder, max_frames.max(1), on_frame)
     }
 
     /// Queue one outbound frame through this endpoint backend.
     pub fn queue_frame(&mut self, frame: &[u8]) -> Result<(), IoError> {
-        match &mut self.backend {
-            IOBackend::Noop => Ok(()),
-            IOBackend::Tcp(io) => io.queue_frame(frame),
-            IOBackend::Udp(io) => io.queue_frame(frame),
-            IOBackend::File(io) => io.queue_frame(frame),
-            IOBackend::InMemory(io) => io.queue_frame(frame),
-        }
+        self.backend.queue_frame(frame)
     }
 
-    /// Flush pending outbound frames.
+    /// Flush pending backend and recorder output, reporting whether either advanced.
     pub fn flush_pending(&mut self) -> Result<bool, IoError> {
-        let backend_progress = match &mut self.backend {
-            IOBackend::Noop => Ok(false),
-            IOBackend::Tcp(io) => io.flush_pending(),
-            IOBackend::Udp(io) => io.flush_pending(),
-            IOBackend::File(io) => io.flush_pending(),
-            IOBackend::InMemory(io) => Ok(io.flush_pending()),
-        }?;
+        let backend_progress = self.backend.flush_pending()?;
         let recorder_progress = match &mut self.recorder {
             Some(recorder) => recorder.flush_pending()?,
             None => false,
@@ -360,153 +103,88 @@ impl IORuntime {
         Ok(backend_progress || recorder_progress)
     }
 
-    /// True when this endpoint's file-backed replay input is fully drained.
+    /// Return whether this endpoint's replay-capable backend is fully drained.
     pub fn replay_input_exhausted(&mut self) -> Result<bool, IoError> {
-        match &mut self.backend {
-            IOBackend::File(io) => io.input_exhausted(),
-            IOBackend::InMemory(io) => Ok(io.input_exhausted()),
-            IOBackend::Noop => Ok(true),
-            IOBackend::Tcp(_) | IOBackend::Udp(_) => Err(IoError::ReplayExpectedInLive),
-        }
+        self.backend.replay_input_exhausted()
     }
 
     #[cfg(test)]
     fn tcp_local_addr(&self) -> Result<std::net::SocketAddr, IoError> {
-        match &self.backend {
-            IOBackend::Tcp(io) => io.local_addr(),
-            IOBackend::Noop | IOBackend::Udp(_) | IOBackend::File(_) | IOBackend::InMemory(_) => Err(IoError::ReplayExpectedInLive),
-        }
+        self.backend.tcp_local_addr()
     }
 }
 
-fn adapt_untimed_callback<F, E>(mut on_frame: F) -> impl FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>
-where
-    F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
-{
-    move |publisher, recv_ts, _, frame| on_frame(publisher, recv_ts, frame)
-}
-
-fn adapt_controlled_callback<F, E>(
-    mut on_frame: F,
-) -> impl FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<FramePollControl, E>
-where
-    F: FnMut(&mut IOPublisher<'_>, RecvTs, FrameLatencyStart, &[u8]) -> Result<(), E>,
-{
-    move |publisher, recv_ts, latency_start, frame| {
-        on_frame(publisher, recv_ts, latency_start, frame)?;
-        Ok(FramePollControl::Continue)
-    }
-}
-
-fn flatten_controlled_poll_error<E>(
-    result: Result<FramePollStatus, FramePollError<RuntimeFrameError<E>>>,
-) -> Result<FramePollStatus, FramePollError<E>> {
-    match result {
-        Ok(status) => Ok(status),
-        Err(FramePollError::Io(error)) => Err(FramePollError::Io(error)),
-        Err(FramePollError::Handler(RuntimeFrameError::Io(error))) => Err(FramePollError::Io(error)),
-        Err(FramePollError::Handler(RuntimeFrameError::Handler(error))) => Err(FramePollError::Handler(error)),
-    }
-}
-
-/// Enum-gated endpoint IO backend.
-#[derive(Debug)]
-pub enum IOBackend {
-    /// Disabled backend.
-    Noop,
-    /// TCP framed input/output backend.
-    Tcp(TcpFrameIo),
-    /// UDP multicast output backend.
-    Udp(UdpFramePublisher),
-    /// File-backed replay/capture backend.
-    File(FileFrameIo),
-    /// In-memory replay/capture backend for benchmarks.
-    InMemory(InMemoryFrameIo),
-}
-
-/// Borrowed frame publisher passed to endpoint frame handlers.
-#[derive(Debug)]
-pub enum IOPublisher<'a> {
-    /// Publisher that drops all frames successfully.
-    Noop,
-    /// TCP publisher borrowed from the active framed TCP session.
-    Tcp(TcpFramePublisher<'a>),
-    /// File publisher borrowed from a file-backed IO runtime.
-    File(FileFramePublisher<'a>),
-    /// In-memory publisher borrowed from a benchmark IO runtime.
-    InMemory(InMemoryFramePublisher<'a>),
-}
-
-impl IOPublisher<'_> {
-    /// Publish one frame immediately when the backend supports immediate flush.
-    pub fn publish(&mut self, frame: &[u8]) -> Result<(), IoError> {
-        match self {
-            Self::Noop => Ok(()),
-            Self::Tcp(publisher) => publisher.publish(frame),
-            Self::File(publisher) => publisher.publish(frame),
-            Self::InMemory(publisher) => publisher.publish(frame),
-        }
-    }
-
-    /// Queue one frame for later flush.
-    pub fn queue_frame(&mut self, frame: &[u8]) -> Result<(), IoError> {
-        match self {
-            Self::Noop => Ok(()),
-            Self::Tcp(publisher) => publisher.queue_frame(frame),
-            Self::File(publisher) => publisher.queue_frame(frame),
-            Self::InMemory(publisher) => publisher.queue_frame(frame),
-        }
-    }
-}
-
-/// One recorded input frame.
+/// Endpoint IO backend configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InputRecord {
-    pub input_seq: u64,
-    pub endpoint: Endpoint,
-    pub recv_ts: RecvTs,
-    pub frame: Vec<u8>,
-}
-
-/// Transport and shared IO-layer failure.
-#[derive(Debug)]
-pub enum IoError {
-    Bind(std::io::Error),
-    Open(std::io::Error),
-    Create(std::io::Error),
-    LocalAddr(std::io::Error),
-    Configure(std::io::Error),
-    Read(std::io::Error),
-    Write(std::io::Error),
-    FrameTooLarge {
-        frame_len: usize,
+pub enum IOConfig {
+    /// Disabled IO backend.
+    Noop,
+    /// Nonblocking TCP framed input/output.
+    Tcp {
+        /// Listener bind address.
+        bind_addr: String,
+        /// Maximum accepted SBE frame length including the SBE header.
+        max_frame_len: usize,
+        /// Maximum queued outbound bytes before disconnecting the active client.
+        max_pending_write_bytes: usize,
+        /// Optional file path for recording observed live input frames.
+        record_path: Option<PathBuf>,
+    },
+    /// Nonblocking UDP multicast output.
+    Udp {
+        /// Local UDP bind address.
+        bind_addr: String,
+        /// IPv4 multicast destination address.
+        group_addr: String,
+        /// IPv4 multicast TTL.
+        multicast_ttl: u32,
+        /// Whether multicast loopback is enabled.
+        multicast_loop_v4: bool,
+        /// Maximum encoded datagram length.
+        max_datagram_len: usize,
+        /// Maximum queued datagram bytes before reporting backpressure.
+        max_pending_datagram_bytes: usize,
+    },
+    /// File-backed replay input and/or output capture.
+    File {
+        /// Optional replay input file containing wrapped input records.
+        input_path: Option<PathBuf>,
+        /// Optional output/capture file path.
+        output_path: Option<PathBuf>,
+        /// Maximum accepted frame length in file records.
         max_frame_len: usize,
     },
-    PendingWriteLimit {
-        pending_bytes: usize,
-        max_pending_write_bytes: usize,
+    /// In-memory replay input and output counting for benchmarks.
+    InMemory {
+        /// Replay records retained in deterministic delivery order.
+        input: Vec<InputRecord>,
+        /// Maximum accepted input and counted output frame length.
+        max_frame_len: usize,
     },
-    InvalidEndpoint(u8),
-    EndpointMismatch {
-        configured: Endpoint,
-        record: Endpoint,
-    },
-    ReplayExpectedInLive,
-    LiveInputInReplay,
-    ReplaySequenceMismatch {
-        expected: u64,
-        actual: u64,
-    },
-    ReplayStalled {
-        expected_input_seq: u64,
+    /// Rate-scheduled in-memory replay input and output counting for benchmarks.
+    ScheduledInMemory {
+        /// Replay records retained in deterministic delivery order.
+        input: Vec<InputRecord>,
+        /// Maximum accepted input and counted output frame length.
+        max_frame_len: usize,
+        /// Open-loop release rate used to derive absolute arrival times.
+        target_rate_per_sec: u64,
     },
 }
 
-/// Error returned by framed IO polling when either transport IO or frame handling fails.
-#[derive(Debug)]
-pub enum FramePollError<E> {
-    Io(IoError),
-    Handler(E),
+impl IOConfig {
+    /// Return the buffer size endpoint runtimes should use when encoding frames
+    /// for this backend.
+    pub const fn frame_capacity(&self) -> usize {
+        match self {
+            Self::Noop => 4096,
+            Self::Tcp { max_frame_len, .. }
+            | Self::File { max_frame_len, .. }
+            | Self::InMemory { max_frame_len, .. }
+            | Self::ScheduledInMemory { max_frame_len, .. } => *max_frame_len,
+            Self::Udp { max_datagram_len, .. } => *max_datagram_len,
+        }
+    }
 }
 
 /// Logical endpoint used for routing, live recording, and deterministic replay.
@@ -540,6 +218,7 @@ impl Endpoint {
         }
     }
 
+    /// Return the stable endpoint label used in startup diagnostics.
     const fn runtime_name(self) -> &'static str {
         match self {
             Self::Control => "Control",
@@ -549,14 +228,148 @@ impl Endpoint {
     }
 }
 
+/// One recorded input frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputRecord {
+    /// Global input sequence assigned in live order and enforced during replay.
+    pub input_seq: u64,
+    /// Endpoint that originally accepted the frame.
+    pub endpoint: Endpoint,
+    /// Receive timestamp captured for deterministic replay.
+    pub recv_ts: RecvTs,
+    /// Complete encoded protocol frame.
+    pub frame: Vec<u8>,
+}
+
+/// Transport and shared IO-layer failure.
+#[derive(Debug)]
+pub enum IoError {
+    /// A socket could not bind to its configured local address.
+    Bind(#[doc = "Underlying socket error."] std::io::Error),
+    /// A replay input file could not be opened.
+    Open(#[doc = "Underlying file error."] std::io::Error),
+    /// An output or recording file could not be created.
+    Create(#[doc = "Underlying file error."] std::io::Error),
+    /// A socket's bound local address could not be read.
+    LocalAddr(#[doc = "Underlying socket error."] std::io::Error),
+    /// A transport or schedule configuration could not be applied.
+    Configure(#[doc = "Underlying configuration error."] std::io::Error),
+    /// An input source failed while reading bytes.
+    Read(#[doc = "Underlying read error."] std::io::Error),
+    /// An output sink failed while writing or flushing bytes.
+    Write(#[doc = "Underlying write error."] std::io::Error),
+    /// A frame exceeds the configured transport or replay limit.
+    FrameTooLarge {
+        /// Observed frame length in bytes.
+        frame_len: usize,
+        /// Maximum accepted frame length in bytes.
+        max_frame_len: usize,
+    },
+    /// Queuing a frame would exceed the configured pending-output bound.
+    PendingWriteLimit {
+        /// Pending byte count that the requested write would produce.
+        pending_bytes: usize,
+        /// Maximum permitted pending byte count.
+        max_pending_write_bytes: usize,
+    },
+    /// A replay record contains an unknown endpoint tag.
+    InvalidEndpoint(#[doc = "Unrecognized on-disk endpoint tag."] u8),
+    /// A replay record belongs to a different endpoint runtime.
+    EndpointMismatch {
+        /// Endpoint owned by the runtime reading the record.
+        configured: Endpoint,
+        /// Endpoint encoded in the replay record.
+        record: Endpoint,
+    },
+    /// Replay exhaustion was queried on a live-only backend.
+    ReplayExpectedInLive,
+    /// A live frame was offered while the runtime is in replay mode.
+    LiveInputInReplay,
+    /// A replay record is not the globally expected next input.
+    ReplaySequenceMismatch {
+        /// Next input sequence required by replay mode.
+        expected: u64,
+        /// Input sequence carried by the accepted record.
+        actual: u64,
+    },
+    /// Replay cannot find the record for the globally expected sequence.
+    ReplayStalled {
+        /// Input sequence whose record is required to continue.
+        expected_input_seq: u64,
+    },
+}
+
+/// Error returned by framed IO polling when either transport IO or frame handling fails.
+#[derive(Debug)]
+pub enum FramePollError<E> {
+    /// The transport, recorder, or replay state failed.
+    Io(#[doc = "I/O-layer failure."] IoError),
+    /// The endpoint callback rejected a delivered frame.
+    Handler(#[doc = "Endpoint-defined handler failure."] E),
+}
+
+/// Metric start policy attached to one inbound frame inside the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameLatencyStart {
+    /// Start timing when the gateway handler receives the frame.
+    HandlerEntry,
+    /// Start timing at this benchmark-scheduled arrival on the runtime clock.
+    Scheduled(
+        /// Absolute scheduled arrival time in runtime-clock nanoseconds.
+        u64,
+    ),
+}
+
+/// Per-frame control returned by an endpoint handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FramePollControl {
+    /// Continue delivering frames while the poll budget permits.
+    Continue,
+    /// Return control to the endpoint after accepting the current frame.
+    Stop,
+}
+
+/// Aggregate result of one controlled ingress poll.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FramePollStatus {
+    /// Whether ingress, connection, or egress state advanced during the poll.
+    pub(crate) progress: bool,
+    /// Whether the frame handler requested an early return.
+    pub(crate) stopped: bool,
+}
+
+impl FramePollStatus {
+    /// Poll result for a backend with no ingress work.
+    const IDLE: Self = Self {
+        progress: false,
+        stopped: false,
+    };
+}
+
+/// Complete inbound frame and runtime-adjacent timing metadata.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InboundFrame<'a> {
+    /// Receive timestamp associated with the frame.
+    pub(crate) recv_ts: RecvTs,
+    /// Timestamp policy used by latency measurement.
+    pub(crate) latency_start: FrameLatencyStart,
+    /// Complete protocol frame borrowed from backend-owned storage.
+    pub(crate) bytes: &'a [u8],
+}
+
+/// Preformatted backend descriptions emitted when an endpoint starts.
 #[derive(Debug)]
 struct IOStartupLog {
+    /// Description of the configured inbound source.
     ingress: String,
+    /// Description of the configured outbound sink.
     egress: String,
+    /// Description of the optional live-input recorder.
     recorder: String,
 }
 
 impl IOStartupLog {
+    /// Describe a configuration without opening or mutating its resources.
     fn from_config(config: &IOConfig) -> Self {
         match config {
             IOConfig::Noop => Self {
@@ -606,335 +419,10 @@ impl IOStartupLog {
     }
 }
 
+/// Format an optional file path for startup diagnostics.
 fn optional_file_descriptor(path: Option<&PathBuf>) -> String {
     path.map_or_else(|| "None".to_owned(), |path| format!("File({})", path.display()))
 }
 
-#[derive(Debug)]
-enum RuntimeFrameError<E> {
-    Io(IoError),
-    Handler(E),
-}
-
-/// Endpoint IO backend configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum IOConfig {
-    /// Disabled IO backend.
-    Noop,
-    /// Nonblocking TCP framed input/output.
-    Tcp {
-        /// Listener bind address.
-        bind_addr: String,
-        /// Maximum accepted SBE frame length including the SBE header.
-        max_frame_len: usize,
-        /// Maximum queued outbound bytes before disconnecting the active client.
-        max_pending_write_bytes: usize,
-        /// Optional file path for recording observed live input frames.
-        record_path: Option<PathBuf>,
-    },
-    /// Nonblocking UDP multicast output.
-    Udp {
-        /// Local UDP bind address.
-        bind_addr: String,
-        /// IPv4 multicast destination address.
-        group_addr: String,
-        /// IPv4 multicast TTL.
-        multicast_ttl: u32,
-        /// Whether multicast loopback is enabled.
-        multicast_loop_v4: bool,
-        /// Maximum encoded datagram length.
-        max_datagram_len: usize,
-        /// Maximum queued datagram bytes before reporting backpressure.
-        max_pending_datagram_bytes: usize,
-    },
-    /// File-backed replay input and/or output capture.
-    File {
-        /// Optional replay input file containing wrapped input records.
-        input_path: Option<PathBuf>,
-        /// Optional output/capture file path.
-        output_path: Option<PathBuf>,
-        /// Maximum accepted frame length in file records.
-        max_frame_len: usize,
-    },
-    /// In-memory replay input and output counting for benchmarks.
-    InMemory { input: Vec<InputRecord>, max_frame_len: usize },
-    /// Rate-scheduled in-memory replay input and output counting for benchmarks.
-    ScheduledInMemory {
-        input: Vec<InputRecord>,
-        max_frame_len: usize,
-        target_rate_per_sec: u64,
-    },
-}
-
-impl IOConfig {
-    /// Return the buffer size endpoint runtimes should use when encoding frames
-    /// for this backend.
-    pub const fn frame_capacity(&self) -> usize {
-        match self {
-            Self::Noop => 4096,
-            Self::Tcp { max_frame_len, .. }
-            | Self::File { max_frame_len, .. }
-            | Self::InMemory { max_frame_len, .. }
-            | Self::ScheduledInMemory { max_frame_len, .. } => *max_frame_len,
-            Self::Udp { max_datagram_len, .. } => *max_datagram_len,
-        }
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{io::Write, net::TcpStream, path::Path, thread, time::Duration};
-
-    use crate::{
-        domain::RecvTs,
-        protocol::{MessageKind, SBE_HEADER_LEN, encode_header},
-        runtime::Mode,
-    };
-
-    fn temp_path(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!("ignition-{name}-{}-{}.bin", std::process::id(), unique_suffix()))
-    }
-
-    fn unique_suffix() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("time")
-            .as_nanos()
-    }
-
-    fn write_record(path: &Path, record: InputRecord) {
-        let mut io = FileFrameIo::open(None, Some(path.to_path_buf()), 128).expect("writer");
-        io.record_input(&record).expect("record");
-        io.flush_pending().expect("flush");
-    }
-
-    fn frame(kind: MessageKind, payload: &[u8]) -> Vec<u8> {
-        let mut bytes = vec![0_u8; SBE_HEADER_LEN + payload.len()];
-        encode_header(&mut bytes, payload.len() as u16, kind).expect("header");
-        bytes[SBE_HEADER_LEN..].copy_from_slice(payload);
-        bytes
-    }
-
-    #[test]
-    fn replay_file_backend_releases_only_expected_global_input_sequence() {
-        let gateway_path = temp_path("gateway-replay");
-        let control_path = temp_path("control-replay");
-        write_record(
-            &gateway_path,
-            InputRecord {
-                input_seq: 1,
-                endpoint: Endpoint::Gateway,
-                recv_ts: RecvTs::new(10),
-                frame: vec![1, 2, 3],
-            },
-        );
-        write_record(
-            &control_path,
-            InputRecord {
-                input_seq: 2,
-                endpoint: Endpoint::Control,
-                recv_ts: RecvTs::new(11),
-                frame: vec![4, 5, 6],
-            },
-        );
-
-        let mut mode = Mode::Replay { expected_input_seq: 1 };
-        let clock = Clock::new();
-        let mut control = IORuntime::new(
-            Endpoint::Control,
-            IOConfig::File {
-                input_path: Some(control_path.clone()),
-                output_path: None,
-                max_frame_len: 128,
-            },
-        )
-        .expect("control");
-        let mut gateway = IORuntime::new(
-            Endpoint::Gateway,
-            IOConfig::File {
-                input_path: Some(gateway_path.clone()),
-                output_path: None,
-                max_frame_len: 128,
-            },
-        )
-        .expect("gateway");
-
-        let mut seen = Vec::new();
-        {
-            assert!(
-                !control
-                    .poll(&clock, &mut mode, |_, recv_ts, frame| {
-                        seen.push((Endpoint::Control, recv_ts.raw(), frame.to_vec()));
-                        Ok::<(), std::convert::Infallible>(())
-                    })
-                    .expect("control poll")
-            );
-        }
-        {
-            assert!(
-                gateway
-                    .poll(&clock, &mut mode, |_, recv_ts, frame| {
-                        seen.push((Endpoint::Gateway, recv_ts.raw(), frame.to_vec()));
-                        Ok::<(), std::convert::Infallible>(())
-                    })
-                    .expect("gateway poll")
-            );
-        }
-        {
-            assert!(
-                control
-                    .poll(&clock, &mut mode, |_, recv_ts, frame| {
-                        seen.push((Endpoint::Control, recv_ts.raw(), frame.to_vec()));
-                        Ok::<(), std::convert::Infallible>(())
-                    })
-                    .expect("control poll")
-            );
-        }
-
-        assert_eq!(
-            seen,
-            vec![(Endpoint::Gateway, 10, vec![1, 2, 3]), (Endpoint::Control, 11, vec![4, 5, 6])]
-        );
-        assert_eq!(mode, Mode::Replay { expected_input_seq: 3 });
-
-        let _ = std::fs::remove_file(gateway_path);
-        let _ = std::fs::remove_file(control_path);
-    }
-
-    #[test]
-    fn in_memory_backend_releases_replay_records_in_sequence() {
-        let mut mode = Mode::Replay { expected_input_seq: 1 };
-        let clock = Clock::new();
-        let records = vec![
-            InputRecord {
-                input_seq: 1,
-                endpoint: Endpoint::Gateway,
-                recv_ts: RecvTs::new(10),
-                frame: frame(MessageKind::NewOrder, &[1, 2, 3, 4]),
-            },
-            InputRecord {
-                input_seq: 2,
-                endpoint: Endpoint::Gateway,
-                recv_ts: RecvTs::new(11),
-                frame: frame(MessageKind::CancelOrder, &[5, 6, 7, 8]),
-            },
-        ];
-        let mut io = IORuntime::new(
-            Endpoint::Gateway,
-            IOConfig::InMemory {
-                input: records.clone(),
-                max_frame_len: 128,
-            },
-        )
-        .expect("in-memory io");
-        let mut seen = Vec::new();
-
-        assert!(
-            io.poll_bounded(
-                &clock,
-                &mut mode,
-                |publisher, recv_ts, bytes| {
-                    seen.push((recv_ts.raw(), bytes.to_vec()));
-                    publisher.queue_frame(bytes)?;
-                    Ok::<(), IoError>(())
-                },
-                1
-            )
-            .expect("first poll")
-        );
-        assert!(
-            io.poll_bounded(
-                &clock,
-                &mut mode,
-                |publisher, recv_ts, bytes| {
-                    seen.push((recv_ts.raw(), bytes.to_vec()));
-                    publisher.queue_frame(bytes)?;
-                    Ok::<(), IoError>(())
-                },
-                1
-            )
-            .expect("second poll")
-        );
-        assert!(!io.poll(&clock, &mut mode, |_, _, _| Ok::<(), IoError>(())).expect("drained"));
-        assert!(io.replay_input_exhausted().expect("exhausted"));
-        assert_eq!(mode, Mode::Replay { expected_input_seq: 3 });
-        assert_eq!(seen, vec![(10, records[0].frame.clone()), (11, records[1].frame.clone())]);
-    }
-
-    #[test]
-    fn in_memory_backend_rejects_wrong_endpoint_record() {
-        let mut mode = Mode::Replay { expected_input_seq: 1 };
-        let clock = Clock::new();
-        let mut io = IORuntime::new(
-            Endpoint::Control,
-            IOConfig::InMemory {
-                input: vec![InputRecord {
-                    input_seq: 1,
-                    endpoint: Endpoint::Gateway,
-                    recv_ts: RecvTs::new(10),
-                    frame: vec![1, 2, 3],
-                }],
-                max_frame_len: 128,
-            },
-        )
-        .expect("in-memory io");
-
-        assert!(matches!(
-            io.poll(&clock, &mut mode, |_, _, _| Ok::<(), IoError>(())),
-            Err(FramePollError::Io(IoError::EndpointMismatch {
-                configured: Endpoint::Control,
-                record: Endpoint::Gateway,
-            }))
-        ));
-    }
-
-    #[test]
-    fn tcp_backend_records_live_input_frames() {
-        let record_path = temp_path("tcp-recording");
-        let clock = Clock::new();
-        let mut runtime = match IORuntime::new(
-            Endpoint::Control,
-            IOConfig::Tcp {
-                bind_addr: "127.0.0.1:0".to_owned(),
-                max_frame_len: 128,
-                max_pending_write_bytes: 1024,
-                record_path: Some(record_path.clone()),
-            },
-        ) {
-            Ok(runtime) => runtime,
-            Err(IoError::Bind(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
-            Err(error) => panic!("tcp runtime: {error:?}"),
-        };
-        let addr = runtime.tcp_local_addr().expect("addr");
-        let mut client = TcpStream::connect(addr).expect("connect");
-        let frame = frame(MessageKind::Heartbeat, &[1, 0, 0, 0]);
-        client.write_all(&frame).expect("write");
-
-        let mut mode = Mode::default();
-        let mut seen = Vec::new();
-        for _ in 0..100 {
-            runtime
-                .poll(&clock, &mut mode, |_, recv_ts, bytes| {
-                    seen.push((recv_ts, bytes.to_vec()));
-                    Ok::<(), std::convert::Infallible>(())
-                })
-                .expect("poll");
-            if !seen.is_empty() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        runtime.flush_pending().expect("flush");
-
-        assert_eq!(seen.len(), 1);
-        let mut recorded = FileFrameIo::open(Some(record_path.clone()), None, 128).expect("reader");
-        let record = recorded.peek_record().expect("record").expect("record");
-        assert_eq!(record.input_seq, 1);
-        assert_eq!(record.endpoint, Endpoint::Control);
-        assert_eq!(record.recv_ts, seen[0].0);
-        assert_eq!(record.frame, frame);
-
-        let _ = std::fs::remove_file(record_path);
-    }
-}
+mod tests;
