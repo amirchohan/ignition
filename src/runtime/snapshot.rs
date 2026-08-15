@@ -1,3 +1,23 @@
+//! Streaming publication of a deterministic control-plane book snapshot.
+//!
+//! A snapshot combines matching-engine book rows, market-data sequence state,
+//! and the current risk reference price into one begin/rows/end control batch.
+//! This module owns the batch protocol but not the underlying state: `Engine`,
+//! `RiskRuntime`, and `MarketDataRuntime` remain the authoritative sources.
+//!
+//! # Main components
+//!
+//! - [`SnapshotProcessor`] publishes the complete snapshot batch for one
+//!   request, using helper methods for the begin marker, each row, and the end
+//!   marker.
+//!
+//! # Data flow and invariants
+//!
+//! Rows stream directly from the engine in deterministic price-time order, so
+//! no snapshot-sized allocation is needed. Every emitted message consumes the
+//! shared engine sequence. The terminal marker carries the actual row count,
+//! allowing consumers to detect an incomplete batch.
+
 use crate::{
     control::{ControlError, ControlPublisher},
     domain::{
@@ -24,7 +44,7 @@ impl SnapshotProcessor {
     ) -> Result<(), ControlError> {
         Self::publish_begin(engine, risk, market_data, sequencer, publisher, request)?;
 
-        // Rows are emitted straight from the book traversal. This avoids a
+        // rows are emitted straight from the book traversal. this avoids a
         // second snapshot-sized buffer while preserving the engine's row order.
         let mut row_count = 0;
         engine.try_for_each_resting_order(|row| {
@@ -49,7 +69,7 @@ impl SnapshotProcessor {
         let best_ask = engine.best_ask()?;
         let market_data = market_data.snapshot();
 
-        // The begin message captures state that is not repeated on each row.
+        // the begin message captures state that is not repeated on each row.
         publisher.publish(ControlEvent::SnapshotBegin(SnapshotBegin {
             engine_seq: sequencer.next_engine_seq()?,
             request_id: request.request_id,
@@ -92,7 +112,7 @@ impl SnapshotProcessor {
         request: Snapshot,
         row_count: u64,
     ) -> Result<(), ControlError> {
-        // End closes the batch and lets readers detect truncated snapshots.
+        // end closes the batch and lets readers detect truncated snapshots.
         publisher.publish(ControlEvent::SnapshotEnd(SnapshotEnd {
             engine_seq: sequencer.next_engine_seq()?,
             request_id: request.request_id,

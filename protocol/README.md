@@ -33,13 +33,19 @@ messages do not carry a symbol field; all order flow in a session is for the
 configured runtime symbol. Multi-symbol support is a future schema/version
 change.
 
-The configured instrument lives in `configs/server.yaml` under
+The configured instrument lives in `../configs/server.yaml` under
 `reference_data.instrument`. The wire protocol carries only integer price and
 quantity fields; `price_decimals`, `qty_decimals`, `price_tick`, and `qty_lot`
 define the per-instrument scale and minimum legal increments. Parsed core
 state uses numeric IDs only: no symbol or asset strings enter the matching
 engine. `instrument_id`, `base_asset_id`, and `quote_asset_id` are `u16` in
 the domain/config model.
+
+Every transport enforces `MAX_ACCEPTED_WIRE_FRAME_LEN`, a documented 4 KiB
+safety envelope. The largest current fixed-width schema frame is 92 bytes; the
+larger envelope preserves bounded extension headroom. TCP's separate 4 KiB
+read chunk is a syscall-batching choice and may contain partial or multiple
+frames; it is not the wire-frame limit.
 
 Prices and quantities are unsigned integer-scaled values. Zero is not a valid
 domain `Price` or `Qty`; outbound optional price fields use wire value `0` as

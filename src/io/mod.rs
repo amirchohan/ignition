@@ -19,7 +19,7 @@
 //! # Data flow and invariants
 //!
 //! Live TCP input is framed first, assigned a global input sequence by
-//! [`Mode`], optionally recorded, and only then handed to its endpoint. Replay
+//! [`InputLifecycle`], optionally recorded, and only then handed to its endpoint. Replay
 //! backends peek without consuming until the record's sequence is globally due
 //! and its endpoint matches the runtime. The replay sequence advances only
 //! after the handler succeeds. This keeps live recordings and replay behavior
@@ -32,7 +32,7 @@
 
 use std::path::PathBuf;
 
-use crate::{clock::Clock, domain::RecvTs, runtime::Mode};
+use crate::{clock::Clock, domain::RecvTs, runtime::InputLifecycle};
 
 mod backend;
 
@@ -77,7 +77,7 @@ impl IORuntime {
     pub(crate) fn poll<F, E>(
         &mut self,
         clock: &Clock,
-        mode: &mut Mode,
+        mode: &mut InputLifecycle,
         max_frames: usize,
         on_frame: F,
     ) -> Result<FramePollStatus, FramePollError<E>>
@@ -123,7 +123,7 @@ pub enum IOConfig {
     Tcp {
         /// Listener bind address.
         bind_addr: String,
-        /// Maximum accepted SBE frame length including the SBE header.
+        /// Internal accepted-frame envelope; mode builders use the protocol constant.
         max_frame_len: usize,
         /// Maximum queued outbound bytes before disconnecting the active client.
         max_pending_write_bytes: usize,
@@ -140,7 +140,7 @@ pub enum IOConfig {
         multicast_ttl: u32,
         /// Whether multicast loopback is enabled.
         multicast_loop_v4: bool,
-        /// Maximum encoded datagram length.
+        /// Internal accepted-datagram envelope.
         max_datagram_len: usize,
         /// Maximum queued datagram bytes before reporting backpressure.
         max_pending_datagram_bytes: usize,
@@ -151,21 +151,21 @@ pub enum IOConfig {
         input_path: Option<PathBuf>,
         /// Optional output/capture file path.
         output_path: Option<PathBuf>,
-        /// Maximum accepted frame length in file records.
+        /// Internal accepted-frame envelope.
         max_frame_len: usize,
     },
     /// In-memory replay input and output counting for benchmarks.
     InMemory {
         /// Replay records retained in deterministic delivery order.
         input: Vec<InputRecord>,
-        /// Maximum accepted input and counted output frame length.
+        /// Internal accepted-frame envelope.
         max_frame_len: usize,
     },
     /// Rate-scheduled in-memory replay input and output counting for benchmarks.
     ScheduledInMemory {
         /// Replay records retained in deterministic delivery order.
         input: Vec<InputRecord>,
-        /// Maximum accepted input and counted output frame length.
+        /// Internal accepted-frame envelope.
         max_frame_len: usize,
         /// Open-loop release rate used to derive absolute arrival times.
         target_rate_per_sec: u64,
@@ -176,14 +176,7 @@ impl IOConfig {
     /// Return the buffer size endpoint runtimes should use when encoding frames
     /// for this backend.
     pub const fn frame_capacity(&self) -> usize {
-        match self {
-            Self::Noop => 4096,
-            Self::Tcp { max_frame_len, .. }
-            | Self::File { max_frame_len, .. }
-            | Self::InMemory { max_frame_len, .. }
-            | Self::ScheduledInMemory { max_frame_len, .. } => *max_frame_len,
-            Self::Udp { max_datagram_len, .. } => *max_datagram_len,
-        }
+        crate::protocol::MAX_ACCEPTED_WIRE_FRAME_LEN
     }
 }
 

@@ -51,6 +51,10 @@ ownership boundary.
 ### `runtime`
 
 - Owns orchestration state, including the matching engine and market-data feed.
+- `runtime::mode::{live,replay,benchmark}` resolves cold-path deployment input
+  into one internal `RuntimeSpec` and construction path.
+- Live input is online; replay and benchmark are finite ordered inputs. Those
+  differences end at the I/O boundary and do not branch matching behaviour.
 - Connects the separate control and trading queues to control state, risk
   checks, engine execution, market-data output, and protocol egress in explicit
   phases.
@@ -67,7 +71,7 @@ ownership boundary.
 - Stores the book directly as two `SideLadder` values, one shared resting-order
   arena, and a dense account table that owns a preallocated
   `(account_id, client_order_id) -> handle` lookup.
-- Uses a fixed storage envelope from `configs/server.yaml` for direct price
+- Uses a fixed storage envelope from `../configs/server.yaml` for direct price
   addressing; dynamic risk price bands are enforced outside the matching data
   structure.
 - Emits deterministic execution reports and delegates trade-print/L1/L2 shaping

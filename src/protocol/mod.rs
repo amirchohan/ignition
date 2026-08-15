@@ -18,4 +18,6 @@ pub mod generated {
 }
 
 pub use error::{ProtocolError, ProtocolResult};
-pub use frame::{MessageKind, ProtocolFrame, SBE_HEADER_LEN, SCHEMA_ID, SCHEMA_VERSION, decode_header, encode_header};
+pub use frame::{
+    MAX_ACCEPTED_WIRE_FRAME_LEN, MessageKind, ProtocolFrame, SBE_HEADER_LEN, SCHEMA_ID, SCHEMA_VERSION, decode_header, encode_header,
+};

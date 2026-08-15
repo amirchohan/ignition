@@ -20,4 +20,4 @@ COPY configs ./configs
 COPY fixtures/replay ./fixtures/replay
 
 ENV RUST_LOG=info
-CMD ["server", "--config", "configs/server.docker.yaml"]
+CMD ["server"]

@@ -1,7 +1,10 @@
 services:
   server:
     build: .
-    command: ["server", "--config", "configs/server.docker.yaml"]
+    command: ["server"]
+    environment:
+      IGNITION_CONTROL_LISTEN_ADDR: "0.0.0.0:19001"
+      IGNITION_GATEWAY_LISTEN_ADDR: "0.0.0.0:19000"
     ports:
       - "19000:19000/tcp"
       - "19001:19001/tcp"
@@ -11,23 +14,26 @@ services:
 
   trading-client:
     build: .
-    command: ["trading-client", "--config", "configs/trading-client.docker.yaml"]
+    command: ["trading-client", "--config", "configs/trading-client.yaml"]
     depends_on:
       - server
     stdin_open: true
     tty: true
     environment:
       TERM: "${TERM:-xterm-256color}"
+      IGNITION_GATEWAY_ADDR: "server:19000"
+      IGNITION_SYNTHETIC_TRAFFIC: "noop"
 
   control-client:
     build: .
-    command: ["control-client", "--config", "configs/control-client.docker.yaml"]
+    command: ["control-client", "--config", "configs/control-client.yaml"]
     depends_on:
       - server
     stdin_open: true
     tty: true
     environment:
       TERM: "${TERM:-xterm-256color}"
+      IGNITION_CONTROL_ADDR: "server:19001"
 
   benchmark:
     build: .
@@ -39,8 +45,7 @@ services:
           --orders "$${ORDERS:-1000000}" \
           --warmup "$${WARMUP:-50000}" \
           --workload "$${WORKLOAD:-mixed}" \
-          --schedule "$${SCHEDULE:-burst}" \
-          --config configs/benchmark.yaml
+          --schedule "$${SCHEDULE:-burst}"
         if [ "$${SCHEDULE:-burst}" = "open-loop" ]; then
           set -- "$$@" --target-rate "$${TARGET_RATE:?TARGET_RATE is required for open-loop benchmarks}"
         fi
@@ -54,6 +59,6 @@ services:
 
   replay:
     build: .
-    command: ["replay", "--run", "${REPLAY_RUN:-1786693693}", "--config", "configs/replay.yaml"]
+    command: ["replay", "--run", "fixtures/replay/runs/${REPLAY_RUN:-1786693693}"]
     volumes:
       - ./fixtures/replay/runs:/app/fixtures/replay/runs

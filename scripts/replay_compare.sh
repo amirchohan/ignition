@@ -1,40 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-input_id="${1:-}"
-config_path="${2:-configs/replay.yaml}"
+run_dir="${1:-}"
 
-if [[ -z "$input_id" ]]; then
-  echo "usage: scripts/replay_compare.sh INPUT_ID [CONFIG_PATH]" >&2
+if [[ -z "$run_dir" ]]; then
+  echo "usage: scripts/replay_compare.sh RUN_DIR" >&2
   exit 2
 fi
 
-if [[ ! "$input_id" =~ ^[0-9]+$ ]]; then
-  echo "invalid input_id: $input_id" >&2
+if [[ ! -d "$run_dir" ]]; then
+  echo "missing replay run directory: $run_dir" >&2
   exit 2
 fi
-
-record_path_dir="$(
-  awk '
-    /^mode:[[:space:]]*$/ { in_mode = 1; next }
-    in_mode && /^[^[:space:]]/ { in_mode = 0 }
-    in_mode && $1 == "record_path_dir:" {
-      value = $0
-      sub(/^[[:space:]]*record_path_dir:[[:space:]]*/, "", value)
-      sub(/[[:space:]]*#.*/, "", value)
-      gsub(/^"|"$/, "", value)
-      print value
-      exit
-    }
-  ' "$config_path"
-)"
-
-if [[ -z "$record_path_dir" ]]; then
-  echo "missing mode.record_path_dir in $config_path" >&2
-  exit 2
-fi
-
-output_root="$record_path_dir/$input_id/output"
+output_root="$run_dir/output"
 baseline="$output_root/0001"
 
 if [[ ! -d "$baseline" ]]; then
@@ -72,4 +50,4 @@ for output_dir in "${outputs[@]}"; do
   done
 done
 
-echo "compared input_id=$input_id baseline=0001 outputs=$compared"
+echo "compared run=$run_dir baseline=0001 outputs=$compared"

@@ -1,15 +1,15 @@
-use std::{fs, path::Path};
+use std::{env, fs, path::Path};
 
 use serde::Deserialize;
 
 use crate::{
-    config::{ConfigError, ServerConfig},
+    config::{ConfigError, CoreConfig},
     domain::rd::InstrumentSpec,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct TradingClientConfig {
-    pub server_config_path: String,
+    pub core_config_path: String,
     pub gateway_addr: String,
     pub market_data: MarketDataClientConfig,
     pub synthetic_traffic: SyntheticTrafficConfig,
@@ -18,13 +18,23 @@ pub struct TradingClientConfig {
 impl TradingClientConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, TradingClientConfigError> {
         let text = fs::read_to_string(path).map_err(TradingClientConfigError::Read)?;
-        let config = serde_yaml::from_str::<Self>(&text).map_err(TradingClientConfigError::Parse)?;
+        let mut config = serde_yaml::from_str::<Self>(&text).map_err(TradingClientConfigError::Parse)?;
+        if let Ok(value) = env::var("IGNITION_GATEWAY_ADDR") {
+            config.gateway_addr = value;
+        }
+        if let Ok(value) = env::var("IGNITION_SYNTHETIC_TRAFFIC") {
+            match value.as_str() {
+                "noop" => config.synthetic_traffic = SyntheticTrafficConfig::Noop,
+                "configured" => {}
+                _ => return Err(TradingClientConfigError::InvalidEnvironment(value)),
+            }
+        }
         config.instrument().map_err(TradingClientConfigError::Server)?;
         Ok(config)
     }
 
     pub fn instrument(&self) -> Result<InstrumentSpec, ConfigError> {
-        ServerConfig::load(&self.server_config_path).and_then(|config| config.validate().map_err(ConfigError::Validate))
+        CoreConfig::load(&self.core_config_path).and_then(|config| config.instrument().map_err(ConfigError::Validate))
     }
 }
 
@@ -54,6 +64,7 @@ pub enum TradingClientConfigError {
     Read(std::io::Error),
     Parse(serde_yaml::Error),
     Server(ConfigError),
+    InvalidEnvironment(String),
 }
 
 impl std::fmt::Display for TradingClientConfigError {
@@ -62,6 +73,7 @@ impl std::fmt::Display for TradingClientConfigError {
             Self::Read(error) => write!(f, "failed to read trading client config: {error}"),
             Self::Parse(error) => write!(f, "failed to parse trading client config: {error}"),
             Self::Server(error) => write!(f, "failed to load server reference data: {error:?}"),
+            Self::InvalidEnvironment(value) => write!(f, "invalid IGNITION_SYNTHETIC_TRAFFIC value: {value}"),
         }
     }
 }
@@ -76,7 +88,7 @@ mod tests {
     fn parses_binance_synthetic_traffic_config() {
         let config = serde_yaml::from_str::<TradingClientConfig>(
             r#"
-server_config_path: "configs/server.yaml"
+core_config_path: "configs/server.yaml"
 gateway_addr: "127.0.0.1:19000"
 market_data:
   bind_addr: "0.0.0.0:19002"
@@ -107,7 +119,7 @@ synthetic_traffic:
     fn parses_noop_synthetic_traffic_config() {
         let config = serde_yaml::from_str::<TradingClientConfig>(
             r#"
-server_config_path: "configs/server.yaml"
+core_config_path: "configs/server.yaml"
 gateway_addr: "127.0.0.1:19000"
 market_data:
   bind_addr: "0.0.0.0:19002"

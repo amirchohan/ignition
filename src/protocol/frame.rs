@@ -15,6 +15,14 @@ pub const SCHEMA_VERSION: u16 = 1;
 /// Length of the standard SBE message header.
 pub const SBE_HEADER_LEN: usize = 8;
 
+/// Maximum complete frame accepted by any current transport.
+///
+/// The current largest fixed-width schema frame is 92 bytes. A 4 KiB envelope
+/// preserves the established bounded parsing behaviour and leaves deliberate
+/// room for compatible fixed-block growth without making this a deployment
+/// setting.
+pub const MAX_ACCEPTED_WIRE_FRAME_LEN: usize = 4 * 1024;
+
 /// Known protocol message families.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageKind {
@@ -270,5 +278,35 @@ mod tests {
         assert_eq!(decoder.time_in_force(), time_in_force::TimeInForce::Gtc);
         assert_eq!(decoder.price(), 44);
         assert_eq!(decoder.qty(), 55);
+    }
+
+    #[test]
+    fn accepted_frame_envelope_covers_every_current_schema_message() {
+        let block_lengths = [
+            new_order_codec::SBE_BLOCK_LENGTH,
+            cancel_order_codec::SBE_BLOCK_LENGTH,
+            cancel_replace_codec::SBE_BLOCK_LENGTH,
+            mass_cancel_codec::SBE_BLOCK_LENGTH,
+            kill_switch_codec::SBE_BLOCK_LENGTH,
+            snapshot_codec::SBE_BLOCK_LENGTH,
+            heartbeat_codec::SBE_BLOCK_LENGTH,
+            execution_report_codec::SBE_BLOCK_LENGTH,
+            control_response_codec::SBE_BLOCK_LENGTH,
+            heartbeat_status_codec::SBE_BLOCK_LENGTH,
+            snapshot_begin_codec::SBE_BLOCK_LENGTH,
+            snapshot_order_codec::SBE_BLOCK_LENGTH,
+            snapshot_end_codec::SBE_BLOCK_LENGTH,
+            trade_print_codec::SBE_BLOCK_LENGTH,
+            l1_update_codec::SBE_BLOCK_LENGTH,
+            l2_update_codec::SBE_BLOCK_LENGTH,
+            protocol_error_codec::SBE_BLOCK_LENGTH,
+        ];
+
+        assert!(
+            block_lengths
+                .into_iter()
+                .all(|length| { SBE_HEADER_LEN + usize::from(length) <= MAX_ACCEPTED_WIRE_FRAME_LEN })
+        );
+        assert_eq!(SBE_HEADER_LEN + usize::from(snapshot_begin_codec::SBE_BLOCK_LENGTH), 92);
     }
 }

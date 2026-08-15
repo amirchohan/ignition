@@ -10,14 +10,16 @@
 //! cumulative rounding or handler-time drift. [`InMemoryFramePublisher`] owns
 //! no storage; it borrows the backend's counters and validates output sizes.
 //!
-//! The parent backend and [`Mode`] still enforce endpoint identity and global
+//! The parent backend and [`InputLifecycle`] still enforce endpoint identity and global
 //! replay sequence. Records remain in their original order, the cursor advances
 //! only after successful handling, and output counting uses saturating totals so
 //! benchmark traffic cannot wrap the counters.
 
 use std::time::Duration;
 
-use crate::{clock::Clock, runtime::Mode};
+#[cfg(test)]
+use crate::runtime::Mode;
+use crate::{clock::Clock, runtime::InputLifecycle};
 
 use super::{
     Endpoint, FrameLatencyStart, FramePollControl, FramePollError, FramePollStatus, IOPublisher, InboundFrame, InputRecord, IoError,
@@ -79,7 +81,7 @@ impl InMemoryFrameIo {
         &mut self,
         clock: &Clock,
         endpoint: Endpoint,
-        mode: &mut Mode,
+        mode: &mut InputLifecycle,
         max_frames: usize,
         mut on_frame: F,
     ) -> Result<FramePollStatus, FramePollError<E>>

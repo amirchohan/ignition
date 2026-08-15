@@ -30,7 +30,7 @@ use super::{
 };
 
 pub fn run_trading_client(config: TradingClientConfig) -> Result<(), TradingClientError> {
-    let instrument = config.instrument().map_err(TradingClientError::ServerConfig)?;
+    let instrument = config.instrument().map_err(TradingClientError::CoreConfig)?;
     let mut gateway = GatewayClient::connect(&config.gateway_addr)?;
     let mut market_data = MarketDataClient::bind(&config.market_data.bind_addr, &config.market_data.group_addr)?;
     let synthetic_traffic_rx = spawn_synthetic_traffic(&config, instrument);
@@ -542,7 +542,7 @@ impl Drop for TerminalGuard {
 #[derive(Debug)]
 pub enum TradingClientError {
     Config(TradingClientConfigError),
-    ServerConfig(crate::config::ConfigError),
+    CoreConfig(crate::config::ConfigError),
     Io(TradingClientIoError),
     Terminal(std::io::Error),
 }
@@ -551,7 +551,7 @@ impl std::fmt::Display for TradingClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Config(error) => write!(f, "{error}"),
-            Self::ServerConfig(error) => write!(f, "server config error: {error:?}"),
+            Self::CoreConfig(error) => write!(f, "core config error: {error:?}"),
             Self::Io(error) => write!(f, "{error}"),
             Self::Terminal(error) => write!(f, "terminal error: {error}"),
         }

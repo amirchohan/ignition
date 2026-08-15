@@ -160,7 +160,7 @@ impl GatewayRuntime {
     pub fn poll<F, E>(
         &mut self,
         clock: &Clock,
-        mode: &mut crate::runtime::Mode,
+        mode: &mut crate::runtime::InputLifecycle,
         sequencer: &mut Sequencer,
         metrics: &mut MetricsRuntime,
         mut on_order: F,
@@ -178,7 +178,7 @@ impl GatewayRuntime {
     pub(crate) fn poll_controlled<F, E>(
         &mut self,
         clock: &Clock,
-        mode: &mut crate::runtime::Mode,
+        mode: &mut crate::runtime::InputLifecycle,
         sequencer: &mut Sequencer,
         metrics: &mut MetricsRuntime,
         mut on_order: F,

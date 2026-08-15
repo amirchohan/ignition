@@ -24,3 +24,8 @@ just replay-compare 1786693693
 It contains recorded live input under `input/` and two replay output passes
 under `output/0001` and `output/0002`. The comparison command uses `0001` as
 the baseline and verifies later output directories byte-for-byte.
+
+Each directory under `runs/` also contains `run.yaml`, a versioned snapshot of
+the exact core configuration and first input sequence used for replay. The
+legacy fixtures preserve the former replay reference price so their golden
+outputs remain stable after the canonical configuration was consolidated.

@@ -12,10 +12,10 @@ control-client:
     cargo run --bin control-client
 
 replay input_id:
-    cargo run --bin replay -- --run {{input_id}} --config configs/replay.yaml
+    cargo run --bin replay -- --run fixtures/replay/runs/{{input_id}}
 
 replay-compare input_id:
-    scripts/replay_compare.sh {{input_id}} configs/replay.yaml
+    scripts/replay_compare.sh fixtures/replay/runs/{{input_id}}
 
 bench:
     cargo run --release --bin benchmark -- --orders 1000000 --warmup 50000 --workload mixed

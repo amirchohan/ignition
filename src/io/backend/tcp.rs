@@ -22,6 +22,10 @@ use std::{
     net::{SocketAddr, TcpListener, TcpStream},
 };
 
+/// Stack scratch space used by each nonblocking read syscall. This is a
+/// transport batching choice, not the maximum legal wire-frame length.
+const TCP_READ_CHUNK_LEN: usize = 4 * 1024;
+
 use crate::{clock::Clock, domain::RecvTs, protocol::SBE_HEADER_LEN};
 
 use super::{FrameLatencyStart, FramePollControl, FramePollError, FramePollStatus, InboundFrame, IoError};
@@ -136,7 +140,7 @@ impl TcpFrameIo {
         }
 
         let mut made_progress = false;
-        let mut buf = [0_u8; 4096];
+        let mut buf = [0_u8; TCP_READ_CHUNK_LEN];
         loop {
             let read_result = match self.active.as_mut() {
                 Some(stream) => stream.read(&mut buf),

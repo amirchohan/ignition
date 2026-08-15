@@ -5,7 +5,7 @@
 Ignition uses a bounded, paged `SideLadder` for each side of the book.
 
 The book has a fixed storage envelope: `storage_min_price..=storage_max_price`.
-These values come from `configs/server.yaml`. This is not a risk price band and
+These values come from `../configs/server.yaml`. This is not a risk price band and
 does not move with the market. It is the finite address space required for
 direct tick indexing without trees or price hashing.
 

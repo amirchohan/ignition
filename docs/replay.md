@@ -1,12 +1,10 @@
 # Replay And Recorded Streams
 
-Deterministic replay starts from a complete recorded input stream. The control
-plane's `Snapshot` output is inspection-only and is not accepted as a replay
-seed; it omits state required for byte-identical continuation and has no
-restore path.
+Deterministic replay starts from a complete recorded input stream plus the
+versioned core configuration captured with that stream. Inspection snapshots
+remain output-only and are not replay seeds.
 
-Ignition records live TCP input before endpoint decoding. Each record wraps one
-raw SBE frame with replay metadata:
+Each input record wraps one raw SBE frame with deterministic metadata:
 
 ```text
 input_seq: u64 little-endian
@@ -17,79 +15,52 @@ frame: [u8; frame_len]
 ```
 
 The wrapper is not part of the client wire protocol. Replay reinjects the raw
-SBE frame and recorded `recv_ts` through the same control/gateway runtime path
-used by live clients. Execution-report and market-data outputs are captured as:
-
-```text
-frame_len: u32 little-endian
-frame: [u8; frame_len]
-```
-
-Outbound trading and market-data messages currently do not carry receive
-timestamps. Execution reports, control events, protocol errors, and
-market-data messages all carry a globally monotonic `engineSeq`; market-data
-messages also carry a feed-local `mdSeq` for gap detection. Control responses
-and protocol errors that do carry `recv_ts` use the recorded timestamp.
+frame and recorded `recv_ts` through the same control/gateway path used by live
+traffic. Captured outputs remain a `u32` little-endian length followed by the
+encoded frame.
 
 ## Recording
 
-Recording is opt-in. Set `mode.record_path_dir` in the live config:
+`configs/live.yaml` selects either disabled or file recording:
 
 ```yaml
-mode:
-  type: live
-  next_input_seq: 1
-  record_path_dir: "fixtures/replay/runs"
+recording:
+  type: file
+  root_dir: "fixtures/replay/runs"
 ```
 
-Then start the server normally:
-
-```bash
-just server
-```
-
-When `record_path_dir` is present, server startup uses epoch seconds as the
-replay `input_id`, creates a run directory, and prints the selected ID.
-Recorded files are written to:
+At live startup the server creates a numeric run ID and writes:
 
 ```text
-fixtures/replay/runs/<input_id>/input/control.bin
-fixtures/replay/runs/<input_id>/input/gateway.bin
+fixtures/replay/runs/<run-id>/run.yaml
+fixtures/replay/runs/<run-id>/input/control.bin
+fixtures/replay/runs/<run-id>/input/gateway.bin
 ```
 
-The runtime assigns one global `input_seq` across control and gateway as frames
-are accepted. Recorders are flushed during normal endpoint polling and flushing.
-If the epoch-second run directory already exists, startup fails instead of
-overwriting recorded input. If `record_path_dir` is absent, the live server
-records nothing.
+`run.yaml` stores manifest format version 1, the first input sequence, and the
+exact validated `CoreConfig`. This prevents later edits to `../configs/server.yaml`
+from changing historical replay behaviour. The runtime still assigns one
+global input sequence across control and gateway.
 
 ## Replay
 
-Replay a recorded input stream with:
+Replay a checked-in or newly recorded run with:
 
 ```bash
-just replay <input_id>
+just replay <run-id>
+# Direct equivalent:
+cargo run --bin replay -- --run fixtures/replay/runs/<run-id>
 ```
 
-Each replay creates the next output directory automatically:
+Each invocation creates the next numbered output directory:
 
 ```text
-fixtures/replay/runs/<input_id>/output/0001/control.bin
-fixtures/replay/runs/<input_id>/output/0001/gateway.bin
-fixtures/replay/runs/<input_id>/output/0001/market_data.bin
+fixtures/replay/runs/<run-id>/output/0001/control.bin
+fixtures/replay/runs/<run-id>/output/0001/gateway.bin
+fixtures/replay/runs/<run-id>/output/0001/market_data.bin
 ```
 
-Running replay again for the same input writes `output/0002`, then `0003`, and
-so on. The replay command reads `mode.record_path_dir` from
-`configs/replay.yaml` and applies the run-specific input/output paths in
-memory.
-
-Compare deterministic replay outputs with:
-
-```bash
-just replay-compare <input_id>
-```
-
-Comparison uses `output/0001` as the baseline and compares every later output
-directory against it. Missing optional endpoint files are allowed only when
-they are missing on both sides; byte mismatches or one-sided files fail.
+Run `just replay-compare <run-id>` to compare every later output against
+`output/0001`. Missing optional endpoint files are allowed only when absent on
+both sides. The binary input/output formats, recorded timestamps, and global
+sequence enforcement are identical between live recording and replay.

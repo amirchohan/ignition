@@ -17,6 +17,8 @@
 //! control egress, for example snapshot begin/row/end messages, without
 //! staging requests or events in intermediate vectors.
 
+use crate::runtime::InputLifecycle;
+#[cfg(test)]
 use crate::runtime::Mode;
 use crate::{
     clock::Clock,
@@ -113,7 +115,13 @@ impl ControlRuntime {
     /// The returned boolean means forward progress was made by the underlying
     /// transport or frame processing. It is deliberately not a count; callers
     /// should observe state or output streams for behavior-specific assertions.
-    pub fn poll<F>(&mut self, clock: &Clock, mode: &mut Mode, sequencer: &mut Sequencer, mut on_request: F) -> Result<bool, ControlError>
+    pub fn poll<F>(
+        &mut self,
+        clock: &Clock,
+        mode: &mut InputLifecycle,
+        sequencer: &mut Sequencer,
+        mut on_request: F,
+    ) -> Result<bool, ControlError>
     where
         F: FnMut(ControlRequest, &mut ControlPublisher<'_, '_>, &mut Sequencer) -> Result<(), ControlError>,
     {

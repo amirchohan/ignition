@@ -1,0 +1,15 @@
+control:
+  listen_addr: "127.0.0.1:19001"
+  max_pending_write_bytes: 1048576
+gateway:
+  listen_addr: "127.0.0.1:19000"
+  max_pending_write_bytes: 1048576
+market_data:
+  bind_addr: "0.0.0.0:0"
+  group_addr: "239.255.0.1:19002"
+  multicast_ttl: 1
+  multicast_loop_v4: true
+  max_pending_datagram_bytes: 1048576
+recording:
+  type: file
+  root_dir: "fixtures/replay/runs"

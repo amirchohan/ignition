@@ -97,6 +97,19 @@ shutdown policy: deterministically drain the book, flush execution and market
 data output, and terminate. No separate capacity reject value or wire-schema
 change is exposed to clients.
 
+## Configuration
+
+`configs/server.yaml` is the single source of deterministic instrument, engine,
+risk, heartbeat, and poll-budget settings used by live and benchmark runs. Live
+network topology, backpressure, multicast, and recording selection live in
+`configs/live.yaml`.
+
+Recorded runs contain a versioned `run.yaml` snapshot of the exact core config.
+Replay reads that manifest rather than a separate replay config, preventing
+later configuration edits from changing historical output. Docker uses the
+same YAML files and applies explicit address overrides through environment
+variables; there are no Docker-specific config copies.
+
 ## Running
 
 Format and lint:
@@ -133,8 +146,9 @@ docker compose run --rm control-client
 ```
 
 The Docker server publishes gateway TCP on `19000`, control TCP on `19001`,
-and market-data UDP on `19002`. The client containers use Docker-specific
-configs that connect to the `server` compose service. Stop the server with:
+and market-data UDP on `19002`. Compose overrides only the container network
+addresses and disables synthetic traffic for the Docker trading client. Stop
+the server with:
 
 ```bash
 docker compose down

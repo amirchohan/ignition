@@ -12,7 +12,7 @@
 //! TCP is the live bidirectional backend and may be paired with a file recorder.
 //! File and in-memory backends drive deterministic replay. UDP is output-only,
 //! while `Noop` intentionally accepts and discards output. Replay sequencing
-//! remains coordinated by [`Mode`], not by individual leaf backends.
+//! remains coordinated by [`InputLifecycle`], not by individual leaf backends.
 
 mod file;
 mod in_memory;
@@ -22,7 +22,7 @@ mod udp;
 #[cfg(test)]
 use std::net::SocketAddr;
 
-use crate::{clock::Clock, runtime::Mode};
+use crate::{clock::Clock, runtime::InputLifecycle};
 
 use super::{Endpoint, FrameLatencyStart, FramePollControl, FramePollError, FramePollStatus, IOConfig, InboundFrame, InputRecord, IoError};
 
@@ -104,7 +104,7 @@ impl IOBackend {
         &mut self,
         endpoint: Endpoint,
         clock: &Clock,
-        mode: &mut Mode,
+        mode: &mut InputLifecycle,
         recorder: &mut Option<FileFrameIo>,
         max_frames: usize,
         mut on_frame: F,

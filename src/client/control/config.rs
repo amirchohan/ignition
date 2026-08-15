@@ -1,12 +1,12 @@
-use std::{fs, path::Path};
+use std::{env, fs, path::Path};
 
 use serde::Deserialize;
 
-use crate::config::{ConfigError, ServerConfig};
+use crate::config::{ConfigError, CoreConfig};
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ControlClientConfig {
-    pub server_config_path: String,
+    pub core_config_path: String,
     pub control_addr: String,
     pub heartbeat_interval_ms: u64,
     pub max_snapshot_rows: usize,
@@ -15,9 +15,12 @@ pub struct ControlClientConfig {
 impl ControlClientConfig {
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ControlClientConfigError> {
         let text = fs::read_to_string(path).map_err(ControlClientConfigError::Read)?;
-        let config = serde_yaml::from_str::<Self>(&text).map_err(ControlClientConfigError::Parse)?;
-        ServerConfig::load(&config.server_config_path)
-            .and_then(|config| config.validate().map(|_| ()).map_err(ConfigError::Validate))
+        let mut config = serde_yaml::from_str::<Self>(&text).map_err(ControlClientConfigError::Parse)?;
+        if let Ok(value) = env::var("IGNITION_CONTROL_ADDR") {
+            config.control_addr = value;
+        }
+        CoreConfig::load(&config.core_config_path)
+            .and_then(|config| config.instrument().map(|_| ()).map_err(ConfigError::Validate))
             .map_err(ControlClientConfigError::Server)?;
         Ok(config)
     }

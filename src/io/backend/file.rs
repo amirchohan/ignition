@@ -1,7 +1,7 @@
 //! Deterministic replay input, live-input recording, and output capture files.
 //!
 //! [`FileFrameIo`] owns optional buffered input and output files. Its one-record
-//! lookahead keeps the next [`InputRecord`] available until [`Mode`] says that
+//! lookahead keeps the next [`InputRecord`] available until [`InputLifecycle`] says that
 //! record's global sequence is due for this endpoint. [`FileFramePublisher`]
 //! lends the same output writer to a frame handler, so replies use the ordinary
 //! publisher interface without acquiring another file or buffer.
@@ -12,7 +12,7 @@
 //! use a length prefix followed by the untouched encoded frame.
 //!
 //! The parent backend coordinates endpoint validation and replay sequencing
-//! with `Mode`. A record is consumed only when its sequence is due, and replay
+//! with `InputLifecycle`. A record is consumed only when its sequence is due, and replay
 //! advances only after its handler succeeds. File replay deliberately delivers
 //! at most one record per poll so separately owned endpoint files can alternate
 //! according to the single global sequence.
@@ -23,7 +23,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::{domain::RecvTs, runtime::Mode};
+use crate::{domain::RecvTs, runtime::InputLifecycle};
 
 use super::{
     Endpoint, FrameLatencyStart, FramePollControl, FramePollError, FramePollStatus, IOPublisher, InboundFrame, InputRecord, IoError,
@@ -71,7 +71,7 @@ impl FileFrameIo {
     pub(crate) fn poll<F, E>(
         &mut self,
         endpoint: Endpoint,
-        mode: &mut Mode,
+        mode: &mut InputLifecycle,
         _max_frames: usize,
         mut on_frame: F,
     ) -> Result<FramePollStatus, FramePollError<E>>

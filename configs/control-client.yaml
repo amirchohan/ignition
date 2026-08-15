@@ -1,4 +1,4 @@
-server_config_path: "configs/server.yaml"
+core_config_path: "configs/server.yaml"
 control_addr: "127.0.0.1:19001"
 heartbeat_interval_ms: 1000
 max_snapshot_rows: 200

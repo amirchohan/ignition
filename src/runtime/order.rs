@@ -1,3 +1,25 @@
+//! Runtime coordination for one normalized order-entry command.
+//!
+//! This module connects the gateway's decoded [`OrderEntry`] values to control
+//! gating, pre-match risk, the matching engine, execution-report publication,
+//! and market-data publication. It owns coordination only; policy remains in
+//! `control` and `risk`, while book mutation remains in `engine`.
+//!
+//! # Main components
+//!
+//! - [`OrderProcessor`] applies the fixed validation and execution sequence for
+//!   one command received during the runtime gateway phase.
+//! - [`OrderProcessOutcome`] tells the outer runtime whether processing may
+//!   continue or fixed-capacity exhaustion requires a graceful shutdown.
+//!
+//! # Data flow and invariants
+//!
+//! Risk-increasing commands observe the control gate before risk evaluation.
+//! Cancels remain available while trading is halted so exposure can be reduced.
+//! Every reject receives the shared engine sequence, accepted commands delegate
+//! mutation to `Engine`, and deferred market-data errors are surfaced before the
+//! next command is accepted.
+
 use crate::{
     control::ControlRuntime,
     domain::{
@@ -15,12 +37,6 @@ use super::RuntimeError;
 /// Order-entry processor for the runtime gateway phase.
 pub(super) struct OrderProcessor;
 
-/// Runtime action produced by processing one normalized order command.
-pub(super) enum OrderProcessOutcome {
-    Continue,
-    GracefulShutdown(CapacityResource),
-}
-
 impl OrderProcessor {
     /// Apply control gating, risk checks, matching, and report publication for one order entry.
     pub(super) fn process(
@@ -34,7 +50,7 @@ impl OrderProcessor {
     ) -> Result<OrderProcessOutcome, RuntimeError> {
         let mut emit_report = |report| reports.emit_execution_report(report);
 
-        // Only new orders and replaces can add risk. Cancels must keep working
+        // only new orders and replaces can add risk. cancels must keep working
         // while the market is halted so users can reduce exposure.
         if Self::is_risk_increasing(entry) {
             let reason = control.reject_reason_for(Self::entry_recv_ts(entry));
@@ -47,7 +63,7 @@ impl OrderProcessor {
 
         let outcome = match risk.evaluate(entry, engine)? {
             RiskDecision::Accept => {
-                // Accepted orders are handed to the book, which publishes
+                // accepted orders are handed to the book, which publishes
                 // execution reports and any market-data updates it creates.
                 let outcome = engine.execute(entry, sequencer, market_data, &mut emit_report)?;
                 if let Some(price) = market_data.take_reference_price_update() {
@@ -59,7 +75,7 @@ impl OrderProcessor {
                 }
             }
             RiskDecision::Reject(reason) => {
-                // Risk rejects still get a sequenced execution report.
+                // risk rejects still get a sequenced execution report.
                 Self::reject_order_entry(sequencer, &mut emit_report, entry, reason)?;
                 OrderProcessOutcome::Continue
             }
@@ -118,4 +134,12 @@ impl OrderProcessor {
             OrderEntry::MassCancel(cancel) => cancel.recv_ts,
         }
     }
+}
+
+/// Runtime action produced by processing one normalized order command.
+pub(super) enum OrderProcessOutcome {
+    /// Continue accepting commands from the current gateway batch.
+    Continue,
+    /// Stop ingress and drain after the named fixed-capacity resource is exhausted.
+    GracefulShutdown(CapacityResource),
 }
