@@ -5,6 +5,16 @@ transport, protocol, orchestration, policy, matching, and publication so the
 matching core remains deterministic and the external adapters can evolve
 without changing book semantics.
 
+## Contents
+
+- [Live topology](#live-topology)
+- [Components](#component-contracts)
+- [Order processing](#order-processing)
+- [Runtime modes](#runtime-modes)
+- [Determinism and concurrency](#determinism-and-concurrency)
+- [Configuration and capacity](#configuration-and-capacity)
+- [Extension boundaries](#extension-boundaries)
+
 ## Live Topology
 
 ```mermaid
@@ -47,7 +57,7 @@ account binding, rate limits, multi-session fan-in, and deterministic ordering
 across sessions belong in a future upstream session gateway rather than in the
 matcher.
 
-## Component Contracts
+## Components
 
 | Component | Owns | Accepts and emits | Deliberately does not own |
 | --- | --- | --- | --- |

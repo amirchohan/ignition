@@ -5,6 +5,16 @@ gateway frames through the same protocol, runtime, risk, matching, sequencing,
 and publication path. Given the same run artifact, each replay produces
 byte-identical control, execution-report, and market-data files.
 
+## Contents
+
+- [Determinism contract](#determinism-contract)
+- [Recorded input format](#recorded-input-format)
+- [Live recording](#live-recording)
+- [Running replay](#running-replay)
+- [Byte-identical verification](#byte-identical-verification)
+- [Why snapshot is not a replay seed](#why-snapshot-is-not-a-replay-seed)
+- [Failure conditions](#failure-conditions)
+
 ## Determinism Contract
 
 A complete replay input consists of:

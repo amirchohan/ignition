@@ -6,6 +6,19 @@ single writer, and emits execution reports and market-data effects through
 caller-owned publishers. It never reads a clock, parses wire bytes, performs
 I/O, or chooses risk policy.
 
+## Contents
+
+- [Matching rules](#matching-rules)
+- [Order types and time in force](#order-types-and-time-in-force)
+- [Identity, cancel, and mass cancel](#identity-cancel-and-mass-cancel)
+- [Cancel-replace priority](#cancel-replace-priority)
+- [Reports and event ordering](#reports-and-event-ordering)
+- [Book structure](#book-structure)
+- [Capacity discipline](#capacity-discipline)
+- [Complexity](#complexity)
+- [Alternatives considered](#alternatives-considered)
+- [Enforced invariants](#enforced-invariants)
+
 ## Matching Rules
 
 Ignition uses strict price-time priority:

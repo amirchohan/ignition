@@ -5,6 +5,18 @@ reads projected book state and returns a typed decision without mutation.
 Control owns halt, shutdown, and heartbeat state. The runtime observes both
 before allowing any risk-increasing command to reach matching.
 
+## Contents
+
+- [Gate ordering](#gate-ordering)
+- [Account exposure](#account-exposure)
+- [Price band](#price-band)
+- [Self-trade prevention](#self-trade-prevention)
+- [Policy ownership and rejections](#policy-ownership-and-rejections)
+- [Kill switch](#kill-switch)
+- [Heartbeat](#heartbeat)
+- [Inspection snapshot](#inspection-snapshot)
+- [Configuration](#configuration)
+
 ## Gate Ordering
 
 For `NewOrder` and `CancelReplace`, the runtime applies:

@@ -5,6 +5,19 @@ with deterministic, prebuilt SBE input and the production runtime graph. It
 reports HDR histogram percentiles, sustained throughput, and allocator calls;
 it does not report an average as a substitute for tail behaviour.
 
+## Contents
+
+- [Measured boundary](#measured-boundary)
+- [Workloads](#workloads)
+- [Arrival schedules](#arrival-schedules)
+- [Histogram and samples](#histogram-and-samples)
+- [Warmup](#warmup)
+- [Allocation measurement](#allocation-measurement)
+- [Commands](#commands)
+- [Observed environment](#observed-environment)
+- [Observed results](#observed-results)
+- [Interpretation](#interpretation)
+
 ## Measured Boundary
 
 The timed path begins after one complete gateway frame is available from the

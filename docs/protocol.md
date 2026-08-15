@@ -4,6 +4,17 @@ Ignition uses Simple Binary Encoding (SBE) with fixed-width, little-endian
 messages. The XML schema at [`protocol/ignition.xml`](../protocol/ignition.xml)
 is the byte-level source of truth; this page is its human-readable contract.
 
+## Contents
+
+- [Framing](#framing)
+- [Endpoint contract](#endpoint-contract)
+- [Numeric policy](#numeric-policy)
+- [Enumerations](#enumerations)
+- [Message layouts](#message-layouts)
+- [Sequencing and gap detection](#sequencing-and-gap-detection)
+- [Snapshots](#snapshots)
+- [Compatibility and generation](#compatibility-and-generation)
+
 ## Framing
 
 Every message is one SBE header followed by one fixed block:
