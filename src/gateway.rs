@@ -19,6 +19,7 @@
 //! vectors. Market-data output is emitted by the runtime-owned market-data feed.
 
 use crate::{
+    clock::Clock,
     domain::{
         DomainError, ProtocolErrorEvent, RecvTs, RejectReason, Sequencer,
         rd::InstrumentSpec,
@@ -151,6 +152,7 @@ impl GatewayRuntime {
     /// should observe state or output streams for behavior-specific assertions.
     pub fn poll<F, E>(
         &mut self,
+        clock: &Clock,
         mode: &mut crate::runtime::Mode,
         sequencer: &mut Sequencer,
         metrics: &mut MetricsRuntime,
@@ -164,10 +166,12 @@ impl GatewayRuntime {
             instrument: self.instrument,
             sequencer,
             metrics,
+            clock,
             on_order: &mut on_order,
             handled_frame: false,
         };
         let io_progress = match self.io.poll_bounded(
+            clock,
             mode,
             |io_publisher, recv_ts, bytes| session.on_frame(io_publisher, recv_ts, bytes),
             self.max_messages_per_poll,
@@ -219,6 +223,7 @@ struct GatewaySession<'a, F> {
     instrument: InstrumentSpec,
     sequencer: &'a mut Sequencer,
     metrics: &'a mut MetricsRuntime,
+    clock: &'a Clock,
     on_order: &'a mut F,
     handled_frame: bool,
 }
@@ -228,7 +233,7 @@ where
     F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), E>,
 {
     fn on_frame(&mut self, io_publisher: &mut IOPublisher<'_>, recv_ts: RecvTs, bytes: &[u8]) -> Result<(), GatewayPollError<E>> {
-        let time = self.metrics.start_clock();
+        let time = self.metrics.start_clock(self.clock);
         self.handled_frame = true;
         let mut publisher = GatewayPublisher {
             io: io_publisher,
@@ -245,7 +250,7 @@ where
         };
         result?;
         publisher.check_deferred_error().map_err(GatewayPollError::Gateway)?;
-        self.metrics.stop_clock(time);
+        self.metrics.stop_clock(self.clock, time);
         Ok(())
     }
 }
@@ -446,10 +451,11 @@ mod tests {
     where
         F: FnMut(OrderEntry, &mut GatewayPublisher<'_, '_>, &mut Sequencer) -> Result<(), GatewayError> + Copy,
     {
+        let clock = Clock::new();
         let mut mode = crate::runtime::Mode::default();
         let mut metrics = MetricsRuntime::noop();
         for _ in 0..100 {
-            if gateway.poll(&mut mode, sequencer, &mut metrics, f).expect("poll") {
+            if gateway.poll(&clock, &mut mode, sequencer, &mut metrics, f).expect("poll") {
                 return;
             }
             thread::sleep(Duration::from_millis(1));
@@ -513,10 +519,11 @@ mod tests {
         let mut mode = crate::runtime::Mode::default();
         let mut metrics = MetricsRuntime::noop();
         let mut callback_seen = false;
+        let clock = Clock::new();
 
         for _ in 0..100 {
             if gateway
-                .poll(&mut mode, &mut sequencer, &mut metrics, |_, _, _| {
+                .poll(&clock, &mut mode, &mut sequencer, &mut metrics, |_, _, _| {
                     callback_seen = true;
                     Ok::<(), GatewayError>(())
                 })

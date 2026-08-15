@@ -19,6 +19,7 @@
 
 use crate::runtime::Mode;
 use crate::{
+    clock::Clock,
     domain::{
         DomainError, ProtocolErrorEvent, RecvTs, RejectReason, Sequencer,
         control::{
@@ -107,7 +108,7 @@ impl ControlRuntime {
     /// The returned boolean means forward progress was made by the underlying
     /// transport or frame processing. It is deliberately not a count; callers
     /// should observe state or output streams for behavior-specific assertions.
-    pub fn poll<F>(&mut self, mode: &mut Mode, sequencer: &mut Sequencer, mut on_request: F) -> Result<bool, ControlError>
+    pub fn poll<F>(&mut self, clock: &Clock, mode: &mut Mode, sequencer: &mut Sequencer, mut on_request: F) -> Result<bool, ControlError>
     where
         F: FnMut(ControlRequest, &mut ControlPublisher<'_, '_>, &mut Sequencer) -> Result<(), ControlError>,
     {
@@ -119,7 +120,9 @@ impl ControlRuntime {
             on_request: &mut on_request,
             shutdown_seen: false,
         };
-        let io_progress = match io.poll(mode, |io_publisher, recv_ts, bytes| session.on_frame(io_publisher, recv_ts, bytes)) {
+        let io_progress = match io.poll(clock, mode, |io_publisher, recv_ts, bytes| {
+            session.on_frame(io_publisher, recv_ts, bytes)
+        }) {
             Ok(progress) => progress,
             Err(FramePollError::Io(error)) => return Err(error.into()),
             Err(FramePollError::Handler(error)) => return Err(error),
@@ -439,11 +442,12 @@ mod tests {
     }
 
     fn poll_until_request(control: &mut ControlRuntime, out: &mut Vec<ControlRequest>) {
+        let clock = Clock::new();
         let mut sequencer = Sequencer::default();
         let mut mode = crate::runtime::Mode::default();
         for _ in 0..100 {
             if control
-                .poll(&mut mode, &mut sequencer, |request, _, _| {
+                .poll(&clock, &mut mode, &mut sequencer, |request, _, _| {
                     out.push(request);
                     Ok(())
                 })
@@ -514,9 +518,10 @@ mod tests {
         out.clear();
         let mut sequencer = Sequencer::default();
         let mut mode = crate::runtime::Mode::default();
+        let clock = Clock::new();
         assert!(
             !control
-                .poll(&mut mode, &mut sequencer, |request, _, _| {
+                .poll(&clock, &mut mode, &mut sequencer, |request, _, _| {
                     out.push(request);
                     Ok(())
                 })
@@ -534,10 +539,11 @@ mod tests {
         let mut sequencer = Sequencer::default();
         let mut mode = crate::runtime::Mode::default();
         let mut requests = Vec::new();
+        let clock = Clock::new();
 
         for _ in 0..100 {
             control
-                .poll(&mut mode, &mut sequencer, |request, _, _| {
+                .poll(&clock, &mut mode, &mut sequencer, |request, _, _| {
                     requests.push(request);
                     Ok(())
                 })
@@ -567,10 +573,11 @@ mod tests {
         let mut sequencer = Sequencer::default();
         let mut mode = crate::runtime::Mode::default();
         let mut requests = Vec::new();
+        let clock = Clock::new();
 
         for _ in 0..100 {
             control
-                .poll(&mut mode, &mut sequencer, |request, _, _| {
+                .poll(&clock, &mut mode, &mut sequencer, |request, _, _| {
                     requests.push(request);
                     Ok(())
                 })

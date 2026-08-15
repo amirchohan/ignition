@@ -15,6 +15,7 @@ pub use startup::RuntimeBuildError;
 use self::order::OrderProcessor;
 use self::snapshot::SnapshotProcessor;
 use crate::{
+    clock::Clock,
     control::{ControlError, ControlRuntime},
     domain::{
         Sequencer,
@@ -31,6 +32,8 @@ use crate::{
 /// Poll-driven runtime orchestrator.
 #[derive(Debug)]
 pub struct Runtime {
+    /// Process-local monotonic clock shared by runtime-adjacent timing paths.
+    clock: Clock,
     /// Live or deterministic replay mode.
     mode: Mode,
     /// Control-plane state and ingress.
@@ -64,6 +67,7 @@ impl Runtime {
     ) -> Result<Self, RuntimeError> {
         tracing::info!("runtime setup in {} mode", mode.label());
         Ok(Self {
+            clock: Clock::new(),
             mode,
             control,
             gateway,
@@ -115,6 +119,7 @@ impl Runtime {
         let mut handled_control_request = false;
 
         let Runtime {
+            clock,
             control,
             gateway,
             market_data,
@@ -128,7 +133,7 @@ impl Runtime {
         // poll every ready control frame before touching order entry. Normal
         // control state is updated inside `ControlRuntime`; this closure only
         // handles work that needs runtime-owned engine or market-data state.
-        let control_progress = control.poll(mode, sequencer, |request, publisher, sequencer| {
+        let control_progress = control.poll(clock, mode, sequencer, |request, publisher, sequencer| {
             handled_control_request = true;
             match request {
                 ControlRequest::KillSwitch(request) => {
@@ -174,6 +179,7 @@ impl Runtime {
     fn poll_gateway(&mut self) -> Result<bool, RuntimeError> {
         let mut handled_order = false;
         let Runtime {
+            clock,
             mode,
             control,
             gateway,
@@ -188,7 +194,7 @@ impl Runtime {
         // them one at a time so reports, book changes, and market data stay in
         // the same order as the incoming frames.
         let gateway_progress = gateway
-            .poll(mode, sequencer, metrics, |entry, publisher, sequencer| {
+            .poll(clock, mode, sequencer, metrics, |entry, publisher, sequencer| {
                 handled_order = true;
                 // the same sequencer is passed through the gateway callback so
                 // protocol rejects and engine reports share one monotonic stream.
@@ -1080,6 +1086,75 @@ mod tests {
         assert_eq!(reports[0].reject_reason, RejectReason::KillSwitchActive);
         assert_eq!(reports[1].reject_reason, RejectReason::UnknownOrder);
         assert_eq!(runtime.engine.resting_order_count(), 0);
+    }
+
+    #[test]
+    fn live_heartbeat_timeout_ignores_endpoint_construction_skew() {
+        let Some(gateway_addr) = reserve_loopback_addr() else {
+            return;
+        };
+        let Some(control_addr) = reserve_loopback_addr() else {
+            return;
+        };
+        let gateway = match GatewayRuntime::new(
+            crate::gateway::GatewayConfig {
+                io: IOConfig::Tcp {
+                    bind_addr: gateway_addr.to_string(),
+                    max_frame_len: 4096,
+                    max_pending_write_bytes: 1 << 20,
+                    record_path: None,
+                },
+                max_messages_per_poll: 1024,
+            },
+            instrument(),
+        ) {
+            Ok(gateway) => gateway,
+            Err(crate::gateway::GatewayError::Io(crate::io::IoError::Bind(error)))
+                if error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return;
+            }
+            Err(error) => panic!("gateway: {error:?}"),
+        };
+
+        // Separate endpoint-local origins would turn this construction delay
+        // into apparent heartbeat age on the gateway timestamp.
+        thread::sleep(Duration::from_millis(200));
+
+        let control = new_control_with_config(ControlConfig {
+            heartbeat_timeout_ns: 100_000_000,
+            io: IOConfig::Tcp {
+                bind_addr: control_addr.to_string(),
+                max_frame_len: 4096,
+                max_pending_write_bytes: 1 << 20,
+                record_path: None,
+            },
+        })
+        .expect("control");
+        let mut control_client = TcpStream::connect(control_addr).expect("connect control");
+        let mut gateway_client = TcpStream::connect(gateway_addr).expect("connect gateway");
+        gateway_client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("gateway timeout");
+        write_control(&mut control_client, &heartbeat(1));
+        write_gateway_orders(&mut gateway_client, [new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10)]);
+
+        let mut runtime = Runtime::new(
+            Mode::default(),
+            engine_config(),
+            risk_config(10, 1_000_000),
+            control,
+            gateway,
+            new_market_data().expect("market data"),
+            MetricsRuntime::noop(),
+        )
+        .expect("runtime");
+        poll_until_control(&mut runtime);
+        runtime.poll_gateway().expect("poll gateway");
+        let reports = read_execution_reports(&mut gateway_client, 1);
+
+        assert_eq!(reports[0].reject_reason, RejectReason::None);
+        assert_eq!(runtime.engine.resting_order_count(), 1);
     }
 
     #[test]

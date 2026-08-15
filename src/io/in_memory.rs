@@ -3,9 +3,9 @@
 //! This backend removes TCP and disk from measured hot-path latency while still
 //! delivering raw protocol frames through the normal endpoint callback path.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::{domain::RecvTs, runtime::Mode};
+use crate::{clock::Clock, domain::RecvTs, runtime::Mode};
 
 use super::{Endpoint, FramePollError, IOPublisher, InputRecord, IoError};
 
@@ -47,13 +47,14 @@ impl InMemoryFrameIo {
             max_frame_len,
             schedule: InputSchedule::OpenLoop {
                 target_rate_per_sec,
-                started_at: None,
+                started_at_ns: None,
             },
         })
     }
 
     pub fn poll<F, E>(
         &mut self,
+        clock: &Clock,
         endpoint: Endpoint,
         mode: &mut Mode,
         mut on_frame: F,
@@ -73,7 +74,7 @@ impl InMemoryFrameIo {
                 return Ok(made_progress);
             }
 
-            self.schedule.wait_until_due(self.cursor);
+            self.schedule.wait_until_due(clock, self.cursor);
             let record = &self.input[self.cursor];
 
             if record.input_seq != mode.expected_replay_input_seq().map_err(FramePollError::Io)? {
@@ -145,30 +146,30 @@ enum InputSchedule {
     Burst,
     OpenLoop {
         target_rate_per_sec: u64,
-        started_at: Option<Instant>,
+        started_at_ns: Option<u64>,
     },
 }
 
 impl InputSchedule {
-    fn wait_until_due(&mut self, input_index: usize) {
+    fn wait_until_due(&mut self, clock: &Clock, input_index: usize) {
         const SPIN_WINDOW: Duration = Duration::from_micros(50);
 
         let Self::OpenLoop {
             target_rate_per_sec,
-            started_at,
+            started_at_ns,
         } = self
         else {
             return;
         };
-        let start = *started_at.get_or_insert_with(Instant::now);
-        let due_offset = Duration::from_nanos(scheduled_offset_ns(input_index as u64, *target_rate_per_sec));
+        let start_ns = *started_at_ns.get_or_insert_with(|| clock.now_ns());
+        let due_offset_ns = scheduled_offset_ns(input_index as u64, *target_rate_per_sec);
 
         loop {
-            let elapsed = start.elapsed();
-            if elapsed >= due_offset {
+            let elapsed_ns = clock.now_ns().saturating_sub(start_ns);
+            if elapsed_ns >= due_offset_ns {
                 return;
             }
-            let remaining = due_offset - elapsed;
+            let remaining = Duration::from_nanos(due_offset_ns - elapsed_ns);
             if remaining > SPIN_WINDOW {
                 std::thread::sleep(remaining - SPIN_WINDOW);
             } else {
@@ -243,6 +244,7 @@ mod tests {
 
     #[test]
     fn scheduled_input_waits_for_absolute_arrival_deadlines() {
+        let clock = Clock::new();
         let records = vec![
             InputRecord {
                 input_seq: 1,
@@ -259,10 +261,11 @@ mod tests {
         ];
         let mut io = InMemoryFrameIo::new_scheduled(records, 128, 200).expect("scheduled io");
         let mut mode = Mode::Replay { expected_input_seq: 1 };
-        let started = Instant::now();
+        let started_ns = clock.now_ns();
 
         assert!(
             io.poll(
+                &clock,
                 Endpoint::Gateway,
                 &mut mode,
                 |_, _, _| Ok::<(), std::convert::Infallible>(()),
@@ -271,7 +274,7 @@ mod tests {
             .expect("poll")
         );
 
-        assert!(started.elapsed() >= Duration::from_millis(5));
+        assert!(clock.now_ns().saturating_sub(started_ns) >= 5_000_000);
         assert_eq!(mode, Mode::Replay { expected_input_seq: 3 });
     }
 }

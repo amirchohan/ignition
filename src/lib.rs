@@ -5,6 +5,7 @@
 //! boundaries.
 
 pub mod client;
+pub mod clock;
 pub mod config;
 pub mod control;
 pub mod domain;

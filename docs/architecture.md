@@ -123,6 +123,11 @@ The intended flow is:
    market-data messages also receive feed-local `MdSeq`,
 7. control and gateway encode endpoint-specific egress frames.
 
+`Runtime` owns one monotonic `Clock` and passes it to live control and gateway
+ingress, benchmark scheduling, and metrics. Live receive timestamps are
+nanoseconds from that runtime origin; replay bypasses live timestamp sampling
+and reuses the values stored with each recorded input frame.
+
 Replay and benchmark traffic exercise the same protocol/runtime boundary as
 live clients, using file and in-memory I/O backends instead of privileged engine
 entrypoints.

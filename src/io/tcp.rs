@@ -6,10 +6,9 @@
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    time::Instant,
 };
 
-use crate::{domain::RecvTs, protocol::SBE_HEADER_LEN};
+use crate::{clock::Clock, domain::RecvTs, protocol::SBE_HEADER_LEN};
 
 use super::{FramePollError, IoError};
 
@@ -115,25 +114,6 @@ impl TcpFramePublisher<'_> {
     }
 }
 
-/// Monotonic timestamp source used at the live I/O boundary.
-#[derive(Debug)]
-struct MonotonicRecvTs {
-    start: Instant,
-}
-
-impl Default for MonotonicRecvTs {
-    fn default() -> Self {
-        Self { start: Instant::now() }
-    }
-}
-
-impl MonotonicRecvTs {
-    fn recv_ts(&mut self) -> RecvTs {
-        let nanos = self.start.elapsed().as_nanos();
-        RecvTs::new(nanos.min(u128::from(u64::MAX)) as u64)
-    }
-}
-
 /// Nonblocking TCP listener with one active client.
 #[derive(Debug)]
 pub struct TcpFrameIo {
@@ -146,7 +126,6 @@ pub struct TcpFrameIo {
     write_len: usize,
     max_frame_len: usize,
     max_pending_write_bytes: usize,
-    recv_ts_source: MonotonicRecvTs,
 }
 
 impl TcpFrameIo {
@@ -163,7 +142,6 @@ impl TcpFrameIo {
             write_len: 0,
             max_frame_len,
             max_pending_write_bytes,
-            recv_ts_source: MonotonicRecvTs::default(),
         })
     }
 
@@ -192,7 +170,7 @@ impl TcpFrameIo {
         }
     }
 
-    fn read_available<F, E>(&mut self, mut on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
+    fn read_available<F, E>(&mut self, clock: &Clock, mut on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
@@ -215,7 +193,7 @@ impl TcpFrameIo {
                 Ok(read) => {
                     made_progress = true;
                     self.read_buf.extend_from_slice(&buf[..read]);
-                    if self.drain_complete_frames(&mut on_frame, max_frames)? {
+                    if self.drain_complete_frames(clock, &mut on_frame, max_frames)? {
                         self.compact_read_buf();
                         return Ok(true);
                     }
@@ -233,7 +211,7 @@ impl TcpFrameIo {
         }
     }
 
-    fn drain_complete_frames<F, E>(&mut self, on_frame: &mut F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
+    fn drain_complete_frames<F, E>(&mut self, clock: &Clock, on_frame: &mut F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
@@ -246,7 +224,6 @@ impl TcpFrameIo {
             write_len,
             max_frame_len,
             max_pending_write_bytes,
-            recv_ts_source,
             ..
         } = self;
         let mut frames = 0_usize;
@@ -276,7 +253,7 @@ impl TcpFrameIo {
 
             let frame_start = *read_start;
             let frame_end = frame_start + frame_len;
-            let recv_ts = recv_ts_source.recv_ts();
+            let recv_ts = RecvTs::new(clock.now_ns());
             *read_start = frame_end;
             let mut publisher = TcpFramePublisher {
                 active,
@@ -352,21 +329,21 @@ impl TcpFrameIo {
         self.write_len = 0;
     }
 
-    pub fn poll<F, E>(&mut self, on_frame: F) -> Result<bool, FramePollError<E>>
+    pub fn poll<F, E>(&mut self, clock: &Clock, on_frame: F) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
-        self.poll_inner(on_frame, None)
+        self.poll_inner(clock, on_frame, None)
     }
 
-    pub fn poll_bounded<F, E>(&mut self, on_frame: F, max_frames: usize) -> Result<bool, FramePollError<E>>
+    pub fn poll_bounded<F, E>(&mut self, clock: &Clock, on_frame: F, max_frames: usize) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
-        self.poll_inner(on_frame, Some(max_frames))
+        self.poll_inner(clock, on_frame, Some(max_frames))
     }
 
-    fn poll_inner<F, E>(&mut self, on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
+    fn poll_inner<F, E>(&mut self, clock: &Clock, on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut TcpFramePublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
@@ -375,7 +352,7 @@ impl TcpFrameIo {
 
         // Then read whatever bytes are available and call the handler for each
         // complete frame. Partial frames stay buffered for a later poll.
-        let read = self.read_available(on_frame, max_frames)?;
+        let read = self.read_available(clock, on_frame, max_frames)?;
 
         // Finally push out anything endpoint code queued while handling input.
         let flushed = self.flush_writes().map_err(FramePollError::Io)?;
@@ -434,8 +411,8 @@ mod tests {
         }
     }
 
-    fn poll_once(io: &mut TcpFrameIo, out: &mut Vec<CapturedFrame>) -> bool {
-        io.poll(|_, recv_ts, bytes| {
+    fn poll_once(io: &mut TcpFrameIo, clock: &Clock, out: &mut Vec<CapturedFrame>) -> bool {
+        io.poll(clock, |_, recv_ts, bytes| {
             out.push(CapturedFrame {
                 recv_ts,
                 bytes: bytes.to_vec(),
@@ -445,9 +422,9 @@ mod tests {
         .expect("poll")
     }
 
-    fn poll_until_frame(io: &mut TcpFrameIo, out: &mut Vec<CapturedFrame>) {
+    fn poll_until_frame(io: &mut TcpFrameIo, clock: &Clock, out: &mut Vec<CapturedFrame>) {
         for _ in 0..100 {
-            poll_once(io, out);
+            poll_once(io, clock, out);
             if !out.is_empty() {
                 return;
             }
@@ -461,6 +438,7 @@ mod tests {
         let Some(mut io) = tcp_io() else {
             return;
         };
+        let clock = Clock::new();
         let addr = io.local_addr().expect("addr");
         let mut client = TcpStream::connect(addr).expect("connect");
         let input = frame(MessageKind::Heartbeat, &[1, 2, 3, 4]);
@@ -468,12 +446,12 @@ mod tests {
         client.write_all(&input[..3]).expect("write partial");
         let mut out = Vec::new();
         for _ in 0..10 {
-            poll_once(&mut io, &mut out);
+            poll_once(&mut io, &clock, &mut out);
         }
         assert!(out.is_empty());
 
         client.write_all(&input[3..]).expect("write rest");
-        poll_until_frame(&mut io, &mut out);
+        poll_until_frame(&mut io, &clock, &mut out);
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].bytes, input);
@@ -484,6 +462,7 @@ mod tests {
         let Some(mut io) = tcp_io() else {
             return;
         };
+        let clock = Clock::new();
         let addr = io.local_addr().expect("addr");
         let mut client = TcpStream::connect(addr).expect("connect");
         let first = frame(MessageKind::Heartbeat, &[1, 2, 3, 4]);
@@ -492,9 +471,9 @@ mod tests {
         client.write_all(&second).expect("write second");
 
         let mut out = Vec::new();
-        poll_until_frame(&mut io, &mut out);
+        poll_until_frame(&mut io, &clock, &mut out);
         if out.len() < 2 {
-            poll_until_frame(&mut io, &mut out);
+            poll_until_frame(&mut io, &clock, &mut out);
         }
 
         assert_eq!(out.len(), 2);
@@ -508,13 +487,14 @@ mod tests {
         let Some(mut io) = tcp_io() else {
             return;
         };
+        let clock = Clock::new();
         let addr = io.local_addr().expect("addr");
         let mut client = TcpStream::connect(addr).expect("connect");
         client.set_read_timeout(Some(Duration::from_secs(1))).expect("timeout");
         let output = frame(MessageKind::HeartbeatStatus, &[9, 8, 7, 6]);
 
         for _ in 0..100 {
-            io.poll(|_, _, _| Ok::<(), std::convert::Infallible>(())).expect("accept");
+            io.poll(&clock, |_, _, _| Ok::<(), std::convert::Infallible>(())).expect("accept");
             if io.active.is_some() {
                 break;
             }
@@ -532,6 +512,7 @@ mod tests {
         let Some(mut io) = tcp_io() else {
             return;
         };
+        let clock = Clock::new();
         let addr = io.local_addr().expect("addr");
         let mut first = TcpStream::connect(addr).expect("first");
         let mut second = TcpStream::connect(addr).expect("second");
@@ -542,7 +523,7 @@ mod tests {
         second.write_all(&second_frame).expect("write second");
 
         let mut out = Vec::new();
-        poll_until_frame(&mut io, &mut out);
+        poll_until_frame(&mut io, &clock, &mut out);
 
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].bytes, first_frame);

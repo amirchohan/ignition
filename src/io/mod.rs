@@ -22,7 +22,7 @@
 
 use std::path::PathBuf;
 
-use crate::{domain::RecvTs, runtime::Mode};
+use crate::{clock::Clock, domain::RecvTs, runtime::Mode};
 
 pub mod file;
 pub mod in_memory;
@@ -111,38 +111,50 @@ impl IORuntime {
     }
 
     /// Poll inbound frames without an explicit frame budget.
-    pub fn poll<F, E>(&mut self, mode: &mut Mode, on_frame: F) -> Result<bool, FramePollError<E>>
+    pub fn poll<F, E>(&mut self, clock: &Clock, mode: &mut Mode, on_frame: F) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
-        self.poll_inner(mode, on_frame, None)
+        self.poll_inner(clock, mode, on_frame, None)
     }
 
     /// Poll inbound frames with a maximum number of frames accepted this call.
-    pub fn poll_bounded<F, E>(&mut self, mode: &mut Mode, on_frame: F, max_frames: usize) -> Result<bool, FramePollError<E>>
+    pub fn poll_bounded<F, E>(&mut self, clock: &Clock, mode: &mut Mode, on_frame: F, max_frames: usize) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
-        self.poll_inner(mode, on_frame, Some(max_frames))
+        self.poll_inner(clock, mode, on_frame, Some(max_frames))
     }
 
-    fn poll_inner<F, E>(&mut self, mode: &mut Mode, on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
+    fn poll_inner<F, E>(
+        &mut self,
+        clock: &Clock,
+        mode: &mut Mode,
+        on_frame: F,
+        max_frames: Option<usize>,
+    ) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
         if matches!(&self.backend, IOBackend::Tcp(_)) {
-            self.poll_tcp(mode, on_frame, max_frames)
+            self.poll_tcp(clock, mode, on_frame, max_frames)
         } else if matches!(&self.backend, IOBackend::File(_)) {
             self.poll_file(mode, on_frame)
         } else if matches!(&self.backend, IOBackend::InMemory(_)) {
-            self.poll_in_memory(mode, on_frame, max_frames)
+            self.poll_in_memory(clock, mode, on_frame, max_frames)
         } else {
             // These backends do not produce inbound frames here.
             Ok(false)
         }
     }
 
-    fn poll_tcp<F, E>(&mut self, mode: &mut Mode, mut on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
+    fn poll_tcp<F, E>(
+        &mut self,
+        clock: &Clock,
+        mode: &mut Mode,
+        mut on_frame: F,
+        max_frames: Option<usize>,
+    ) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
@@ -179,8 +191,8 @@ impl IORuntime {
         // TCP owns connection handling and frame assembly. This layer adds
         // sequencing, optional recording, and endpoint dispatch.
         let result = match max_frames {
-            Some(max_frames) => io.poll_bounded(&mut callback, max_frames),
-            None => io.poll(&mut callback),
+            Some(max_frames) => io.poll_bounded(clock, &mut callback, max_frames),
+            None => io.poll(clock, &mut callback),
         };
         let progress = flatten_poll_error(result)?;
         let record_progress = match recorder.as_mut() {
@@ -231,14 +243,20 @@ impl IORuntime {
         Ok(true)
     }
 
-    fn poll_in_memory<F, E>(&mut self, mode: &mut Mode, mut on_frame: F, max_frames: Option<usize>) -> Result<bool, FramePollError<E>>
+    fn poll_in_memory<F, E>(
+        &mut self,
+        clock: &Clock,
+        mode: &mut Mode,
+        mut on_frame: F,
+        max_frames: Option<usize>,
+    ) -> Result<bool, FramePollError<E>>
     where
         F: FnMut(&mut IOPublisher<'_>, RecvTs, &[u8]) -> Result<(), E>,
     {
         let IOBackend::InMemory(io) = &mut self.backend else {
             return Ok(false);
         };
-        io.poll(self.endpoint, mode, &mut on_frame, max_frames)
+        io.poll(clock, self.endpoint, mode, &mut on_frame, max_frames)
     }
 
     /// Queue one outbound frame through this endpoint backend.
@@ -627,6 +645,7 @@ mod tests {
         );
 
         let mut mode = Mode::Replay { expected_input_seq: 1 };
+        let clock = Clock::new();
         let mut control = IORuntime::new(
             Endpoint::Control,
             IOConfig::File {
@@ -650,7 +669,7 @@ mod tests {
         {
             assert!(
                 !control
-                    .poll(&mut mode, |_, recv_ts, frame| {
+                    .poll(&clock, &mut mode, |_, recv_ts, frame| {
                         seen.push((Endpoint::Control, recv_ts.raw(), frame.to_vec()));
                         Ok::<(), std::convert::Infallible>(())
                     })
@@ -660,7 +679,7 @@ mod tests {
         {
             assert!(
                 gateway
-                    .poll(&mut mode, |_, recv_ts, frame| {
+                    .poll(&clock, &mut mode, |_, recv_ts, frame| {
                         seen.push((Endpoint::Gateway, recv_ts.raw(), frame.to_vec()));
                         Ok::<(), std::convert::Infallible>(())
                     })
@@ -670,7 +689,7 @@ mod tests {
         {
             assert!(
                 control
-                    .poll(&mut mode, |_, recv_ts, frame| {
+                    .poll(&clock, &mut mode, |_, recv_ts, frame| {
                         seen.push((Endpoint::Control, recv_ts.raw(), frame.to_vec()));
                         Ok::<(), std::convert::Infallible>(())
                     })
@@ -691,6 +710,7 @@ mod tests {
     #[test]
     fn in_memory_backend_releases_replay_records_in_sequence() {
         let mut mode = Mode::Replay { expected_input_seq: 1 };
+        let clock = Clock::new();
         let records = vec![
             InputRecord {
                 input_seq: 1,
@@ -717,6 +737,7 @@ mod tests {
 
         assert!(
             io.poll_bounded(
+                &clock,
                 &mut mode,
                 |publisher, recv_ts, bytes| {
                     seen.push((recv_ts.raw(), bytes.to_vec()));
@@ -729,6 +750,7 @@ mod tests {
         );
         assert!(
             io.poll_bounded(
+                &clock,
                 &mut mode,
                 |publisher, recv_ts, bytes| {
                     seen.push((recv_ts.raw(), bytes.to_vec()));
@@ -739,7 +761,7 @@ mod tests {
             )
             .expect("second poll")
         );
-        assert!(!io.poll(&mut mode, |_, _, _| Ok::<(), IoError>(())).expect("drained"));
+        assert!(!io.poll(&clock, &mut mode, |_, _, _| Ok::<(), IoError>(())).expect("drained"));
         assert!(io.replay_input_exhausted().expect("exhausted"));
         assert_eq!(mode, Mode::Replay { expected_input_seq: 3 });
         assert_eq!(seen, vec![(10, records[0].frame.clone()), (11, records[1].frame.clone())]);
@@ -748,6 +770,7 @@ mod tests {
     #[test]
     fn in_memory_backend_rejects_wrong_endpoint_record() {
         let mut mode = Mode::Replay { expected_input_seq: 1 };
+        let clock = Clock::new();
         let mut io = IORuntime::new(
             Endpoint::Control,
             IOConfig::InMemory {
@@ -763,7 +786,7 @@ mod tests {
         .expect("in-memory io");
 
         assert!(matches!(
-            io.poll(&mut mode, |_, _, _| Ok::<(), IoError>(())),
+            io.poll(&clock, &mut mode, |_, _, _| Ok::<(), IoError>(())),
             Err(FramePollError::Io(IoError::EndpointMismatch {
                 configured: Endpoint::Control,
                 record: Endpoint::Gateway,
@@ -774,6 +797,7 @@ mod tests {
     #[test]
     fn tcp_backend_records_live_input_frames() {
         let record_path = temp_path("tcp-recording");
+        let clock = Clock::new();
         let mut runtime = match IORuntime::new(
             Endpoint::Control,
             IOConfig::Tcp {
@@ -796,7 +820,7 @@ mod tests {
         let mut seen = Vec::new();
         for _ in 0..100 {
             runtime
-                .poll(&mut mode, |_, recv_ts, bytes| {
+                .poll(&clock, &mut mode, |_, recv_ts, bytes| {
                     seen.push((recv_ts, bytes.to_vec()));
                     Ok::<(), std::convert::Infallible>(())
                 })
