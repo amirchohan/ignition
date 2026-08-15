@@ -1,6 +1,35 @@
-/target
-/.idea
+# Rust build output
+/target/
+**/*.rs.bk
 
+# Local IDE and editor state
+/.idea/
+/.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local Codex/agent state
+/.agents/
+/.codex/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Runtime-generated replay captures
+/fixtures/replay/live-*.bin
+/fixtures/replay/runs/*
+
+# Preserve the documented golden replay fixture
+!/fixtures/replay/runs/1786693693/
+!/fixtures/replay/runs/1786693693/**
+
+# Temporary files
+*.tmp
+
+# Repository-local instructions and original evaluation brief
+/AGENTS.md
 /docs/spec.pdf
-
-AGENTS.md
