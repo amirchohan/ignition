@@ -169,16 +169,21 @@ impl FileFrameIo {
             return Ok(None);
         };
         let mut header = [0_u8; RECORD_HEADER_LEN];
-        match input.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        match input.read(&mut header[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(1) => input.read_exact(&mut header[1..]).map_err(IoError::Read)?,
+            Ok(_) => return Err(IoError::Read(std::io::Error::other("invalid replay header read"))),
             Err(error) => return Err(IoError::Read(error)),
         }
 
-        let input_seq = u64::from_le_bytes(header[0..8].try_into().expect("input seq bytes"));
+        let input_seq = u64::from_le_bytes([
+            header[0], header[1], header[2], header[3], header[4], header[5], header[6], header[7],
+        ]);
         let endpoint = Endpoint::from_u8(header[8])?;
-        let recv_ts = RecvTs::new(u64::from_le_bytes(header[9..17].try_into().expect("recv ts bytes")));
-        let frame_len = u32::from_le_bytes(header[17..21].try_into().expect("frame len bytes")) as usize;
+        let recv_ts = RecvTs::new(u64::from_le_bytes([
+            header[9], header[10], header[11], header[12], header[13], header[14], header[15], header[16],
+        ]));
+        let frame_len = u32::from_le_bytes([header[17], header[18], header[19], header[20]]) as usize;
         if frame_len > self.max_frame_len {
             return Err(IoError::FrameTooLarge {
                 frame_len,
@@ -289,6 +294,17 @@ mod tests {
         .expect("record");
         assert!(io.flush_pending().expect("flush record"));
         assert!(!io.flush_pending().expect("clean record flush"));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn truncated_record_header_is_an_error_not_clean_eof() {
+        let path = std::env::temp_dir().join(format!("ignition-truncated-record-{}.bin", std::process::id()));
+        std::fs::write(&path, [1_u8, 2, 3]).expect("truncated input");
+        let mut io = FileFrameIo::open(Some(path.clone()), None, 128).expect("reader");
+
+        assert!(matches!(io.peek_record(), Err(IoError::Read(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof));
 
         let _ = std::fs::remove_file(path);
     }

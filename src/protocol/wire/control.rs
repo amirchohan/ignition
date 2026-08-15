@@ -84,7 +84,7 @@ pub fn decode_control_request(input: &[u8], recv_ts: RecvTs) -> Result<ControlRe
                 recv_ts,
             }))
         }
-        _ => unreachable!("control request kind checked above"),
+        _ => Err(WireDecodeError::protocol(unexpected_template(frame.kind), input, recv_ts)),
     }
 }
 

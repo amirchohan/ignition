@@ -119,7 +119,7 @@ pub fn decode_order_entry(input: &[u8]) -> ProtocolResult<WireOrderEntry> {
                 client_ts: decoder.client_ts(),
             }))
         }
-        _ => unreachable!("order entry kind checked above"),
+        _ => Err(unexpected_template(frame.kind)),
     }
 }
 

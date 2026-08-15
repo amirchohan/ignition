@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable))]
+
 //! Hot-path benchmark entry point.
 //!
 //! This binary measures the order-entry path without TCP or disk IO in the
@@ -100,7 +102,7 @@ fn build_runtime(
 ) -> Result<Runtime, RuntimeBuildError> {
     let config = ServerConfig::load(&args.config_path).map_err(RuntimeBuildError::Config)?;
     let instrument = config.validate().map_err(RuntimeBuildError::ReferenceData)?;
-    let metrics = MetricsRuntime::new(metrics_override.unwrap_or(config.metrics), 0);
+    let metrics = MetricsRuntime::new(metrics_override.unwrap_or(config.metrics), 0).map_err(RuntimeBuildError::Metrics)?;
     let control = ControlRuntime::new(ControlConfig {
         heartbeat_timeout_ns: 0,
         max_messages_per_poll: 1024,

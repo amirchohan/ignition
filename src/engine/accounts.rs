@@ -35,7 +35,10 @@
 //! This lets mass cancel walk one account's orders without scanning the whole
 //! book or allocating a separate list node for every order.
 
-use crate::domain::trading::order::{AccountId, OrderId};
+use crate::domain::{
+    DomainError, DomainResult,
+    trading::order::{AccountId, OrderId},
+};
 use hashbrown::HashMap;
 
 use super::orders::OrderHandle;
@@ -102,13 +105,17 @@ impl AccountTable {
 
     /// Register a newly resting order in the account-scoped lookup.
     #[inline]
-    pub(crate) fn insert_order(&mut self, account_id: AccountId, client_order_id: OrderId, handle: OrderHandle) {
+    pub(crate) fn insert_order(&mut self, account_id: AccountId, client_order_id: OrderId, handle: OrderHandle) -> DomainResult<()> {
         // resting storage assigns the arena handle before the order becomes
         // reachable through this lookup.
-        let previous = self.active_orders.insert(AccountOrderKey::new(account_id, client_order_id), handle);
+        let key = AccountOrderKey::new(account_id, client_order_id);
         // structural validation must reject a duplicate exact key before this
         // method is called.
-        debug_assert!(previous.is_none(), "live account order must be unique");
+        if self.active_orders.contains_key(&key) {
+            return Err(DomainError::Malformed);
+        }
+        self.active_orders.insert(key, handle);
+        Ok(())
     }
 
     /// Remove an account order from the live-order lookup.
@@ -127,19 +134,22 @@ impl AccountTable {
         old_client_order_id: OrderId,
         new_client_order_id: OrderId,
         handle: OrderHandle,
-    ) {
+    ) -> DomainResult<()> {
         // a same-ID replacement needs no map mutation. confirm that the
         // existing key still points to the order being replaced.
         if old_client_order_id == new_client_order_id {
-            debug_assert_eq!(self.order_handle(account_id, old_client_order_id), Some(handle));
-            return;
+            return (self.order_handle(account_id, old_client_order_id) == Some(handle))
+                .then_some(())
+                .ok_or(DomainError::Malformed);
         }
 
         // a priority-preserving cancel-replace keeps its arena slot but changes
         // the externally visible key used to find that slot.
         let removed = self.remove_order(account_id, old_client_order_id);
-        debug_assert_eq!(removed, Some(handle), "replacement must rekey its original live order");
-        self.insert_order(account_id, new_client_order_id, handle);
+        if removed != Some(handle) {
+            return Err(DomainError::Malformed);
+        }
+        self.insert_order(account_id, new_client_order_id, handle)
     }
 }
 /// Book state maintained for one configured account.

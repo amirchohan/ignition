@@ -314,11 +314,11 @@ impl TestEngine {
     }
 
     fn best_bid(&self) -> Option<(Price, u64)> {
-        self.engine.best_bid()
+        self.engine.best_bid().expect("consistent book")
     }
 
     fn best_ask(&self) -> Option<(Price, u64)> {
-        self.engine.best_ask()
+        self.engine.best_ask().expect("consistent book")
     }
 
     fn resting_order_count(&self) -> usize {
@@ -368,7 +368,7 @@ fn resting_rows(engine: &TestEngine) -> Vec<(u64, u32, Side, u64, u64)> {
                 row.price.raw(),
                 row.remaining_qty,
             ));
-            Ok::<(), ()>(())
+            Ok::<(), EngineError>(())
         })
         .expect("resting rows");
     rows

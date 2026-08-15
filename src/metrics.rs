@@ -12,26 +12,32 @@ use crate::clock::Clock;
 /// Runtime metrics collector.
 #[derive(Debug)]
 pub struct MetricsRuntime {
-    backend: MetricsBackend,
-    metrics: Metrics,
+    state: MetricsState,
+}
+
+#[derive(Debug)]
+enum MetricsState {
+    Noop,
+    InMemory(Metrics),
 }
 
 impl MetricsRuntime {
     /// Build a metrics runtime for the selected backend.
-    pub fn new(backend: MetricsBackend, warmup_samples: u64) -> Self {
-        Self {
-            backend,
-            metrics: Metrics::new(warmup_samples),
-        }
+    pub fn new(backend: MetricsBackend, warmup_samples: u64) -> Result<Self, MetricsError> {
+        let state = match backend {
+            MetricsBackend::Noop => MetricsState::Noop,
+            MetricsBackend::InMemory => MetricsState::InMemory(Metrics::new(warmup_samples)?),
+        };
+        Ok(Self { state })
     }
 
     /// Build a no-op metrics runtime.
     pub fn noop() -> Self {
-        Self::new(MetricsBackend::Noop, 0)
+        Self { state: MetricsState::Noop }
     }
 
     /// Build an in-memory metrics runtime with a warmup sample budget.
-    pub fn in_memory(warmup_samples: u64) -> Self {
+    pub fn in_memory(warmup_samples: u64) -> Result<Self, MetricsError> {
         Self::new(MetricsBackend::InMemory, warmup_samples)
     }
 
@@ -42,27 +48,34 @@ impl MetricsRuntime {
 
     /// Start one timing sample at a timestamp from the runtime clock.
     pub(crate) fn start_clock_at(&self, start_ns: u64) -> MetricsTime {
-        match self.backend {
-            MetricsBackend::Noop => MetricsTime::Noop,
-            MetricsBackend::InMemory => MetricsTime::Started(start_ns),
+        match &self.state {
+            MetricsState::Noop => MetricsTime::Noop,
+            MetricsState::InMemory(_) => MetricsTime::Started(start_ns),
         }
     }
 
     /// Stop one timing sample and record it when metrics are enabled.
     pub fn stop_clock(&mut self, clock: &Clock, time: MetricsTime) {
-        match (self.backend, time) {
-            (MetricsBackend::InMemory, MetricsTime::Started(start_ns)) => self.metrics.record(start_ns, clock.now_ns()),
-            (MetricsBackend::Noop, _) | (_, MetricsTime::Noop) => {}
+        match (&mut self.state, time) {
+            (MetricsState::InMemory(metrics), MetricsTime::Started(start_ns)) => metrics.record(start_ns, clock.now_ns()),
+            (MetricsState::Noop, _) | (_, MetricsTime::Noop) => {}
         }
     }
 
     /// Return a post-run metrics snapshot.
     pub fn snapshot(&self) -> MetricsSnapshot {
-        match self.backend {
-            MetricsBackend::Noop => MetricsSnapshot::default(),
-            MetricsBackend::InMemory => self.metrics.snapshot(),
+        match &self.state {
+            MetricsState::Noop => MetricsSnapshot::default(),
+            MetricsState::InMemory(metrics) => metrics.snapshot(),
         }
     }
+}
+
+/// Metrics construction failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetricsError {
+    /// The in-memory latency histogram could not be constructed.
+    InvalidHistogramConfig,
 }
 
 /// Metrics backend selected at runtime construction.
@@ -94,15 +107,15 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn new(warmup_samples: u64) -> Self {
-        Self {
+    fn new(warmup_samples: u64) -> Result<Self, MetricsError> {
+        Ok(Self {
             warmup_samples,
             seen_samples: 0,
             measured_samples: 0,
             first_measured_start_ns: None,
             last_measured_end_ns: None,
-            histogram: Histogram::new_with_bounds(1, 60_000_000_000, 3).expect("valid histogram bounds"),
-        }
+            histogram: Histogram::new_with_bounds(1, 60_000_000_000, 3).map_err(|_| MetricsError::InvalidHistogramConfig)?,
+        })
     }
 
     fn record(&mut self, start_ns: u64, end_ns: u64) {
@@ -176,7 +189,7 @@ mod tests {
     #[test]
     fn in_memory_skips_warmup_and_records_percentiles() {
         let clock = Clock::new();
-        let mut metrics = MetricsRuntime::in_memory(1);
+        let mut metrics = MetricsRuntime::in_memory(1).expect("metrics");
         let first = metrics.start_clock(&clock);
         metrics.stop_clock(&clock, first);
         let second = metrics.start_clock(&clock);
@@ -191,8 +204,11 @@ mod tests {
 
     #[test]
     fn scheduled_start_records_queue_delay_directly() {
-        let mut metrics = MetricsRuntime::in_memory(0);
-        metrics.metrics.record(1_000, 4_000);
+        let mut metrics = MetricsRuntime::in_memory(0).expect("metrics");
+        let MetricsState::InMemory(state) = &mut metrics.state else {
+            panic!("in-memory metrics state");
+        };
+        state.record(1_000, 4_000);
 
         let snapshot = metrics.snapshot();
 

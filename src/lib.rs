@@ -1,3 +1,5 @@
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable))]
+
 //! Ignition is a single-symbol, deterministic CLOB matching engine.
 //!
 //! The crate keeps protocol, I/O, runtime orchestration, risk, matching,

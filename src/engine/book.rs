@@ -47,13 +47,13 @@ use super::*;
 
 impl Engine {
     /// Return the current best bid price and aggregate quantity.
-    pub fn best_bid(&self) -> Option<(Price, u64)> {
-        self.bids.top()
+    pub fn best_bid(&self) -> Result<Option<(Price, u64)>, EngineError> {
+        self.bids.top().map_err(engine_error)
     }
 
     /// Return the current best ask price and aggregate quantity.
-    pub fn best_ask(&self) -> Option<(Price, u64)> {
-        self.asks.top()
+    pub fn best_ask(&self) -> Result<Option<(Price, u64)>, EngineError> {
+        self.asks.top().map_err(engine_error)
     }
 
     /// Return the number of currently resting orders.
@@ -72,25 +72,32 @@ impl Engine {
     }
 
     /// Return a read-only view of one resting order for risk projection.
-    pub fn resting_order(&self, account_id: AccountId, order_id: OrderId) -> Option<RestingOrderView> {
+    pub fn resting_order(&self, account_id: AccountId, order_id: OrderId) -> Result<Option<RestingOrderView>, EngineError> {
         // resolve through the account-scoped key first, then use the
         // generation-checked handle to read the arena slot.
-        let handle = self.accounts.order_handle(account_id, order_id)?;
-        let order = self.orders.get(handle).copied()?;
+        let Some(handle) = self.accounts.order_handle(account_id, order_id) else {
+            return Ok(None);
+        };
+        let order = self.orders.get(handle).copied().ok_or(EngineError::InvariantViolation)?;
         // the composite lookup must never resolve an order owned by another
         // account.
-        debug_assert_eq!(order.account_id, account_id);
-        Some(RestingOrderView {
+        if order.account_id != account_id || order.order_id != order_id {
+            return Err(EngineError::InvariantViolation);
+        }
+        Ok(Some(RestingOrderView {
             order_id: order.order_id,
             account_id: order.account_id,
             side: order.side,
             price: order.price,
             remaining_qty: order.remaining_qty,
-        })
+        }))
     }
 
     /// Visit resting orders in deterministic book order.
-    pub fn try_for_each_resting_order<E>(&self, mut visit: impl FnMut(RestingOrderView) -> Result<(), E>) -> Result<(), E> {
+    pub fn try_for_each_resting_order<E>(&self, mut visit: impl FnMut(RestingOrderView) -> Result<(), E>) -> Result<(), E>
+    where
+        E: From<EngineError>,
+    {
         // snapshots and risk iteration use one stable ordering: bids from best
         // to worst first, then asks from best to worst.
         self.try_for_each_side_order(Side::Buy, &mut visit)?;
@@ -130,7 +137,7 @@ impl Engine {
         // client-order indexes before returning it to the caller.
         let level_qty = self.append_to_level(side, key, handle)?;
         self.append_to_account(account_id, handle)?;
-        self.accounts.insert_order(account_id, order_id, handle);
+        self.accounts.insert_order(account_id, order_id, handle)?;
         Ok(level_qty)
     }
 
@@ -143,11 +150,11 @@ impl Engine {
 
         // append at the tail to preserve FIFO within the price level.
         if let Some(tail) = tail {
-            self.orders.get_mut(tail).expect("tail").level_next = Some(handle);
-            self.orders.get_mut(handle).expect("order").level_prev = Some(tail);
+            self.orders.get_mut(tail).ok_or(DomainError::Malformed)?.level_next = Some(handle);
+            self.orders.get_mut(handle).ok_or(DomainError::Malformed)?.level_prev = Some(tail);
         }
 
-        let remaining_qty = self.orders.get(handle).expect("order").remaining_qty;
+        let remaining_qty = self.orders.get(handle).ok_or(DomainError::Malformed)?.remaining_qty;
         let level = self.side_mut(side).get_level_mut_or_activate(key)?;
         // the first order initializes both ends; later orders only advance the
         // tail because their neighbor links were patched above.
@@ -155,10 +162,10 @@ impl Engine {
             level.head = Some(handle);
         }
         level.tail = Some(handle);
-        level.total_qty += remaining_qty;
+        level.total_qty = level.total_qty.checked_add(remaining_qty).ok_or(DomainError::Malformed)?;
         let level_qty = level.total_qty;
-        level.order_count += 1;
-        self.side_mut(side).mark_occupied(key);
+        level.order_count = level.order_count.checked_add(1).ok_or(DomainError::Malformed)?;
+        self.side_mut(side).mark_occupied(key)?;
         Ok(level_qty)
     }
 
@@ -176,16 +183,16 @@ impl Engine {
                 account.head = Some(handle);
             }
             account.tail = Some(handle);
-            account.open_order_count += 1;
-            account.open_notional += order_notional;
+            account.open_order_count = account.open_order_count.checked_add(1).ok_or(DomainError::Malformed)?;
+            account.open_notional = account.open_notional.checked_add(order_notional).ok_or(DomainError::Malformed)?;
             tail
         };
 
         // keep a second intrusive list so mass cancel never scans unrelated
         // accounts or allocates separate list nodes.
         if let Some(tail) = tail {
-            self.orders.get_mut(tail).expect("account tail").account_next = Some(handle);
-            self.orders.get_mut(handle).expect("order").account_prev = Some(tail);
+            self.orders.get_mut(tail).ok_or(DomainError::Malformed)?.account_next = Some(handle);
+            self.orders.get_mut(handle).ok_or(DomainError::Malformed)?.account_prev = Some(tail);
         }
         Ok(())
     }
@@ -201,52 +208,60 @@ impl Engine {
         // the order keeps its arena slot and FIFO position; only the externally
         // visible ID and remaining quantity change.
         self.accounts
-            .replace_order_id(replace.account_id, replace.orig_client_order_id, replace.client_order_id, handle);
+            .replace_order_id(replace.account_id, replace.orig_client_order_id, replace.client_order_id, handle)?;
 
         let level_qty = {
             let level = self.side_mut(current.side).get_level_mut_or_activate(key)?;
             // this path only permits a same-price quantity reduction, so both
             // visible aggregates decrease by the removed quantity.
-            level.total_qty -= old_qty - replace.qty.raw();
+            level.total_qty = level
+                .total_qty
+                .checked_sub(old_qty - replace.qty.raw())
+                .ok_or(DomainError::Malformed)?;
             level.total_qty
         };
-        if let Some(account) = self.accounts.get_mut(current.account_id) {
-            account.open_notional -= raw_notional(current.price, old_qty - replace.qty.raw());
-        }
+        let account = self.accounts.get_mut(current.account_id).ok_or(DomainError::Malformed)?;
+        account.open_notional = account
+            .open_notional
+            .checked_sub(raw_notional(current.price, old_qty - replace.qty.raw()))
+            .ok_or(DomainError::Malformed)?;
         Ok(level_qty)
     }
 
     /// Remove one resting order from every index and free its arena slot.
     #[inline]
-    pub(super) fn unlink_and_free(&mut self, handle: OrderHandle) -> Option<RestingOrder> {
-        let order = self.orders.get(handle).copied()?;
+    pub(super) fn unlink_and_free(&mut self, handle: OrderHandle) -> DomainResult<RestingOrder> {
+        let order = self.orders.get(handle).copied().ok_or(DomainError::Malformed)?;
         // unlink every index before returning the arena slot to the freelist so
         // no live path can retain a handle whose slot may be reused.
-        self.unlink_from_level(handle, order);
-        self.unlink_from_account(handle, order);
+        self.unlink_from_level(handle, order)?;
+        self.unlink_from_account(handle, order)?;
         let removed_handle = self.accounts.remove_order(order.account_id, order.order_id);
-        debug_assert_eq!(removed_handle, Some(handle));
-        self.orders.free(handle)
+        if removed_handle != Some(handle) {
+            return Err(DomainError::Malformed);
+        }
+        self.orders.free(handle).ok_or(DomainError::Malformed)
     }
 
     /// Remove one resting order from its price-level FIFO chain.
-    pub(super) fn unlink_from_level(&mut self, handle: OrderHandle, order: RestingOrder) {
+    pub(super) fn unlink_from_level(&mut self, handle: OrderHandle, order: RestingOrder) -> DomainResult<()> {
         // patch neighboring FIFO links so arbitrary cancels stay constant-time.
-        if let Some(prev) = order.level_prev
-            && let Some(prev_order) = self.orders.get_mut(prev)
-        {
+        if let Some(prev) = order.level_prev {
+            let prev_order = self.orders.get_mut(prev).ok_or(DomainError::Malformed)?;
             prev_order.level_next = order.level_next;
         }
-        if let Some(next) = order.level_next
-            && let Some(next_order) = self.orders.get_mut(next)
-        {
+        if let Some(next) = order.level_next {
+            let next_order = self.orders.get_mut(next).ok_or(DomainError::Malformed)?;
             next_order.level_prev = order.level_prev;
         }
 
-        let key = self.side(order.side).key_for_price(order.price).expect("stored price");
+        let key = self.side(order.side).key_for_price(order.price)?;
         let emptied = {
             // update level aggregates before possibly clearing ladder occupancy.
-            let level = self.side_mut(order.side).get_level_mut_or_activate(key).expect("stored level");
+            let level = self.side_mut(order.side).get_level_mut_or_activate(key)?;
+            if level.order_count == 0 || level.total_qty < order.remaining_qty {
+                return Err(DomainError::Malformed);
+            }
             if level.head == Some(handle) {
                 level.head = order.level_next;
             }
@@ -258,34 +273,36 @@ impl Engine {
             level.is_empty()
         };
         if emptied {
-            self.side_mut(order.side).mark_empty(key);
+            self.side_mut(order.side).mark_empty(key)?;
         }
+        Ok(())
     }
 
     /// Remove one resting order from its account active-order chain.
-    pub(super) fn unlink_from_account(&mut self, handle: OrderHandle, order: RestingOrder) {
+    pub(super) fn unlink_from_account(&mut self, handle: OrderHandle, order: RestingOrder) -> DomainResult<()> {
         // patch account-list neighbors independently from price-level FIFO links.
-        if let Some(prev) = order.account_prev
-            && let Some(prev_order) = self.orders.get_mut(prev)
-        {
+        if let Some(prev) = order.account_prev {
+            let prev_order = self.orders.get_mut(prev).ok_or(DomainError::Malformed)?;
             prev_order.account_next = order.account_next;
         }
-        if let Some(next) = order.account_next
-            && let Some(next_order) = self.orders.get_mut(next)
-        {
+        if let Some(next) = order.account_next {
+            let next_order = self.orders.get_mut(next).ok_or(DomainError::Malformed)?;
             next_order.account_prev = order.account_prev;
         }
 
-        if let Some(account) = self.accounts.get_mut(order.account_id) {
-            if account.head == Some(handle) {
-                account.head = order.account_next;
-            }
-            if account.tail == Some(handle) {
-                account.tail = order.account_prev;
-            }
-            account.open_order_count -= 1;
-            account.open_notional -= raw_notional(order.price, order.remaining_qty);
+        let account = self.accounts.get_mut(order.account_id).ok_or(DomainError::Malformed)?;
+        if account.head == Some(handle) {
+            account.head = order.account_next;
         }
+        if account.tail == Some(handle) {
+            account.tail = order.account_prev;
+        }
+        account.open_order_count = account.open_order_count.checked_sub(1).ok_or(DomainError::Malformed)?;
+        account.open_notional = account
+            .open_notional
+            .checked_sub(raw_notional(order.price, order.remaining_qty))
+            .ok_or(DomainError::Malformed)?;
+        Ok(())
     }
 
     /// Return the next occupied price key behind `current` on one side of the book.
@@ -298,16 +315,16 @@ impl Engine {
 
     /// Return whether a post-only order would cross the current opposite best.
     #[inline]
-    pub(super) fn would_cross(&self, side: Side, price: Option<Price>) -> bool {
+    pub(super) fn would_cross(&self, side: Side, price: Option<Price>) -> DomainResult<bool> {
         // an absent limit cannot be placed passively and is therefore treated
         // as crossing for the post-only decision.
         let Some(price) = price else {
-            return true;
+            return Ok(true);
         };
-        match side {
-            Side::Buy => self.best_ask().is_some_and(|(ask, _)| price >= ask),
-            Side::Sell => self.best_bid().is_some_and(|(bid, _)| price <= bid),
-        }
+        Ok(match side {
+            Side::Buy => self.asks.top()?.is_some_and(|(ask, _)| price >= ask),
+            Side::Sell => self.bids.top()?.is_some_and(|(bid, _)| price <= bid),
+        })
     }
 
     /// Return whether an opposite price is executable for this incoming order.
@@ -340,8 +357,8 @@ impl Engine {
     ) -> DomainResult<()> {
         // read the new top of book after mutation so L1 describes the same
         // state as the absolute L2 update.
-        let best_bid = self.best_bid();
-        let best_ask = self.best_ask();
+        let best_bid = self.bids.top()?;
+        let best_ask = self.asks.top()?;
         // preserve deterministic event ordering: changed depth first, then the
         // resulting top-of-book snapshot.
         market_data.publish_l2_update(sequencer, side, price, level_qty)?;
@@ -350,39 +367,44 @@ impl Engine {
 
     /// Return the aggregate quantity currently visible at a level after mutation.
     #[inline]
-    pub(super) fn current_level_qty(&self, side: Side, price: Price) -> u64 {
-        // an unrepresentable or inactive level has no visible book quantity.
-        let Ok(key) = self.side(side).key_for_price(price) else {
-            return 0;
-        };
-        self.side(side).get_level(key).map_or(0, |level| level.total_qty)
+    pub(super) fn current_level_qty(&self, side: Side, price: Price) -> DomainResult<u64> {
+        let key = self.side(side).key_for_price(price)?;
+        Ok(self.side(side).get_level(key).map_or(0, |level| level.total_qty))
     }
 
     /// Visit one side in price-time priority order.
-    pub(super) fn try_for_each_side_order<E>(
-        &self,
-        side: Side,
-        visit: &mut impl FnMut(RestingOrderView) -> Result<(), E>,
-    ) -> Result<(), E> {
+    pub(super) fn try_for_each_side_order<E>(&self, side: Side, visit: &mut impl FnMut(RestingOrderView) -> Result<(), E>) -> Result<(), E>
+    where
+        E: From<EngineError>,
+    {
         // ladder occupancy jumps directly between active prices in the side's
         // best-to-worst direction.
-        let mut cursor = self.side(side).best_level().map(|(key, _)| key);
+        let mut cursor = self
+            .side(side)
+            .best_level()
+            .map_err(engine_error)
+            .map_err(E::from)?
+            .map(|(key, _)| key);
         while let Some(key) = cursor {
-            if let Some(level) = self.side(side).get_level(key) {
-                let mut current = level.head;
-                while let Some(handle) = current {
-                    let Some(order) = self.orders.get(handle) else {
-                        break;
-                    };
-                    visit(RestingOrderView {
-                        order_id: order.order_id,
-                        account_id: order.account_id,
-                        side: order.side,
-                        price: order.price,
-                        remaining_qty: order.remaining_qty,
-                    })?;
-                    current = order.level_next;
-                }
+            let level = self
+                .side(side)
+                .get_level(key)
+                .ok_or(EngineError::InvariantViolation)
+                .map_err(E::from)?;
+            let mut current = level.head;
+            if current.is_none() {
+                return Err(E::from(EngineError::InvariantViolation));
+            }
+            while let Some(handle) = current {
+                let order = self.orders.get(handle).ok_or(EngineError::InvariantViolation).map_err(E::from)?;
+                visit(RestingOrderView {
+                    order_id: order.order_id,
+                    account_id: order.account_id,
+                    side: order.side,
+                    price: order.price,
+                    remaining_qty: order.remaining_qty,
+                })?;
+                current = order.level_next;
             }
             cursor = self.next_occupied_key(side, key);
         }
@@ -390,23 +412,21 @@ impl Engine {
     }
 
     /// Collect resting-order handles for one side in price-time order.
-    pub(super) fn collect_side_handles(&self, side: Side, out: &mut Vec<OrderHandle>) {
+    pub(super) fn collect_side_handles(&self, side: Side, out: &mut Vec<OrderHandle>) -> DomainResult<()> {
         // drain cannot follow links after freeing their arena slots, so capture
         // the stable handle order before any mutation begins.
-        let mut cursor = self.side(side).best_level().map(|(key, _)| key);
+        let mut cursor = self.side(side).best_level()?.map(|(key, _)| key);
         while let Some(key) = cursor {
-            if let Some(level) = self.side(side).get_level(key) {
-                let mut current = level.head;
-                while let Some(handle) = current {
-                    let Some(order) = self.orders.get(handle) else {
-                        break;
-                    };
-                    out.push(handle);
-                    current = order.level_next;
-                }
+            let level = self.side(side).get_level(key).ok_or(DomainError::Malformed)?;
+            let mut current = level.head.ok_or(DomainError::Malformed).map(Some)?;
+            while let Some(handle) = current {
+                let order = self.orders.get(handle).ok_or(DomainError::Malformed)?;
+                out.push(handle);
+                current = order.level_next;
             }
             cursor = self.next_occupied_key(side, key);
         }
+        Ok(())
     }
 
     /// Return immutable state for one side of the book.

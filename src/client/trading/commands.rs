@@ -65,7 +65,7 @@ pub fn scale_decimal_ceil(input: &str, decimals: u8, tick: u64) -> Result<u64, C
     if truncated_nonzero {
         raw = raw.checked_add(1).ok_or(CommandParseError::InvalidScalar)?;
     }
-    Ok(raw.div_ceil(tick) * tick)
+    raw.div_ceil(tick).checked_mul(tick).ok_or(CommandParseError::InvalidScalar)
 }
 
 pub fn format_scaled(raw: u64, decimals: u8) -> String {
@@ -98,7 +98,7 @@ fn parse_limit(
     let (tif, account_id) = match parts.len() {
         4 => (TimeInForce::Gtc, parse_u32(parts[3])?),
         5 => (parse_tif(parts[3])?, parse_u32(parts[4])?),
-        _ => unreachable!("limit command length checked"),
+        _ => return Err(CommandParseError::Usage("buy|sell <price> <qty> [gtc|ioc|post] <account>")),
     };
     Ok(ClientOrderFrame::New(ClientNewOrder {
         client_order_id: ids.next(),

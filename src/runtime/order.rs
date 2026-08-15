@@ -45,7 +45,7 @@ impl OrderProcessor {
             }
         }
 
-        let outcome = match risk.evaluate(entry, engine) {
+        let outcome = match risk.evaluate(entry, engine)? {
             RiskDecision::Accept => {
                 // Accepted orders are handed to the book, which publishes
                 // execution reports and any market-data updates it creates.

@@ -125,12 +125,12 @@ impl SideLadder {
     /// Return whether `key` can be addressed without exhausting the active-page pool.
     pub(crate) fn can_rest_at(&self, key: LevelKey) -> bool {
         // an already active logical page needs no free physical page.
-        self.page_slots[key.page_index].is_some() || !self.page_pool.free.is_empty()
+        self.page_slots.get(key.page_index).is_some_and(Option::is_some) || !self.page_pool.free.is_empty()
     }
 
     /// Return whether removing one order at `key` would release its active page.
     pub(crate) fn page_released_after_removing_order(&self, key: LevelKey) -> bool {
-        let Some(page_handle) = self.page_slots[key.page_index] else {
+        let Some(page_handle) = self.page_slots.get(key.page_index).and_then(|slot| *slot) else {
             return false;
         };
         let page = &self.page_pool.pages[page_handle];
@@ -141,32 +141,47 @@ impl SideLadder {
 
     /// Return a mutable level, activating its page from the pool if needed.
     pub(crate) fn get_level_mut_or_activate(&mut self, key: LevelKey) -> DomainResult<&mut PriceLevel> {
-        if self.page_slots[key.page_index].is_none() {
+        let slot = self.page_slots.get_mut(key.page_index).ok_or(DomainError::Malformed)?;
+        if slot.is_none() {
             // page activation only assigns preallocated storage; exhaustion is
             // reported instead of growing the pool.
             let page_handle = self.page_pool.activate().ok_or(DomainError::InvalidInstrumentSpec)?;
-            self.page_slots[key.page_index] = Some(page_handle);
+            *slot = Some(page_handle);
         }
 
-        let page_handle = self.page_slots[key.page_index].expect("page activated");
-        Ok(&mut self.page_pool.pages[page_handle].levels[key.offset])
+        let page_handle = slot.ok_or(DomainError::Malformed)?;
+        self.page_pool
+            .pages
+            .get_mut(page_handle)
+            .and_then(|page| page.levels.get_mut(key.offset))
+            .ok_or(DomainError::Malformed)
     }
 
     /// Mark a level as visible in the side's occupancy indexes.
-    pub(crate) fn mark_occupied(&mut self, key: LevelKey) {
-        if let Some(page_handle) = self.page_slots[key.page_index] {
-            // update both occupancy layers before exposing the key as best.
-            self.page_pool.pages[page_handle].occupied.set(key.offset);
-            self.occupied_pages.set(key.page_index);
-            self.refresh_best_after_occupy(key);
+    pub(crate) fn mark_occupied(&mut self, key: LevelKey) -> DomainResult<()> {
+        let page_handle = self
+            .page_slots
+            .get(key.page_index)
+            .and_then(|slot| *slot)
+            .ok_or(DomainError::Malformed)?;
+        let page = self.page_pool.pages.get_mut(page_handle).ok_or(DomainError::Malformed)?;
+        if key.offset >= page.levels.len() {
+            return Err(DomainError::Malformed);
         }
+        // update both occupancy layers before exposing the key as best.
+        page.occupied.set(key.offset);
+        self.occupied_pages.set(key.page_index);
+        self.refresh_best_after_occupy(key);
+        Ok(())
     }
 
     /// Mark a level empty and release its page when no levels remain active.
-    pub(crate) fn mark_empty(&mut self, key: LevelKey) {
-        let Some(page_handle) = self.page_slots[key.page_index] else {
-            return;
-        };
+    pub(crate) fn mark_empty(&mut self, key: LevelKey) -> DomainResult<()> {
+        let page_handle = self
+            .page_slots
+            .get(key.page_index)
+            .and_then(|slot| *slot)
+            .ok_or(DomainError::Malformed)?;
 
         self.page_pool.pages[page_handle].occupied.clear(key.offset);
         if !self.page_pool.pages[page_handle].occupied.any() {
@@ -181,18 +196,24 @@ impl SideLadder {
             // any other level leaves the cached key valid.
             self.best = self.find_best();
         }
+        Ok(())
     }
 
     /// Return the best level key and metadata for this side.
-    pub(crate) fn best_level(&self) -> Option<(LevelKey, &PriceLevel)> {
-        let key = self.best?;
-        Some((key, self.get_level(key)?))
+    pub(crate) fn best_level(&self) -> DomainResult<Option<(LevelKey, &PriceLevel)>> {
+        let Some(key) = self.best else {
+            return Ok(None);
+        };
+        let level = self.get_level(key).ok_or(DomainError::Malformed)?;
+        if level.is_empty() {
+            return Err(DomainError::Malformed);
+        }
+        Ok(Some((key, level)))
     }
 
     /// Return the top price and aggregate quantity for this side.
-    pub(crate) fn top(&self) -> Option<(Price, u64)> {
-        let (key, level) = self.best_level()?;
-        Some((key.price, level.total_qty))
+    pub(crate) fn top(&self) -> DomainResult<Option<(Price, u64)>> {
+        Ok(self.best_level()?.map(|(key, level)| (key.price, level.total_qty)))
     }
 
     /// Return the next occupied key at a lower price than `current`.
@@ -483,18 +504,18 @@ mod tests {
         let bid_100 = bids.key_for_price(Price::new(100, &instrument).expect("price")).expect("key");
         let bid_1200 = bids.key_for_price(Price::new(1200, &instrument).expect("price")).expect("key");
         bids.get_level_mut_or_activate(bid_100).expect("level").order_count = 1;
-        bids.mark_occupied(bid_100);
+        bids.mark_occupied(bid_100).expect("occupied");
         bids.get_level_mut_or_activate(bid_1200).expect("level").order_count = 1;
-        bids.mark_occupied(bid_1200);
+        bids.mark_occupied(bid_1200).expect("occupied");
         assert_eq!(bids.best.expect("best").price.raw(), 1200);
-        bids.mark_empty(bid_1200);
+        bids.mark_empty(bid_1200).expect("empty");
         assert_eq!(bids.best.expect("best").price.raw(), 100);
 
         let mut asks = SideLadder::new(Side::Sell, config()).expect("asks");
         asks.get_level_mut_or_activate(bid_1200).expect("level").order_count = 1;
-        asks.mark_occupied(bid_1200);
+        asks.mark_occupied(bid_1200).expect("occupied");
         asks.get_level_mut_or_activate(bid_100).expect("level").order_count = 1;
-        asks.mark_occupied(bid_100);
+        asks.mark_occupied(bid_100).expect("occupied");
         assert_eq!(asks.best.expect("best").price.raw(), 100);
     }
 }

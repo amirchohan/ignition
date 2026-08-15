@@ -45,8 +45,8 @@ impl SnapshotProcessor {
         publisher: &mut ControlPublisher<'_, '_>,
         request: Snapshot,
     ) -> Result<(), ControlError> {
-        let best_bid = engine.best_bid();
-        let best_ask = engine.best_ask();
+        let best_bid = engine.best_bid()?;
+        let best_ask = engine.best_ask()?;
         let market_data = market_data.snapshot();
 
         // The begin message captures state that is not repeated on each row.

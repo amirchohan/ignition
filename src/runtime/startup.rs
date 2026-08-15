@@ -11,7 +11,7 @@ use crate::{
     engine::{EngineConfig, EngineError},
     gateway::{GatewayError, GatewayRuntime},
     market_data::{MarketDataError, MarketDataRuntime},
-    metrics::{MetricsBackend, MetricsRuntime},
+    metrics::{MetricsBackend, MetricsError, MetricsRuntime},
     risk::RiskConfig,
 };
 
@@ -31,7 +31,7 @@ impl Runtime {
             endpoints.control,
             endpoints.gateway,
             endpoints.market_data,
-            MetricsRuntime::new(resolved.metrics, 0),
+            MetricsRuntime::new(resolved.metrics, 0)?,
         )
         .map_err(RuntimeBuildError::Runtime)
     }
@@ -117,6 +117,7 @@ pub enum RuntimeBuildError {
     Gateway(GatewayError),
     MarketData(MarketDataError),
     Engine(EngineError),
+    Metrics(MetricsError),
     Runtime(RuntimeError),
 }
 
@@ -132,6 +133,7 @@ impl std::fmt::Display for RuntimeBuildError {
             Self::Gateway(error) => write!(f, "failed to open gateway endpoint: {error:?}"),
             Self::MarketData(error) => write!(f, "failed to open market-data endpoint: {error:?}"),
             Self::Engine(error) => write!(f, "failed to construct engine: {error:?}"),
+            Self::Metrics(error) => write!(f, "failed to construct metrics: {error:?}"),
             Self::Runtime(error) => write!(f, "failed to construct runtime: {error:?}"),
         }
     }
@@ -171,5 +173,11 @@ impl From<EngineError> for RuntimeBuildError {
     /// Convert engine construction failures into runtime construction errors.
     fn from(error: EngineError) -> Self {
         Self::Engine(error)
+    }
+}
+
+impl From<MetricsError> for RuntimeBuildError {
+    fn from(error: MetricsError) -> Self {
+        Self::Metrics(error)
     }
 }

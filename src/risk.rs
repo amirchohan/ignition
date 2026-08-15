@@ -8,7 +8,7 @@ use crate::{
         DomainError, DomainResult, Price, RejectReason,
         trading::order::{AccountId, CancelReplace, NewOrder, OrderEntry, OrderType, TimeInForce},
     },
-    engine::{Engine, OrderProjection, RestingOrderView},
+    engine::{Engine, EngineError, OrderProjection, RestingOrderView},
 };
 
 /// Immutable risk settings validated at startup.
@@ -83,11 +83,11 @@ impl RiskRuntime {
     /// Risk rejects only when it can prove a risk-policy violation. Commands
     /// outside risk's ownership are accepted through to the engine so the
     /// engine can apply structural validation and matching semantics.
-    pub fn evaluate(&self, entry: OrderEntry, engine: &Engine) -> RiskDecision {
+    pub fn evaluate(&self, entry: OrderEntry, engine: &Engine) -> Result<RiskDecision, EngineError> {
         match entry {
             OrderEntry::NewOrder(order) => self.evaluate_new(order, engine),
             OrderEntry::CancelReplace(replace) => self.evaluate_replace(replace, engine),
-            OrderEntry::CancelOrder(_) | OrderEntry::MassCancel(_) => RiskDecision::Accept,
+            OrderEntry::CancelOrder(_) | OrderEntry::MassCancel(_) => Ok(RiskDecision::Accept),
         }
     }
 
@@ -101,20 +101,20 @@ impl RiskRuntime {
     /// Duplicate order IDs, invalid accounts, missing limit prices, and
     /// storage-envelope violations are deliberately not checked here; the
     /// engine owns those structural rejects after risk passes the command on.
-    fn evaluate_new(&self, order: NewOrder, engine: &Engine) -> RiskDecision {
+    fn evaluate_new(&self, order: NewOrder, engine: &Engine) -> Result<RiskDecision, EngineError> {
         // Submitted limit prices are checked directly against the active band.
         // Market orders have no submitted price, so they are checked through
         // projected executable prices below.
         if let Some(reason) = self.check_limit_price(order.order_type, order.price) {
-            return RiskDecision::Reject(reason);
+            return Ok(RiskDecision::Reject(reason));
         }
 
         // The projection is read-only: it walks visible executable liquidity to
         // determine STP, executable price-band exposure, and any quantity that
         // would remain resting after matching.
-        let projection = engine.project_order(order.account_id, order.side, order.price, order.qty.raw());
+        let projection = engine.project_order(order.account_id, order.side, order.price, order.qty.raw())?;
         if let Some(reason) = self.check_projection(order.time_in_force, projection) {
-            return RiskDecision::Reject(reason);
+            return Ok(RiskDecision::Reject(reason));
         }
 
         // Open-order and open-notional limits apply only to projected resting
@@ -130,21 +130,21 @@ impl RiskRuntime {
     /// subtract old exposure from the projected account state. If the original
     /// order is missing or belongs to another account, risk does not reject;
     /// the engine will produce the correct `UnknownOrder` lifecycle report.
-    fn evaluate_replace(&self, replace: CancelReplace, engine: &Engine) -> RiskDecision {
-        let Some(current) = engine.resting_order(replace.account_id, replace.orig_client_order_id) else {
-            return RiskDecision::Accept;
+    fn evaluate_replace(&self, replace: CancelReplace, engine: &Engine) -> Result<RiskDecision, EngineError> {
+        let Some(current) = engine.resting_order(replace.account_id, replace.orig_client_order_id)? else {
+            return Ok(RiskDecision::Accept);
         };
         // Cancel-replace always submits a limit replacement price, so the new
         // price itself must be inside the band before projection.
         if let Some(reason) = self.check_limit_price(OrderType::Limit, Some(replace.price)) {
-            return RiskDecision::Reject(reason);
+            return Ok(RiskDecision::Reject(reason));
         }
 
         // Project the replacement as a fresh GTC limit order after removing the
         // original exposure in `check_account_limits`.
-        let projection = engine.project_order(replace.account_id, current.side, Some(replace.price), replace.qty.raw());
+        let projection = engine.project_order(replace.account_id, current.side, Some(replace.price), replace.qty.raw())?;
         if let Some(reason) = self.check_projection(TimeInForce::Gtc, projection) {
-            return RiskDecision::Reject(reason);
+            return Ok(RiskDecision::Reject(reason));
         }
 
         self.check_account_limits(
@@ -200,12 +200,12 @@ impl RiskRuntime {
         replaced_order: Option<RestingOrderView>,
         residual_price: Option<Price>,
         residual_qty: u64,
-    ) -> RiskDecision {
+    ) -> Result<RiskDecision, EngineError> {
         let Some(open_count) = engine.account_open_order_count(account_id) else {
-            return RiskDecision::Accept;
+            return Ok(RiskDecision::Accept);
         };
         let Some(open_notional) = engine.account_open_notional(account_id) else {
-            return RiskDecision::Accept;
+            return Ok(RiskDecision::Accept);
         };
         // For replace, subtract the current resting order first, then add only
         // the projected residual that would rest after matching.
@@ -214,17 +214,23 @@ impl RiskRuntime {
         let added_count = u32::from(residual_qty > 0);
         let added_notional = residual_price.map_or(0, |price| raw_notional(price, residual_qty));
 
-        let projected_count = open_count - removed_count + added_count;
+        let projected_count = open_count
+            .checked_sub(removed_count)
+            .and_then(|count| count.checked_add(added_count))
+            .ok_or(EngineError::InvariantViolation)?;
         if projected_count > self.config.max_open_orders_per_account {
-            return RiskDecision::Reject(RejectReason::RiskOpenOrderLimit);
+            return Ok(RiskDecision::Reject(RejectReason::RiskOpenOrderLimit));
         }
 
-        let projected_notional = open_notional - removed_notional + added_notional;
+        let projected_notional = open_notional
+            .checked_sub(removed_notional)
+            .and_then(|notional| notional.checked_add(added_notional))
+            .ok_or(EngineError::InvariantViolation)?;
         if projected_notional > self.config.max_open_notional_per_account {
-            return RiskDecision::Reject(RejectReason::RiskNotionalLimit);
+            return Ok(RiskDecision::Reject(RejectReason::RiskNotionalLimit));
         }
 
-        RiskDecision::Accept
+        Ok(RiskDecision::Accept)
     }
 
     /// Return whether `price` is inside the inclusive reference-price band.
@@ -358,7 +364,7 @@ mod tests {
             &engine,
         );
 
-        assert_eq!(decision, RiskDecision::Reject(RejectReason::RiskOpenOrderLimit));
+        assert_eq!(decision, Ok(RiskDecision::Reject(RejectReason::RiskOpenOrderLimit)));
     }
 
     #[test]
@@ -370,7 +376,7 @@ mod tests {
             &engine,
         );
 
-        assert_eq!(decision, RiskDecision::Reject(RejectReason::RiskNotionalLimit));
+        assert_eq!(decision, Ok(RiskDecision::Reject(RejectReason::RiskNotionalLimit)));
     }
 
     #[test]
@@ -382,7 +388,7 @@ mod tests {
             &engine,
         );
 
-        assert_eq!(decision, RiskDecision::Reject(RejectReason::PriceBand));
+        assert_eq!(decision, Ok(RiskDecision::Reject(RejectReason::PriceBand)));
     }
 
     #[test]
@@ -401,7 +407,7 @@ mod tests {
             &engine,
         );
 
-        assert_eq!(decision, RiskDecision::Reject(RejectReason::SelfTradePrevention));
+        assert_eq!(decision, Ok(RiskDecision::Reject(RejectReason::SelfTradePrevention)));
         assert_eq!(engine.resting_order_count(), 1);
     }
 
@@ -418,7 +424,7 @@ mod tests {
         let risk = RiskRuntime::new(risk_config(1, 15_000));
         let decision = risk.evaluate(OrderEntry::CancelReplace(replace(2, 1, 1, 1_000, 15)), &engine);
 
-        assert_eq!(decision, RiskDecision::Accept);
+        assert_eq!(decision, Ok(RiskDecision::Accept));
     }
 
     #[test]
@@ -437,7 +443,7 @@ mod tests {
             &engine,
         );
 
-        assert_eq!(decision, RiskDecision::Accept);
+        assert_eq!(decision, Ok(RiskDecision::Accept));
     }
 
     #[test]
@@ -446,7 +452,7 @@ mod tests {
         let risk = RiskRuntime::new(risk_config(10, 1_000_000));
         let decision = risk.evaluate(OrderEntry::CancelReplace(replace(2, 1, 404, 1_000, 15)), &engine);
 
-        assert_eq!(decision, RiskDecision::Accept);
+        assert_eq!(decision, Ok(RiskDecision::Accept));
     }
 
     #[test]
@@ -496,7 +502,7 @@ mod tests {
             } else {
                 RiskDecision::Accept
             };
-            prop_assert_eq!(decision, expected);
+            prop_assert_eq!(decision, Ok(expected));
             prop_assert_eq!(engine.resting_order_count(), 1);
         }
 
@@ -536,9 +542,9 @@ mod tests {
             );
 
             if seed_count >= max_orders {
-                prop_assert_eq!(decision, RiskDecision::Reject(RejectReason::RiskOpenOrderLimit));
+                prop_assert_eq!(decision, Ok(RiskDecision::Reject(RejectReason::RiskOpenOrderLimit)));
             } else {
-                prop_assert_eq!(decision, RiskDecision::Accept);
+                prop_assert_eq!(decision, Ok(RiskDecision::Accept));
             }
         }
 
@@ -565,9 +571,9 @@ mod tests {
             );
 
             if (990..=1_010).contains(&price_raw) {
-                prop_assert_eq!(decision, RiskDecision::Accept);
+                prop_assert_eq!(decision, Ok(RiskDecision::Accept));
             } else {
-                prop_assert_eq!(decision, RiskDecision::Reject(RejectReason::PriceBand));
+                prop_assert_eq!(decision, Ok(RiskDecision::Reject(RejectReason::PriceBand)));
             }
         }
     }

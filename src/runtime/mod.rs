@@ -902,7 +902,7 @@ mod tests {
         let made_progress = runtime.poll_gateway().expect("poll gateway");
 
         assert!(made_progress);
-        assert_eq!(runtime.engine.best_bid(), Some((price(1_001), 5)));
+        assert_eq!(runtime.engine.best_bid(), Ok(Some((price(1_001), 5))));
         let reports = read_execution_reports(&mut gateway_client, 2);
         assert_eq!(reports.len(), 2);
         assert_eq!(reports[0].client_order_id.raw(), 1);

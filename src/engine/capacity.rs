@@ -48,90 +48,96 @@ use super::*;
 impl Engine {
     /// Return the bounded resource that would prevent this command from resting.
     #[inline]
-    pub(super) fn capacity_pressure(&self, entry: OrderEntry) -> Option<CapacityResource> {
+    pub(super) fn capacity_pressure(&self, entry: OrderEntry) -> Result<Option<CapacityResource>, EngineError> {
         match entry {
             OrderEntry::NewOrder(order) => self.new_order_capacity_pressure(order),
             OrderEntry::CancelReplace(replace) => self.replace_capacity_pressure(replace),
             // cancellation never needs a new resting slot or ladder page and
             // must remain available when the book is full.
-            OrderEntry::CancelOrder(_) | OrderEntry::MassCancel(_) => None,
+            OrderEntry::CancelOrder(_) | OrderEntry::MassCancel(_) => Ok(None),
         }
     }
 
     /// Return capacity pressure for a new order that may leave resting quantity.
     #[inline]
-    pub(super) fn new_order_capacity_pressure(&self, order: NewOrder) -> Option<CapacityResource> {
+    pub(super) fn new_order_capacity_pressure(&self, order: NewOrder) -> Result<Option<CapacityResource>, EngineError> {
         // malformed account ownership and duplicate account-scoped IDs are
         // structural rejections, so they cannot consume resting capacity.
         if !self.accounts.contains(order.account_id) || self.accounts.contains_order(order.account_id, order.client_order_id) {
-            return None;
+            return Ok(None);
         }
         // market and IOC orders never place residual quantity on the book.
         if order.order_type != OrderType::Limit || order.time_in_force == TimeInForce::Ioc {
-            return None;
+            return Ok(None);
         }
         // a missing price is rejected by lifecycle validation rather than
         // reported as capacity pressure.
-        let price = order.price?;
+        let Some(price) = order.price else { return Ok(None) };
         // an unrepresentable price is structurally invalid, while a crossing
         // post-only order is canceled without resting.
-        if !self.price_in_storage(price) || (order.time_in_force == TimeInForce::PostOnly && self.would_cross(order.side, order.price)) {
-            return None;
+        if !self.price_in_storage(price)
+            || (order.time_in_force == TimeInForce::PostOnly && self.would_cross(order.side, order.price).map_err(engine_error)?)
+        {
+            return Ok(None);
         }
 
-        let projection = self.project_order(order.account_id, order.side, order.price, order.qty.raw());
+        let projection = self.project_order(order.account_id, order.side, order.price, order.qty.raw())?;
         // an order that would fill completely does not need resting resources.
         if projection.residual_qty == 0 {
-            return None;
+            return Ok(None);
         }
 
         // a residual after any execution means every encountered maker was
         // fully removed, so at least one shared arena slot will be reusable.
         if !self.orders.has_free_slot() && projection.executable_qty == 0 {
-            return Some(CapacityResource::RestingOrders);
+            return Ok(Some(CapacityResource::RestingOrders));
         }
 
-        let key = self.side(order.side).key_for_price(price).ok()?;
-        (!self.side(order.side).can_rest_at(key)).then_some(CapacityResource::ActivePages)
+        let key = self.side(order.side).key_for_price(price).map_err(engine_error)?;
+        Ok((!self.side(order.side).can_rest_at(key)).then_some(CapacityResource::ActivePages))
     }
 
     /// Return capacity pressure for a replacement that may re-enter the book.
     #[inline]
-    pub(super) fn replace_capacity_pressure(&self, replace: CancelReplace) -> Option<CapacityResource> {
+    pub(super) fn replace_capacity_pressure(&self, replace: CancelReplace) -> Result<Option<CapacityResource>, EngineError> {
         // invalid prices and duplicate replacement IDs are rejected before the
         // replacement can consume a resource.
         if !self.price_in_storage(replace.price)
             || (self.accounts.contains_order(replace.account_id, replace.client_order_id)
                 && replace.client_order_id != replace.orig_client_order_id)
         {
-            return None;
+            return Ok(None);
         }
         // an unknown or stale original order reaches the lifecycle handler so
         // it can produce the correct rejection instead of a capacity failure.
-        let handle = self.accounts.order_handle(replace.account_id, replace.orig_client_order_id)?;
-        let current = self.orders.get(handle).copied()?;
-        debug_assert_eq!(current.account_id, replace.account_id);
+        let Some(handle) = self.accounts.order_handle(replace.account_id, replace.orig_client_order_id) else {
+            return Ok(None);
+        };
+        let current = self.orders.get(handle).copied().ok_or(EngineError::InvariantViolation)?;
+        if current.account_id != replace.account_id || current.order_id != replace.orig_client_order_id {
+            return Err(EngineError::InvariantViolation);
+        }
         // a same-price quantity reduction stays in its existing arena slot and
         // ladder position, so it cannot require new capacity.
         if current.price == replace.price && replace.qty.raw() <= current.remaining_qty {
-            return None;
+            return Ok(None);
         }
 
-        let projection = self.project_order(replace.account_id, current.side, Some(replace.price), replace.qty.raw());
+        let projection = self.project_order(replace.account_id, current.side, Some(replace.price), replace.qty.raw())?;
         // a replacement that would fill completely needs no destination page.
         if projection.residual_qty == 0 {
-            return None;
+            return Ok(None);
         }
 
         // the original order is removed before re-entry, so its arena slot is
         // always reusable; only the side-local destination page can be blocked.
-        let target_key = self.side(current.side).key_for_price(replace.price).ok()?;
+        let target_key = self.side(current.side).key_for_price(replace.price).map_err(engine_error)?;
         if self.side(current.side).can_rest_at(target_key) {
-            return None;
+            return Ok(None);
         }
         // when the page pool is full, moving the only order from its source page
         // releases that page in time to activate the destination page.
-        let source_key = self.side(current.side).key_for_price(current.price).ok()?;
-        (!self.side(current.side).page_released_after_removing_order(source_key)).then_some(CapacityResource::ActivePages)
+        let source_key = self.side(current.side).key_for_price(current.price).map_err(engine_error)?;
+        Ok((!self.side(current.side).page_released_after_removing_order(source_key)).then_some(CapacityResource::ActivePages))
     }
 }

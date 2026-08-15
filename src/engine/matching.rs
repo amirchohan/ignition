@@ -61,16 +61,22 @@ use super::*;
 
 impl Engine {
     /// Project an incoming order against visible opposite liquidity without mutation.
-    pub fn project_order(&self, account_id: AccountId, side: Side, limit_price: Option<Price>, qty: u64) -> OrderProjection {
+    pub fn project_order(
+        &self,
+        account_id: AccountId,
+        side: Side,
+        limit_price: Option<Price>,
+        qty: u64,
+    ) -> Result<OrderProjection, EngineError> {
         let mut remaining_qty = qty;
-        let mut executable_qty = 0;
+        let mut executable_qty: u64 = 0;
         let mut low_execution_price = None;
         let mut high_execution_price = None;
         let mut self_trade = false;
         let opposite_side = best_side(side);
         // begin at the economically best maker price, then follow occupied
         // levels in the side's best-to-worst direction.
-        let mut cursor = self.side(opposite_side).best_level().map(|(key, _)| key);
+        let mut cursor = self.side(opposite_side).best_level().map_err(engine_error)?.map(|(key, _)| key);
 
         while remaining_qty > 0 {
             let Some(key) = cursor else {
@@ -80,39 +86,48 @@ impl Engine {
                 break;
             }
 
-            if let Some(level) = self.side(opposite_side).get_level(key) {
-                // each level's intrusive chain defines FIFO order without
-                // allocating a projection-specific collection.
-                let mut current = level.head;
-                while remaining_qty > 0 {
-                    let Some(handle) = current else {
-                        break;
-                    };
-                    let Some(order) = self.orders.get(handle).copied() else {
-                        break;
-                    };
-                    let fill_qty = remaining_qty.min(order.remaining_qty);
-                    remaining_qty -= fill_qty;
-                    executable_qty += fill_qty;
-                    low_execution_price = Some(low_execution_price.map_or(order.price, |price: Price| price.min(order.price)));
-                    high_execution_price = Some(high_execution_price.map_or(order.price, |price: Price| price.max(order.price)));
-                    // projection records potential self-trade for the risk layer;
-                    // matching itself does not apply self-trade policy.
-                    self_trade |= order.account_id == account_id;
-                    current = order.level_next;
+            let level = self.side(opposite_side).get_level(key).ok_or(EngineError::InvariantViolation)?;
+            // each level's intrusive chain defines FIFO order without
+            // allocating a projection-specific collection.
+            let mut current = level.head.ok_or(EngineError::InvariantViolation).map(Some)?;
+            let mut visited_count = 0_u32;
+            let mut visited_qty = 0_u64;
+            while remaining_qty > 0 {
+                let Some(handle) = current else {
+                    break;
+                };
+                let order = self.orders.get(handle).copied().ok_or(EngineError::InvariantViolation)?;
+                if order.remaining_qty == 0 || order.side != opposite_side || order.price != key.price {
+                    return Err(EngineError::InvariantViolation);
                 }
+                let fill_qty = remaining_qty.min(order.remaining_qty);
+                visited_count = visited_count.checked_add(1).ok_or(EngineError::InvariantViolation)?;
+                visited_qty = visited_qty
+                    .checked_add(order.remaining_qty)
+                    .ok_or(EngineError::InvariantViolation)?;
+                remaining_qty -= fill_qty;
+                executable_qty = executable_qty.checked_add(fill_qty).ok_or(EngineError::InvariantViolation)?;
+                low_execution_price = Some(low_execution_price.map_or(order.price, |price: Price| price.min(order.price)));
+                high_execution_price = Some(high_execution_price.map_or(order.price, |price: Price| price.max(order.price)));
+                // projection records potential self-trade for the risk layer;
+                // matching itself does not apply self-trade policy.
+                self_trade |= order.account_id == account_id;
+                current = order.level_next;
+            }
+            if remaining_qty > 0 && current.is_none() && (visited_count != level.order_count || visited_qty != level.total_qty) {
+                return Err(EngineError::InvariantViolation);
             }
 
             cursor = self.next_occupied_key(opposite_side, key);
         }
 
-        OrderProjection {
+        Ok(OrderProjection {
             executable_qty,
             residual_qty: remaining_qty,
             low_execution_price,
             high_execution_price,
             self_trade,
-        }
+        })
     }
 
     /// Match an aggressive order against the opposite best levels.
@@ -132,7 +147,7 @@ impl Engine {
         let mut outcome = MatchOutcome::default();
         while *remaining_qty > 0 {
             // an empty opposite side leaves any residual decision to lifecycle.
-            let Some((best_key, best_level)) = self.side(best_side(side)).best_level() else {
+            let Some((best_key, best_level)) = self.side(best_side(side)).best_level()? else {
                 break;
             };
             let level_head = best_level.head;
@@ -142,16 +157,11 @@ impl Engine {
                 break;
             }
 
-            // empty or stale level heads violate occupancy invariants; clearing
-            // the level repairs best-price discovery and lets matching continue.
-            let Some(maker_handle) = level_head else {
-                self.side_mut(best_side(side)).mark_empty(best_key);
-                continue;
-            };
-            let Some(maker) = self.orders.get(maker_handle).copied() else {
-                self.side_mut(best_side(side)).mark_empty(best_key);
-                continue;
-            };
+            let maker_handle = level_head.ok_or(DomainError::Malformed)?;
+            let maker = self.orders.get(maker_handle).copied().ok_or(DomainError::Malformed)?;
+            if maker.remaining_qty == 0 || maker.side != best_side(side) || maker.price != best_key.price {
+                return Err(DomainError::Malformed);
+            }
 
             // once another fill is certain, the previous taker report can no
             // longer be the order's terminal report and is safe to emit.
@@ -160,14 +170,14 @@ impl Engine {
             // at least one side of every execution reaches zero.
             let fill_qty = (*remaining_qty).min(maker.remaining_qty);
             *remaining_qty -= fill_qty;
-            outcome.filled_qty += fill_qty;
+            outcome.filled_qty = outcome.filled_qty.checked_add(fill_qty).ok_or(DomainError::Malformed)?;
             // apply book state first so all following events describe post-fill state.
             self.apply_fill(maker_handle, best_key, fill_qty)?;
-            let maker_remaining = self.orders.get(maker_handle).map_or(0, |order| order.remaining_qty);
+            let maker_remaining = self.orders.get(maker_handle).ok_or(DomainError::Malformed)?.remaining_qty;
             if maker_remaining == 0 {
                 // fully filled makers leave both intrusive lists and the
                 // account-scoped ID lookup before book data is observed.
-                self.unlink_and_free(maker_handle);
+                self.unlink_and_free(maker_handle)?;
             }
 
             // market-data output is sequenced immediately after the deterministic state change.
@@ -179,7 +189,7 @@ impl Engine {
                 fill_qty,
                 &self.config.instrument(),
             )?;
-            let level_qty = self.current_level_qty(maker.side, maker.price);
+            let level_qty = self.current_level_qty(maker.side, maker.price)?;
             self.publish_book_update(maker.side, maker.price, level_qty, sequencer, market_data)?;
 
             // maker status is final only when this fill exhausted its leaves
@@ -261,21 +271,18 @@ impl Engine {
     pub(super) fn apply_fill(&mut self, maker_handle: OrderHandle, key: ladder::LevelKey, fill_qty: u64) -> DomainResult<()> {
         // capture notional before taking mutable borrows; the matching loop has
         // already validated that this generation-checked handle is live.
-        let filled_notional = self.orders.get(maker_handle).map_or(0, |order| raw_notional(order.price, fill_qty));
-        if let Some(order) = self.orders.get_mut(maker_handle) {
-            order.remaining_qty -= fill_qty;
-        }
-        let side = self.orders.get(maker_handle).map_or(Side::Sell, |order| order.side);
+        let maker = self.orders.get(maker_handle).copied().ok_or(DomainError::Malformed)?;
+        let filled_notional = raw_notional(maker.price, fill_qty);
+        let order = self.orders.get_mut(maker_handle).ok_or(DomainError::Malformed)?;
+        order.remaining_qty = order.remaining_qty.checked_sub(fill_qty).ok_or(DomainError::Malformed)?;
+        let side = maker.side;
         // account exposure tracks only quantity still resting on the book.
-        if let Some(order) = self.orders.get(maker_handle).copied()
-            && let Some(account) = self.accounts.get_mut(order.account_id)
-        {
-            account.open_notional -= filled_notional;
-        }
+        let account = self.accounts.get_mut(maker.account_id).ok_or(DomainError::Malformed)?;
+        account.open_notional = account.open_notional.checked_sub(filled_notional).ok_or(DomainError::Malformed)?;
         // order count and FIFO links remain unchanged here; unlink_and_free
         // removes them only when the maker reaches zero leaves quantity.
         let level = self.side_mut(side).get_level_mut_or_activate(key)?;
-        level.total_qty -= fill_qty;
+        level.total_qty = level.total_qty.checked_sub(fill_qty).ok_or(DomainError::Malformed)?;
         Ok(())
     }
 }

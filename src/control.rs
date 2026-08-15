@@ -27,6 +27,7 @@ use crate::{
             KillSwitchAction,
         },
     },
+    engine::EngineError,
     io::{Endpoint, FramePollControl, FramePollError, IOConfig, IOPublisher, IORuntime, IoError},
     protocol::{
         ProtocolError,
@@ -353,6 +354,7 @@ pub enum ControlError {
     Io(IoError),
     Encode(ProtocolError),
     Domain(DomainError),
+    Engine(EngineError),
 }
 
 impl From<IoError> for ControlError {
@@ -370,6 +372,12 @@ impl From<ProtocolError> for ControlError {
 impl From<DomainError> for ControlError {
     fn from(error: DomainError) -> Self {
         Self::Domain(error)
+    }
+}
+
+impl From<EngineError> for ControlError {
+    fn from(error: EngineError) -> Self {
+        Self::Engine(error)
     }
 }
 

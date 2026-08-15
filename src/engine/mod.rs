@@ -117,11 +117,11 @@ impl Engine {
         // orders are projected against current liquidity to see whether any
         // residual would need a resting-order slot or ladder page that is full.
         // If so, reject the command before changing any state.
-        if let Some(resource) = self.capacity_pressure(entry) {
+        if let Some(resource) = self.capacity_pressure(entry)? {
             let rejected = match entry {
                 OrderEntry::NewOrder(order) => self.reject_new(order, RejectReason::KillSwitchActive, sequencer, emit_report),
                 OrderEntry::CancelReplace(replace) => self.reject_replace(replace, RejectReason::KillSwitchActive, sequencer, emit_report),
-                OrderEntry::CancelOrder(_) | OrderEntry::MassCancel(_) => unreachable!("cancel commands do not consume capacity"),
+                OrderEntry::CancelOrder(_) | OrderEntry::MassCancel(_) => return Err(EngineError::InvariantViolation),
             };
             rejected.map_err(engine_error)?;
             return Ok(EngineExecution::CapacityExceeded(resource));
@@ -202,7 +202,7 @@ pub(crate) fn structural_reject_reason(error: DomainError) -> RejectReason {
 fn engine_error(error: DomainError) -> EngineError {
     match error {
         DomainError::SequenceOverflow => EngineError::SequenceOverflow,
-        _ => EngineError::InvalidConfig,
+        _ => EngineError::InvariantViolation,
     }
 }
 
@@ -308,8 +308,10 @@ impl EngineConfig {
 /// Engine construction or execution failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineError {
-    /// Configuration or an internal structural assumption was invalid.
+    /// Startup configuration was invalid.
     InvalidConfig,
+    /// Live engine indexes or aggregates disagreed with one another.
+    InvariantViolation,
     /// A monotonic outbound sequence number could not be incremented.
     SequenceOverflow,
 }

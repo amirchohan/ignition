@@ -573,7 +573,7 @@ mod tests {
         let clock = Clock::new();
         let mut mode = crate::runtime::Mode::Replay { expected_input_seq: 1 };
         let mut sequencer = Sequencer::default();
-        let mut metrics = MetricsRuntime::in_memory(1);
+        let mut metrics = MetricsRuntime::in_memory(1).expect("metrics");
         let mut handled = 0_u64;
 
         gateway

@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn stale_active_order_handle_surfaces_an_invariant_error() {
+    let mut test_engine = TestEngine::new_noop();
+    let mut events = Vec::new();
+    execute(
+        &mut test_engine,
+        new_order(1, 1, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some(1_000), 10, 1),
+        &mut events,
+        "rest order",
+    );
+    let account_id = AccountId::new(1).expect("account");
+    let order_id = OrderId::new(1).expect("order");
+    let handle = test_engine.engine.accounts.order_handle(account_id, order_id).expect("handle");
+    test_engine.engine.orders.free(handle).expect("corrupt arena for test");
+
+    assert_eq!(
+        test_engine.engine.resting_order(account_id, order_id),
+        Err(EngineError::InvariantViolation)
+    );
+}
+
+#[test]
 fn account_scoped_order_ids_coexist_and_cancel_independently() {
     let mut engine = TestEngine::new_noop();
     let mut events = Vec::new();
@@ -28,12 +49,14 @@ fn account_scoped_order_ids_coexist_and_cancel_independently() {
         engine
             .engine
             .resting_order(AccountId::new(1).expect("account"), OrderId::new(7).expect("order"))
+            .expect("consistent book")
             .is_some()
     );
     assert!(
         engine
             .engine
             .resting_order(AccountId::new(2).expect("account"), OrderId::new(7).expect("order"))
+            .expect("consistent book")
             .is_some()
     );
 
@@ -44,12 +67,14 @@ fn account_scoped_order_ids_coexist_and_cancel_independently() {
         engine
             .engine
             .resting_order(AccountId::new(1).expect("account"), OrderId::new(7).expect("order"))
+            .expect("consistent book")
             .is_none()
     );
     assert!(
         engine
             .engine
             .resting_order(AccountId::new(2).expect("account"), OrderId::new(7).expect("order"))
+            .expect("consistent book")
             .is_some()
     );
     assert_eq!(resting_rows(&engine), vec![(7, 2, Side::Buy, 999, 10)]);
@@ -117,12 +142,14 @@ fn replace_and_trade_resolve_account_scoped_order_identity() {
         engine
             .engine
             .resting_order(AccountId::new(1).expect("account"), OrderId::new(8).expect("order"))
+            .expect("consistent book")
             .is_some()
     );
     assert!(
         engine
             .engine
             .resting_order(AccountId::new(2).expect("account"), OrderId::new(8).expect("order"))
+            .expect("consistent book")
             .is_some()
     );
 
@@ -146,12 +173,14 @@ fn replace_and_trade_resolve_account_scoped_order_identity() {
         engine
             .engine
             .resting_order(AccountId::new(1).expect("account"), OrderId::new(8).expect("order"))
+            .expect("consistent book")
             .is_none()
     );
     assert!(
         engine
             .engine
             .resting_order(AccountId::new(2).expect("account"), OrderId::new(8).expect("order"))
+            .expect("consistent book")
             .is_some()
     );
 }
@@ -242,7 +271,7 @@ fn snapshot_streams_rows_in_price_time_order() {
         .engine
         .try_for_each_resting_order(|row| {
             rows.push((row.order_id.raw(), row.side, row.price.raw(), row.remaining_qty));
-            Ok::<(), ()>(())
+            Ok::<(), EngineError>(())
         })
         .expect("snapshot rows");
 

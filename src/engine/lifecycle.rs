@@ -72,18 +72,14 @@ impl Engine {
         // links needed to continue traversal. this shutdown path may allocate;
         // normal order-entry processing does not use it.
         let mut handles = Vec::with_capacity(self.resting_order_count());
-        self.collect_side_handles(Side::Buy, &mut handles);
-        self.collect_side_handles(Side::Sell, &mut handles);
+        self.collect_side_handles(Side::Buy, &mut handles)?;
+        self.collect_side_handles(Side::Sell, &mut handles)?;
 
         for handle in handles {
-            // a stale handle is skipped defensively; a consistent pre-drain book
-            // contains each live handle exactly once.
-            let Some(removed) = self.unlink_and_free(handle) else {
-                continue;
-            };
+            let removed = self.unlink_and_free(handle)?;
             // unlinking happens before publication so both L2 and L1 describe
             // the post-cancel book.
-            let level_qty = self.current_level_qty(removed.side, removed.price);
+            let level_qty = self.current_level_qty(removed.side, removed.price)?;
             self.publish_book_update(removed.side, removed.price, level_qty, sequencer, market_data)?;
             self.push_report(
                 sequencer,
@@ -135,7 +131,7 @@ impl Engine {
 
         // post-only liquidity must never execute immediately, so a crossing
         // order is canceled before entering the matching loop.
-        if order.time_in_force == TimeInForce::PostOnly && self.would_cross(order.side, order.price) {
+        if order.time_in_force == TimeInForce::PostOnly && self.would_cross(order.side, order.price)? {
             self.push_report(
                 sequencer,
                 emit_report,
@@ -243,15 +239,15 @@ impl Engine {
                 ReportSpec::new_reject(cancel.client_order_id, cancel.account_id, RejectReason::UnknownOrder, 0),
             );
         };
-        debug_assert_eq!(self.orders.get(handle).map(|order| order.account_id), Some(cancel.account_id));
+        if self.orders.get(handle).map(|order| order.account_id) != Some(cancel.account_id) {
+            return Err(DomainError::Malformed);
+        }
 
         // remove the order before publishing the level change and cancellation
         // report so every output observes post-cancel state.
-        let removed = self.unlink_and_free(handle);
-        if let Some(order) = removed {
-            let level_qty = self.current_level_qty(order.side, order.price);
-            self.publish_book_update(order.side, order.price, level_qty, sequencer, market_data)?;
-        }
+        let removed = self.unlink_and_free(handle)?;
+        let level_qty = self.current_level_qty(removed.side, removed.price)?;
+        self.publish_book_update(removed.side, removed.price, level_qty, sequencer, market_data)?;
         self.push_report(
             sequencer,
             emit_report,
@@ -263,7 +259,7 @@ impl Engine {
                 reject_reason: RejectReason::None,
                 fill_price: None,
                 fill_qty: 0,
-                remaining_qty: removed.map_or(0, |order| order.remaining_qty),
+                remaining_qty: removed.remaining_qty,
             },
         )
     }
@@ -293,10 +289,10 @@ impl Engine {
         let Some(handle) = self.accounts.order_handle(replace.account_id, replace.orig_client_order_id) else {
             return self.reject_replace(replace, RejectReason::UnknownOrder, sequencer, emit_report);
         };
-        let Some(current) = self.orders.get(handle).copied() else {
-            return self.reject_replace(replace, RejectReason::UnknownOrder, sequencer, emit_report);
-        };
-        debug_assert_eq!(current.account_id, replace.account_id);
+        let current = self.orders.get(handle).copied().ok_or(DomainError::Malformed)?;
+        if current.account_id != replace.account_id || current.order_id != replace.orig_client_order_id {
+            return Err(DomainError::Malformed);
+        }
 
         if current.price == replace.price && replace.qty.raw() <= current.remaining_qty {
             // same-price reductions stay in the existing FIFO position.
@@ -322,10 +318,9 @@ impl Engine {
         }
 
         // price changes and quantity increases lose priority and re-enter as new.
-        if let Some(removed) = self.unlink_and_free(handle) {
-            let level_qty = self.current_level_qty(removed.side, removed.price);
-            self.publish_book_update(removed.side, removed.price, level_qty, sequencer, market_data)?;
-        }
+        let removed = self.unlink_and_free(handle)?;
+        let level_qty = self.current_level_qty(removed.side, removed.price)?;
+        self.publish_book_update(removed.side, removed.price, level_qty, sequencer, market_data)?;
         self.push_report(
             sequencer,
             emit_report,
@@ -379,25 +374,24 @@ impl Engine {
         let mut current = self.accounts.get(cancel.account_id).and_then(|account| account.head);
         while let Some(handle) = current {
             // capture the next account link before unlinking frees this slot.
-            current = self.orders.get(handle).and_then(|order| order.account_next);
-            if let Some(removed) = self.unlink_and_free(handle) {
-                let level_qty = self.current_level_qty(removed.side, removed.price);
-                self.publish_book_update(removed.side, removed.price, level_qty, sequencer, market_data)?;
-                self.push_report(
-                    sequencer,
-                    emit_report,
-                    ReportSpec {
-                        client_order_id: removed.order_id,
-                        account_id: removed.account_id,
-                        exec_type: ExecType::Canceled,
-                        ord_status: OrdStatus::Canceled,
-                        reject_reason: RejectReason::None,
-                        fill_price: None,
-                        fill_qty: 0,
-                        remaining_qty: removed.remaining_qty,
-                    },
-                )?;
-            }
+            current = Some(self.orders.get(handle).ok_or(DomainError::Malformed)?.account_next).flatten();
+            let removed = self.unlink_and_free(handle)?;
+            let level_qty = self.current_level_qty(removed.side, removed.price)?;
+            self.publish_book_update(removed.side, removed.price, level_qty, sequencer, market_data)?;
+            self.push_report(
+                sequencer,
+                emit_report,
+                ReportSpec {
+                    client_order_id: removed.order_id,
+                    account_id: removed.account_id,
+                    exec_type: ExecType::Canceled,
+                    ord_status: OrdStatus::Canceled,
+                    reject_reason: RejectReason::None,
+                    fill_price: None,
+                    fill_qty: 0,
+                    remaining_qty: removed.remaining_qty,
+                },
+            )?;
         }
 
         self.push_report(
