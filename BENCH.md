@@ -1,158 +1,238 @@
-# Benchmark Methodology
+# Benchmark Methodology and Results
 
-Ignition's primary benchmark is `benchmark`. It measures the runtime hot
-path after a complete binary gateway frame is available in memory:
+Ignition's `benchmark` binary measures the latency-sensitive order-entry path
+with deterministic, prebuilt SBE input and the production runtime graph. It
+reports HDR histogram percentiles, sustained throughput, and allocator calls;
+it does not report an average as a substitute for tail behaviour.
+
+## Measured Boundary
+
+The timed path begins after one complete gateway frame is available from the
+in-memory adapter:
 
 ```text
-SBE gateway frame
--> gateway decode and domain normalization
--> control/risk gate
--> matching engine
--> execution-report encode
--> in-memory egress sink accepts the frame
+complete SBE gateway frame
+→ header and message decode
+→ domain normalization
+→ control and risk gate
+→ liquidity/capacity projection
+→ matching and book mutation
+→ trade/L2/L1 shaping and encoding
+→ execution-report encoding
+→ in-memory egress accepts the report
 ```
 
-The benchmark intentionally excludes TCP loopback scheduling, disk reads/writes,
-logging, and per-order stdout. Replay/file determinism is validated separately
-by `just replay-compare <input_id>`. This benchmark is for the order-entry to
-execution-report hot path, not for transport-inclusive round-trip latency.
+Timing stops after all handling for that input frame and after deferred gateway
+publication errors are checked. Every generated input contributes one sample,
+including cancels and commands that produce several logical outputs.
+
+The benchmark intentionally excludes:
+
+- TCP reads, writes, buffering, and client/server scheduling;
+- UDP syscalls and multicast fan-out;
+- filesystem recording and replay I/O;
+- workload generation and SBE input encoding;
+- configuration parsing, runtime construction, and book preallocation;
+- environment inspection and report formatting.
+
+It is therefore a service-time/scheduled-arrival benchmark of the normal
+gateway-to-report path, not a transport-inclusive round-trip benchmark.
+
+## Workloads
+
+All workloads generate valid binary gateway messages before measurement and
+cycle across bounded accounts and 64 nearby price levels.
+
+| Workload | Deterministic shape |
+| --- | --- |
+| `mixed` | Five-message cycle: passive buy GTC, priority-losing cancel-replace, cancel, passive sell GTC, aggressive buy IOC fill |
+| `cancel` | Alternating passive buy add and cancel |
+| `aggressive-ioc` | Alternating passive sell and crossing buy IOC |
+| `passive-add` | Passive sell GTC only; order count must fit configured resting capacity |
+
+The primary reported workload is `mixed`, giving each message in its
+five-command cycle a 20% share. It exercises decoding, price mapping, arena and
+lookup mutation, replace, cancel, risk projection, matching, trade and book
+data encoding, and execution reports.
+
+Workload preflight rejects a configuration that cannot represent its generated
+accounts, 64-level price range, or passive resting count. A benchmark should
+measure the intended path, not accidental capacity shutdown.
+
+## Arrival Schedules
+
+### Burst
+
+Burst mode releases all prepared frames as fast as the runtime can consume
+them. Each sample starts at gateway-handler entry, so the histogram represents
+per-command service time. Throughput is measured from the first sample start to
+the last sample end.
+
+Burst mode is useful for saturated local throughput and core-path latency, but
+it does not model independent external arrivals and therefore cannot reveal
+queue delay relative to an offered schedule.
+
+### Open loop
+
+Open-loop mode assigns every input an absolute arrival deadline from the start
+of the run. Deadlines do not move when an earlier order is slow. The runtime
+releases overdue frames immediately until it catches up, and each latency sample
+starts at its intended deadline rather than handler entry.
+
+This directly includes scheduler delay and backlog in every observation. It
+avoids coordinated omission without a post-hoc correction: a slow period does
+not cause the load generator to stop scheduling the requests that should have
+arrived during it.
+
+## Histogram and Samples
+
+Latency is recorded in an HDR histogram with a one-nanosecond lower bound, a
+60-second upper bound, and three significant digits. The report includes:
+
+- p50;
+- p99;
+- p99.9;
+- p99.99;
+- maximum.
+
+After the run, the binary requires the histogram sample count to equal the
+requested order count. A partial finite run cannot produce a plausible-looking
+report.
+
+## Warmup
+
+Warmup uses the same workload and resolved core configuration but a separate
+runtime, disabled metrics, and a disjoint order-ID range. The measured runtime
+is then constructed with all input frames already allocated and encoded.
+
+This warms compiled and shared machine paths without contaminating book state
+or the measured histogram. It does not eliminate operating-system scheduling,
+frequency scaling, or cold effects in the newly constructed measured book.
+
+## Allocation Measurement
+
+The benchmark binary installs a counting wrapper around Rust's system global
+allocator. Immediately before the measured runtime begins, it resets total
+allocation-call and requested-byte counters; it reads them immediately after
+the runtime completes.
+
+The counters exclude workload generation, configuration, runtime construction,
+preallocation, warmup, environment inspection, and printing. They include any
+allocator call made anywhere in the process while the measured runtime is
+active. A zero result demonstrates no observed steady-state allocation in that
+experiment; it is not a static proof that every possible error or shutdown path
+is allocation-free.
 
 ## Commands
 
-Default release benchmark:
+Primary 1M-order burst run:
+
+```bash
+cargo run --release --bin benchmark -- \
+  --orders 1000000 \
+  --warmup 50000 \
+  --workload mixed \
+  --schedule burst
+```
+
+The equivalent shortcut is:
 
 ```bash
 just bench
 ```
 
-Open-loop benchmark at an explicit target arrival rate:
+Open loop at 100,000 scheduled arrivals per second:
 
 ```bash
-just bench-open-loop 100000
-cargo run --release --bin benchmark -- --orders 1000000 --warmup 50000 --workload mixed --schedule open-loop --target-rate 100000
+cargo run --release --bin benchmark -- \
+  --orders 1000000 \
+  --warmup 50000 \
+  --workload mixed \
+  --schedule open-loop \
+  --target-rate 100000
 ```
 
-Docker benchmark without local Rust setup:
+The equivalent shortcut is `just bench-open-loop 100000`.
+
+Docker runs use the same release binary and configuration:
 
 ```bash
 docker compose run --rm benchmark
 SCHEDULE=open-loop TARGET_RATE=100000 docker compose run --rm benchmark
 ```
 
-Smaller smoke run:
+A short smoke run can reduce `--orders` and `--warmup`, but should not replace
+the primary evidence. Optional Linux pinning is explicit, for example:
 
 ```bash
-cargo run --release --bin benchmark -- --orders 10000 --warmup 1000 --workload mixed
-ORDERS=10000 WARMUP=1000 docker compose run --rm benchmark
+taskset -c 2 cargo run --release --bin benchmark -- \
+  --orders 1000000 --warmup 50000 --workload mixed
 ```
 
-Optional CPU pinning on Linux:
+Pinned and unpinned results must not be presented as the same experiment.
 
-```bash
-taskset -c 2 cargo run --release --bin benchmark -- --orders 1000000 --warmup 50000 --workload mixed
-```
+## Observed Environment
 
-Supported workloads:
+Results below were collected on 2026-08-15 from source revision `8d5473a`
+with documentation-only working-tree changes.
 
 ```text
-mixed           cancel-replace, cancel, passive add, and aggressive IOC fill mix
-cancel          alternating passive add and cancel
-aggressive-ioc  alternating passive sell and crossing IOC buy
-passive-add     passive GTC adds only; keep count within configured book capacity
+CPU: Intel Core i5-4670 @ 3.40GHz
+Logical CPUs: 4
+Physical cores: 4
+CPU governor: schedutil
+L1d / L1i: 32K / 32K
+L2 / L3: 256K / 6144K
+Memory: 15781676 kB
+NUMA nodes: 1
+Kernel: 7.0.0-28-generic
+Rust: rustc 1.95.0 (59807616e 2026-04-14)
+CPU affinity: 0-3 (not pinned to an isolated core)
 ```
 
-## Measurement
+The host was not isolated from normal operating-system activity. Frequency was
+managed by `schedutil`, and no claim is made that these are production-hardware
+or best-case numbers.
 
-Input frames are generated deterministically as real SBE order-entry messages
-and loaded into an `InMemory` IO backend before measurement. The backend still
-uses the normal runtime/gateway callback path, but it does not clone input
-frames or write output frames during the measured run. Output egress is counted
-in memory.
+## Observed Results
 
-Latency samples are recorded into an HDR histogram from inside the gateway frame
-handler and stop after execution report emission/queueing for that frame. Burst
-samples start when the complete frame is handed to gateway decoding, so they
-measure service time. Open-loop samples start at the frame's scheduled arrival,
-so they include any time spent overdue before the gateway can process it. The
-benchmark prints p50, p99, p99.9, p99.99, and max latency in nanoseconds.
+Both runs used 1,000,000 measured mixed commands and 50,000 warmup commands.
 
-Burst mode is the default and releases all pre-generated frames as fast as the
-runtime can consume them. Open-loop mode requires `--target-rate` and assigns
-each frame an absolute arrival deadline from the start of the run. A slow frame
-does not shift later deadlines: overdue frames are released immediately until
-the runtime catches up. This prevents the input schedule from waiting for each
-response before deciding when to send the next order.
+| Metric | Burst service time | Open loop at 100k/s |
+| --- | ---: | ---: |
+| Throughput | 692,729 orders/s | 100,000 orders/s |
+| p50 | 1,687 ns | 1,958 ns |
+| p99 | 2,523 ns | 6,406,143 ns |
+| p99.9 | 13,799 ns | 19,415,039 ns |
+| p99.99 | 37,183 ns | 25,427,967 ns |
+| max | 1,598,463 ns | 26,034,175 ns |
+| Allocation calls | 0 | 0 |
+| Allocated bytes | 0 | 0 |
 
-Open-loop output includes the configured target rate, expected inter-arrival
-interval, and one scheduled-arrival-to-report histogram. Every generated order
-contributes a sample from its intended arrival, so backlog delay is observed
-directly instead of estimated with post-hoc coordinated-omission correction.
-
-Warmup runs before the measured run. Allocation counters are reset immediately
-before the measured run, so reported allocations exclude workload generation,
-runtime construction, and warmup. The measured hot path should report zero
-allocation calls once buffers and book storage are preallocated.
-
-The runtime-owned monotonic `Clock` supplies one nanosecond timebase to benchmark
-scheduling and metrics. Scheduled arrival metadata remains benchmark-local and
-does not replace deterministic receive timestamps or enter matching, replay
-records, or protocol output. Neither mode measures TCP transport or client-side
-round-trip time.
-
-## Local Result
-
-Machine:
-
-```text
-OS: Linux Prime 7.0.0-28-generic x86_64
-CPU: Intel Core i5-4670 @ 3.40GHz, 4 cores, SMT disabled
-Rust: rustc 1.95.0
-Command: cargo run --release --bin benchmark -- --orders 100000 --warmup 10000 --workload mixed
-CPU pinning: not used
-```
-
-Observed output:
-
-```text
-environment:
-  cpu_model: Intel(R) Core(TM) i5-4670 CPU @ 3.40GHz
-  logical_cpus: 4
-  physical_cores: 4
-  cpu_governor: schedutil
-  l1d_cache: 32K
-  l1i_cache: 32K
-  l2_cache: 256K
-  l3_cache: 6144K
-  memory_total: 15781676 kB
-  numa_nodes: 1
-  kernel: 7.0.0-28-generic
-  cpu_pinning: 0-3
-
-workload: mixed
-schedule: burst
-orders: 100000
-warmup_orders: 10000
-throughput_orders_per_sec: 687802
-
-latency_ns_service_time:
-  p50: 1700
-  p99: 2559
-  p99.9: 11079
-  p99.99: 43135
-  max: 125311
-
-allocations:
-  calls: 0
-  bytes: 0
-  calls_per_order: 0.000000
-```
+The open-loop expected inter-arrival interval was 10,000 ns. The output sample
+count matched 1,000,000 in both runs.
 
 ## Interpretation
 
-Median and p99 are dominated by SBE decode/normalize, risk projection, book
-mutation, market-data encode, and execution-report encode. The wider p99.99/max
-tail on this unpinned local run is most likely host scheduling and cache effects
-around occasional aggressive fills and runtime phase transitions. The benchmark
-does not claim transport-inclusive latency; a separate TCP loopback benchmark
-would be needed to characterize socket buffering, wakeups, and client/server
-scheduling.
+The burst result shows a narrow core distribution through p99 and sustained
+throughput around 693k commands/s for this mixed workload. The p99.9 and above
+widen as occasional matching, page/lookup mutation, runtime phase boundaries,
+cache effects, and host preemption enter the sample. The 1.60 ms maximum is an
+outlier on an unpinned, non-isolated host rather than representative median
+service time.
+
+At 100k/s, offered load is far below measured burst capacity, and median
+open-loop latency remains close to burst service time. Its millisecond p99 tail
+shows transient scheduling backlog that a closed-loop or handler-entry timer
+would omit. The runtime yields while waiting for the next scheduled arrival;
+on this unpinned `schedutil` host, descheduling or delayed wakeup can make many
+deadlines overdue and those commands then include the accumulated delay. The
+exact cause was not traced with scheduler/performance counters, so this is the
+most plausible interpretation rather than a proven attribution.
+
+The contrast is intentional evidence: service time alone describes matcher
+cost, while scheduled-arrival latency exposes the environment and queueing seen
+under an independent arrival process. A production performance campaign should
+add isolated-core pinning, a performance governor, repeated trials, hardware
+counters, scheduler traces, and a separate TCP round-trip benchmark before
+using these figures for capacity planning.

@@ -1,144 +1,159 @@
 # Architecture
 
-Ignition is a single-symbol, in-memory CLOB matching engine. The architecture
-keeps byte-level protocol handling, runtime orchestration, matching, risk,
-market-data, and control-plane concerns separated so each layer has an explicit
-ownership boundary.
+Ignition is a single-process, single-symbol matching service. It separates
+transport, protocol, orchestration, policy, matching, and publication so the
+matching core remains deterministic and the external adapters can evolve
+without changing book semantics.
 
-## Component Ownership
+## Live Topology
 
-### `protocol`
+```mermaid
+flowchart LR
+    TC[Trading client]
+    CC[Control client]
 
-- Owns the SBE schema integration, generated codecs, and handwritten Rust facade.
-- `protocol/ignition.xml` is the source of truth for wire messages.
-- `protocol/generated/` contains committed generated Rust and is not edited
-  by hand.
-- `src/protocol/frame.rs` owns SBE header/template handling.
-- `src/protocol/wire/` exposes endpoint-specific encode/decode helpers:
-  control request/response paths and trading entry/event paths.
-- Does not own business logic, matching decisions, risk checks, IO, or runtime
-  orchestration.
+    subgraph S[Ignition server]
+        GW[Gateway runtime]
+        CTL[Control runtime]
+        RT[Single-writer runtime]
+        RISK[Risk runtime]
+        ENG[Matching engine]
+        MD[Market-data runtime]
 
-### `domain`
+        GW -->|OrderEntry| RT
+        CTL -->|ControlRequest| RT
+        RT -->|risk-increasing command| RISK
+        RISK -->|accepted command| ENG
+        ENG -->|ExecutionReport| GW
+        ENG -->|book and trade effects| MD
+        RT -->|snapshot and shutdown work| ENG
+    end
 
-- Owns protocol-agnostic types consumed by control, risk, matching, market data,
-  replay, and benchmarking.
-- The domain root owns integer-scaled `Price`, `Qty`, and raw notional types.
-- `domain::rd` owns single-instrument reference data.
-- `domain::control` owns `ControlRequest` and `ControlEvent`.
-- `domain::trading::order` owns `OrderEntry` and execution reports.
-- `domain::trading::md` owns trade prints, L1/L2 updates, and market-data
-  sequencing.
-- Shared deterministic values such as `RecvTs`, `EngineSeq`, reject reasons,
-  and protocol-error events live at the domain root.
+    TC -->|SBE order entry / TCP 19000| GW
+    GW -->|SBE execution reports / TCP 19000| TC
+    CC -->|SBE control / TCP 19001| CTL
+    CTL -->|SBE control events / TCP 19001| CC
+    MD -->|SBE market data / UDP multicast 19002| TC
+```
 
-### `gateway`
+Gateway and control have separate listeners, framing state, output rings, and
+poll budgets. This prevents gateway connection pressure from consuming the
+control endpoint's transport resources. Both are deliberately orchestrated by
+one single-writer runtime; control is polled first so an operational state
+change is visible before the next gateway batch.
 
-- Owns trading frame/session ingress and egress for the order-entry endpoint.
-- Trading ingress decodes only order-entry messages: new, cancel,
-  cancel-replace, and mass cancel.
-- Trading egress encodes execution reports and protocol errors for the trading
-  endpoint.
-- The live TCP path decodes a borrowed complete frame, normalizes it once, and
-  lets runtime process/publish through a borrowed gateway publisher.
-- The current live TCP adapter keeps one active client per endpoint. Production
-  multi-client fan-in should sit in an upstream order gateway/session layer
-  responsible for authentication, account binding, rate limits, backpressure,
-  disconnect policy, and deterministic sequencing before frames reach this
-  matcher runtime.
-- Does not own matching, risk, market-data feed state, or control-plane policy.
+The live TCP adapter accepts one active client per endpoint. Authentication,
+account binding, rate limits, multi-session fan-in, and deterministic ordering
+across sessions belong in a future upstream session gateway rather than in the
+matcher.
 
-### `runtime`
+## Component Contracts
 
-- Owns orchestration state, including the matching engine and market-data feed.
-- `runtime::mode::{live,replay,benchmark}` resolves cold-path deployment input
-  into one internal `RuntimeSpec` and construction path.
-- Live input is online; replay and benchmark are finite ordered inputs. Those
-  differences end at the I/O boundary and do not branch matching behaviour.
-- Connects the separate control and trading queues to control state, risk
-  checks, engine execution, market-data output, and protocol egress in explicit
-  phases.
-- Does not parse wire bytes directly and does not own order-book internals.
+| Component | Owns | Accepts and emits | Deliberately does not own |
+| --- | --- | --- | --- |
+| `domain` | Protocol-independent IDs, values, commands, events, and reject reasons | Copyable typed values shared by all components | Encoding, I/O, policy, or book state |
+| `protocol` | SBE header validation, generated codec integration, and wire/domain conversion | Byte slices ↔ typed domain messages | Transport and business decisions |
+| `io` | Framing, TCP/UDP/file/in-memory backends, bounded output, and input recording | Complete frames and borrowed publishers | Message interpretation |
+| `gateway` | Trading ingress, normalization, execution-report egress, and gateway metrics boundary | SBE frames → `OrderEntry`; `ExecutionReport` → SBE | Risk and matching policy |
+| `control` | Kill-switch state, heartbeat liveness, control acknowledgements, and control ingress | SBE frames → `ControlRequest`; typed control events → SBE | Book mutation and snapshot data ownership |
+| `risk` | Price bands, STP, and projected account exposure checks | `OrderEntry` plus read-only engine views → accept/reject | Book mutation or protocol output |
+| `engine` | Resting book, lifecycle operations, matching, and book invariants | Normalized `OrderEntry` → reports and book/trade effects | Clock, transport, framing, and risk policy |
+| `market_data` | Trade/L1/L2 shaping, feed sequencing, encoding, and UDP/file egress | Typed book/trade effects → SBE feed messages | Matching decisions |
+| `runtime` | Component graph, global sequencing, phase order, shutdown, and mode lifecycle | Poll progress and typed component boundaries | Wire layouts and book internals |
+| `metrics` | HDR latency samples and benchmark counters | Gateway timing observations → snapshot | Matching state |
+| `client` | Interactive commands, display, heartbeat, and optional synthetic traffic | Operator input and external market data ↔ SBE frames | Privileged access to engine internals |
 
-### `engine`
+## Order Processing
 
-- Owns order-book state, order lifecycle mutations, and price-time priority
-  matching.
-- Accepts internal typed `OrderEntry` values, not raw protocol buffers.
-- Exposes `Engine::execute(entry, sequencer, market_data, emit_report)`, where
-  the caller owns sequence state, market-data feed state, and order-entry report
-  egress.
-- Stores the book directly as two `SideLadder` values, one shared resting-order
-  arena, and a dense account table that owns a preallocated
-  `(account_id, client_order_id) -> handle` lookup.
-- Uses a fixed storage envelope from `../configs/server.yaml` for direct price
-  addressing; dynamic risk price bands are enforced outside the matching data
-  structure.
-- Emits deterministic execution reports and delegates trade-print/L1/L2 shaping
-  to the caller-owned market-data feed runtime.
-- Does not read wall-clock time, parse protocol bytes, perform transport IO, or
-  make risk-policy decisions.
+```mermaid
+sequenceDiagram
+    participant C as Control endpoint
+    participant G as Gateway endpoint
+    participant R as Runtime
+    participant K as Risk
+    participant E as Engine
+    participant M as Market data
 
-### `risk`
+    R->>C: poll bounded control batch
+    C-->>R: apply halt/resume/heartbeat state
+    R->>G: poll bounded gateway batch
+    G-->>R: decoded and normalized OrderEntry
+    R->>R: apply control gate to new/replace
+    R->>K: project and evaluate risk
+    K-->>R: accept or typed rejection
+    R->>E: execute accepted command
+    E->>M: trade, then L2 and L1 after mutation
+    E-->>G: sequenced execution report(s)
+    R->>M: flush pending market data
+```
 
-- Owns pre-match account limits, notional checks, price bands, and
-  self-trade-prevention policy evaluation.
-- Produces typed accept/reject decisions before matching.
-- Reads book-derived state through `Engine` views, but does not mutate the book
-  or emit protocol frames directly.
+Cancels and mass cancels bypass the risk-increasing control gate so exposure
+can still be reduced while trading is halted. New orders and cancel-replaces
+observe control state immediately before risk and matching, not only when bytes
+enter the process. Detailed policy is in [Risk and control](risk-and-control.md).
 
-### `market_data`
+All logical outbound events consume one global `engineSeq`. Market-data events
+also consume a feed-local `mdSeq`; trade prints additionally consume a
+`tradeId`. State is mutated before its resulting output is sequenced and
+published. The [wire protocol](protocol.md) defines the observable ordering and
+gap-detection fields.
 
-- Owns outbound trade-print, L1, and L2 market-data shaping and multicast UDP
-  egress.
-- Owns feed-local market-data sequencing separately from global outbound
-  `EngineSeq` allocation.
-- Centralizes per-mutation top-of-book output, absolute level-update output,
-  encoding, queueing, and flush/error state.
-- Reads each L1 snapshot from the matching book, which remains the source of
-  truth.
-- Does not make matching or risk decisions.
+## Runtime Modes
 
-### `control`
+Live, replay, and benchmark modes all build the same `Runtime` graph. They
+differ only at startup-selected leaf adapters:
 
-- Owns operational state: kill switch, snapshot requests, heartbeat liveness,
-  and status responses.
-- Emits deterministic inspection snapshots; these are not full-runtime
-  checkpoints and cannot seed replay.
-- Does not mutate the book directly; runtime applies control outcomes such as
-  shutdown drains and snapshots in order.
+| Mode | Control input | Gateway input | Output |
+| --- | --- | --- | --- |
+| Live | Nonblocking TCP, optionally recorded | Nonblocking TCP, optionally recorded | TCP execution/control plus UDP multicast market data |
+| Replay | Finite recorded file | Finite recorded file | Fresh control, gateway, and market-data files |
+| Benchmark | Disabled | Prepared deterministic in-memory SBE frames | Counted in-memory sinks |
 
-### Client Tooling
+The shared path prevents replay and benchmark traffic from bypassing decode,
+normalization, risk, matching, sequencing, or encoding. Replay details are in
+[Replay](replay.md); the benchmark boundary is in [`BENCH.md`](../BENCH.md).
 
-- File, CLI, benchmark, replay, TCP, and in-memory clients are adapters from
-  input sources to protocol frames.
-- Clients must use the same SBE protocol path as the server runtime.
-- Clients do not call privileged internal engine APIs.
+## Determinism and Concurrency
 
-## Runtime Direction
+The engine has one mutable owner and uses no book locks. Same-price FIFO
+priority is defined by the runtime-assigned input order, not by client
+timestamps or thread scheduling. Live receive timestamps come from one
+process-local monotonic clock. Recording persists both the global input
+sequence and receive timestamp; replay injects those recorded values instead
+of reading the clock.
 
-The intended flow is:
+No wall-clock value, random value, or unordered iteration enters matching or
+output order. Deterministic traversal is explicit for snapshots, mass cancel,
+matching, and shutdown.
 
-1. control and gateway receive bytes on their respective endpoints,
-2. protocol wire adapters decode into `ControlRequest` or `OrderEntry`,
-3. runtime drains control and trading queues in deterministic order,
-4. control state and risk gates are observed before matching,
-5. engine mutates book state and emits internal execution/book effects,
-6. market-data and execution outputs receive a shared global `EngineSeq`;
-   market-data messages also receive feed-local `MdSeq`,
-7. control and gateway encode endpoint-specific egress frames.
+## Configuration and Capacity
 
-`Runtime` owns one monotonic `Clock` and passes it to live control and gateway
-ingress, benchmark scheduling, and metrics. Live receive timestamps are
-nanoseconds from that runtime origin; replay bypasses live timestamp sampling
-and reuses the values stored with each recorded input frame. Scheduled benchmark
-ingress carries its intended arrival on the same clock to gateway metrics, while
-keeping that benchmark-only timing metadata out of replay and protocol state.
+[`configs/server.yaml`](../configs/server.yaml) contains deterministic reference
+data, matching capacity, risk policy, heartbeat, and poll budgets. Live-only
+addresses, output capacities, multicast settings, and recording selection live
+in [`configs/live.yaml`](../configs/live.yaml). Environment overrides are
+limited to deployment addresses and client adapter selection.
 
-Replay and benchmark traffic exercise the same protocol/runtime boundary as
-live clients, using file and in-memory I/O backends instead of privileged engine
-entrypoints.
+The runtime allocates bounded book storage and reusable endpoint buffers during
+construction. It does not grow these structures in the order-entry path. If a
+command would exhaust resting-order or active-page capacity, the command is
+rejected before mutation and the runtime drains the book, flushes outputs, and
+terminates. TCP output beyond its configured pending-byte limit disconnects the
+active session and reports an error; multicast queue exhaustion is surfaced as
+a runtime error.
 
-Concurrent submission is modeled as deterministic serialization before the
-single-writer matcher. The runtime-assigned input stream, not client-provided
-timestamps or socket scheduling, defines same-price FIFO priority.
+## Extension Boundaries
+
+- Multi-symbol operation can shard instruments across independent single-writer
+  runtimes while preserving each symbol's local ordering.
+- A session gateway can add authentication, account binding, throttling, and
+  deterministic multi-client fan-in ahead of the existing binary boundary.
+- Kernel-bypass or FPGA-assisted parsing can replace transport/protocol leaves
+  without exposing book internals.
+- Persistence can consume ordered input and output logs; a restorable checkpoint
+  requires more state than the current inspection snapshot contains.
+- Market-data recovery can add a versioned L2 snapshot and delta replay around
+  the existing `mdSeq` contract.
+
+The rationale and tradeoffs behind these boundaries are recorded in
+[Design decisions](design-decisions.md).
