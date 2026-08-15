@@ -65,7 +65,8 @@ ownership boundary.
   the caller owns sequence state, market-data feed state, and order-entry report
   egress.
 - Stores the book directly as two `SideLadder` values, one shared resting-order
-  arena, a `client_order_id -> handle` lookup, and a dense account table.
+  arena, and a dense account table that owns a preallocated
+  `(account_id, client_order_id) -> handle` lookup.
 - Uses a fixed storage envelope from `configs/server.yaml` for direct price
   addressing; dynamic risk price bands are enforced outside the matching data
   structure.

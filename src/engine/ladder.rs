@@ -1,8 +1,63 @@
+//! Paged price-level storage and fast best-price discovery for one book side.
+//!
+//! A `SideLadder` represents either all bids or all asks inside the configured
+//! price range. It translates an integer price into a logical page and an
+//! offset within that page, records which prices are occupied, and finds the
+//! next or best occupied price without scanning every possible price.
+//!
+//! The configured price range may be much wider than the number of price pages
+//! that are active at one time. The ladder therefore separates logical pages
+//! from physical storage: `page_slots` covers the full price range, while
+//! `PagePool` contains only the bounded number of preallocated pages that may
+//! hold live levels. Activating and releasing a logical page does not allocate.
+//!
+//! # Main components
+//!
+//! - [`PriceLevel`] stores aggregate quantity, order count, and the FIFO
+//!   endpoints for one price. Actual resting orders live in `OrderArena`.
+//! - [`LevelKey`] is the translated address of one price: logical page index,
+//!   offset within that page, and the original integer price.
+//! - `Bitmap` stores occupancy as packed bits and can jump to the next or
+//!   previous set bit using integer bit operations.
+//! - `Page` is a reusable dense group of price levels with its own level
+//!   occupancy bitmap.
+//! - `PagePool` owns every physical page available to one side and a freelist
+//!   of page handles that are not currently assigned to a logical price range.
+//! - [`SideLadder`] ties the mapping, page pool, page-level occupancy bitmap,
+//!   and cached best price together for one side of the book.
+//!
+//! # How lookups work
+//!
+//! A price is first converted to a tick offset from the configured minimum.
+//! Division by `page_size` selects its logical page and the remainder selects
+//! its level within that page. `page_slots` then maps the logical page to a
+//! physical page-pool handle. Empty logical pages have no physical page.
+//!
+//! There are two occupancy layers. `occupied_pages` identifies logical pages
+//! containing visible quantity, and each active `Page` identifies its occupied
+//! levels. Traversal checks the current page first, then uses the outer bitmap
+//! to jump directly to the next active page.
+//!
+//! # Important invariants
+//!
+//! A level is occupied exactly when it contains visible resting orders. A
+//! logical page is occupied exactly when at least one of its levels is occupied.
+//! An empty page is reset before its physical storage returns to the pool. The
+//! cached `best` key is either absent or points to an occupied level; bids choose
+//! the highest occupied price and asks choose the lowest.
+//!
+//! `book.rs` updates level aggregates and calls `mark_occupied` or `mark_empty`.
+//! `matching.rs` reads best and neighboring levels. `capacity.rs` asks whether
+//! a page can be activated or deterministically released before mutation.
+
 use crate::domain::{DomainError, DomainResult, Price, trading::order::Side};
 
 use super::{EngineConfig, orders::OrderHandle};
 
-/// FIFO metadata and aggregate quantity for one price level.
+/// Visible aggregates and FIFO endpoints for one price level.
+///
+/// The level does not own order nodes. Its handles point into `OrderArena`,
+/// where neighboring orders carry the rest of the FIFO links.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PriceLevel {
     /// Oldest resting order at this price.
@@ -22,7 +77,7 @@ impl PriceLevel {
     }
 }
 
-/// Address of one price level inside the paged ladder.
+/// Logical address and absolute price of one level inside the paged ladder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LevelKey {
     /// Absolute page index inside this side's storage envelope.
@@ -33,7 +88,7 @@ pub(crate) struct LevelKey {
     pub(crate) price: Price,
 }
 
-/// Compact occupancy set used for levels and pages.
+/// Packed occupancy bits used to skip empty levels and logical pages.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Bitmap {
     /// Packed 64-bit occupancy words.
@@ -44,6 +99,7 @@ impl Bitmap {
     /// Create an empty bitmap with enough words for `bits` entries.
     fn new(bits: usize) -> Self {
         Self {
+            // round up so a final partial word still has storage for every bit.
             words: vec![0; bits.div_ceil(64)],
         }
     }
@@ -75,7 +131,7 @@ impl Bitmap {
     fn next_set_from(&self, bit: usize) -> Option<usize> {
         let mut word_index = bit / 64;
         let mut word = *self.words.get(word_index)?;
-        // Ignore occupied bits before the requested start point in the first word.
+        // ignore occupied bits before the requested start point in the first word.
         word &= !0_u64 << (bit % 64);
 
         loop {
@@ -92,7 +148,7 @@ impl Bitmap {
         let mut word_index = bit / 64;
         let mut word = *self.words.get(word_index)?;
         let keep_bits = bit % 64;
-        // Ignore occupied bits after the requested start point in the first word.
+        // ignore occupied bits after the requested start point in the first word.
         word &= u64::MAX >> (63 - keep_bits);
 
         loop {
@@ -108,7 +164,7 @@ impl Bitmap {
     }
 }
 
-/// Fixed-size dense mini-ladder activated from the page pool.
+/// Reusable dense group of adjacent price levels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Page {
     /// Fixed-size price levels for this page.
@@ -137,7 +193,7 @@ impl Page {
     }
 }
 
-/// Preallocated pool for active ladder pages.
+/// Preallocated physical pages and handles that are currently free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PagePool {
     /// Preallocated pages available to this side.
@@ -153,6 +209,8 @@ impl PagePool {
         let mut free = Vec::with_capacity(max_active_pages);
         for index in 0..max_active_pages {
             pages.push(Page::new(page_size));
+            // reverse insertion makes pop activate handles in ascending order,
+            // keeping page reuse deterministic.
             free.push(max_active_pages - 1 - index);
         }
 
@@ -171,32 +229,34 @@ impl PagePool {
     }
 }
 
-/// One side of the book, backed by a bounded paged price ladder.
+/// One book side backed by a bounded pool of paged price levels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SideLadder {
-    /// Side represented by this ladder.
+    /// Buy or sell ordering rule represented by this ladder.
     side: Side,
-    /// Lowest price representable by this side.
+    /// Lowest integer price that can be translated into this ladder.
     storage_min_price: Price,
-    /// Highest price representable by this side.
+    /// Highest integer price that can be translated into this ladder.
     storage_max_price: Price,
     /// Tick size in integer price units.
     tick_size: u64,
-    /// Number of price levels in each page.
+    /// Number of adjacent tick prices stored in each physical page.
     page_size: usize,
-    /// Mapping from logical page index to active page-pool handle.
+    /// Logical price-page to physical page-pool handle mapping.
     page_slots: Vec<Option<usize>>,
-    /// Occupancy bitmap for logical pages with visible quantity.
+    /// Bits for logical pages containing at least one occupied level.
     occupied_pages: Bitmap,
-    /// Reusable storage for active pages.
+    /// Preallocated physical page storage and its freelist.
     page_pool: PagePool,
-    /// Cached best price-level key for this side.
+    /// Cached highest bid or lowest ask, depending on `side`.
     best: Option<LevelKey>,
 }
 
 impl SideLadder {
     /// Create an empty side ladder from validated engine config.
     pub(crate) fn new(side: Side, config: EngineConfig) -> DomainResult<Self> {
+        // inclusive tick span determines how many logical levels the configured
+        // storage envelope can address.
         let tick_span = (config.storage_max_price().raw() - config.storage_min_price().raw()) / config.instrument().price_tick;
         let page_count = (tick_span as usize + 1).div_ceil(config.page_size() as usize);
 
@@ -217,12 +277,14 @@ impl SideLadder {
         })
     }
 
-    /// Convert an in-envelope price to its page and offset address.
+    /// Translate an in-range price into its logical ladder address.
     pub(crate) fn key_for_price(&self, price: Price) -> DomainResult<LevelKey> {
         if price < self.storage_min_price || price > self.storage_max_price {
             return Err(DomainError::InvalidPrice);
         }
 
+        // prices are already tick-aligned domain values, so integer division
+        // maps the offset exactly onto a level.
         let tick = (price.raw() - self.storage_min_price.raw()) / self.tick_size;
         let page_index = tick as usize / self.page_size;
         let offset = tick as usize % self.page_size;
@@ -237,6 +299,7 @@ impl SideLadder {
 
     /// Return whether `key` can be addressed without exhausting the active-page pool.
     pub(crate) fn can_rest_at(&self, key: LevelKey) -> bool {
+        // an already active logical page needs no free physical page.
         self.page_slots[key.page_index].is_some() || !self.page_pool.free.is_empty()
     }
 
@@ -246,13 +309,16 @@ impl SideLadder {
             return false;
         };
         let page = &self.page_pool.pages[page_handle];
+        // the removed order must empty its level, and that level must be the
+        // only occupied position anywhere in the physical page.
         page.levels[key.offset].order_count == 1 && page.occupied.contains_only(key.offset)
     }
 
     /// Return a mutable level, activating its page from the pool if needed.
     pub(crate) fn get_level_mut_or_activate(&mut self, key: LevelKey) -> DomainResult<&mut PriceLevel> {
         if self.page_slots[key.page_index].is_none() {
-            // Page activation is bounded by the preallocated active-page pool.
+            // page activation only assigns preallocated storage; exhaustion is
+            // reported instead of growing the pool.
             let page_handle = self.page_pool.activate().ok_or(DomainError::InvalidInstrumentSpec)?;
             self.page_slots[key.page_index] = Some(page_handle);
         }
@@ -264,6 +330,7 @@ impl SideLadder {
     /// Mark a level as visible in the side's occupancy indexes.
     pub(crate) fn mark_occupied(&mut self, key: LevelKey) {
         if let Some(page_handle) = self.page_slots[key.page_index] {
+            // update both occupancy layers before exposing the key as best.
             self.page_pool.pages[page_handle].occupied.set(key.offset);
             self.occupied_pages.set(key.page_index);
             self.refresh_best_after_occupy(key);
@@ -278,19 +345,17 @@ impl SideLadder {
 
         self.page_pool.pages[page_handle].occupied.clear(key.offset);
         if !self.page_pool.pages[page_handle].occupied.any() {
+            // an empty logical page no longer needs scarce physical storage.
             self.occupied_pages.clear(key.page_index);
             self.page_slots[key.page_index] = None;
             self.page_pool.release(page_handle);
         }
 
         if self.best == Some(key) {
+            // only removing the cached best requires a bitmap search; removing
+            // any other level leaves the cached key valid.
             self.best = self.find_best();
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn best_key(&self) -> Option<LevelKey> {
-        self.best
     }
 
     /// Return the best level key and metadata for this side.
@@ -307,6 +372,8 @@ impl SideLadder {
 
     /// Return the next occupied key at a lower price than `current`.
     pub(crate) fn occupied_before(&self, current: LevelKey) -> Option<LevelKey> {
+        // prefer another occupied level in the same physical page before
+        // consulting the outer logical-page bitmap.
         if current.offset > 0
             && let Some(page_handle) = self.page_slots[current.page_index]
             && let Some(offset) = self.page_pool.pages[page_handle].occupied.prev_set_from(current.offset - 1)
@@ -323,6 +390,8 @@ impl SideLadder {
 
     /// Return the next occupied key at a higher price than `current`.
     pub(crate) fn occupied_after(&self, current: LevelKey) -> Option<LevelKey> {
+        // prefer another occupied level in the same physical page before
+        // consulting the outer logical-page bitmap.
         if current.offset + 1 < self.page_size
             && let Some(page_handle) = self.page_slots[current.page_index]
             && let Some(offset) = self.page_pool.pages[page_handle].occupied.next_set_from(current.offset + 1)
@@ -339,6 +408,8 @@ impl SideLadder {
 
     /// Update best price after adding visible quantity at `key`.
     fn refresh_best_after_occupy(&mut self, key: LevelKey) {
+        // equal or worse prices preserve the existing cache; FIFO priority is
+        // represented inside the level rather than in this key.
         self.best = match (self.side, self.best) {
             (_, None) => Some(key),
             (Side::Buy, Some(best)) if key.price > best.price => Some(key),
@@ -351,7 +422,7 @@ impl SideLadder {
     fn find_best(&self) -> Option<LevelKey> {
         match self.side {
             Side::Buy => {
-                // Bids choose the highest occupied page and highest occupied offset.
+                // bids choose the highest occupied page and highest occupied offset.
                 let start = self.page_slots.len().checked_sub(1)?;
                 let page_index = self.occupied_pages.prev_set_from(start)?;
                 let page_handle = self.page_slots[page_index]?;
@@ -359,7 +430,7 @@ impl SideLadder {
                 self.key_from_page_offset(page_index, offset)
             }
             Side::Sell => {
-                // Asks choose the lowest occupied page and lowest occupied offset.
+                // asks choose the lowest occupied page and lowest occupied offset.
                 let page_index = self.occupied_pages.next_set_from(0)?;
                 let page_handle = self.page_slots[page_index]?;
                 let offset = self.page_pool.pages[page_handle].occupied.next_set_from(0)?;
@@ -372,6 +443,8 @@ impl SideLadder {
     fn key_from_page_offset(&self, page_index: usize, offset: usize) -> Option<LevelKey> {
         let tick = page_index.checked_mul(self.page_size)?.checked_add(offset)? as u64;
         let raw = self.storage_min_price.raw().checked_add(tick.checked_mul(self.tick_size)?)?;
+        // the final logical page may be only partially covered by the configured
+        // price envelope.
         if raw > self.storage_max_price.raw() {
             return None;
         }
@@ -413,15 +486,15 @@ mod tests {
         bids.mark_occupied(bid_100);
         bids.get_level_mut_or_activate(bid_1200).expect("level").order_count = 1;
         bids.mark_occupied(bid_1200);
-        assert_eq!(bids.best_key().expect("best").price.raw(), 1200);
+        assert_eq!(bids.best.expect("best").price.raw(), 1200);
         bids.mark_empty(bid_1200);
-        assert_eq!(bids.best_key().expect("best").price.raw(), 100);
+        assert_eq!(bids.best.expect("best").price.raw(), 100);
 
         let mut asks = SideLadder::new(Side::Sell, config()).expect("asks");
         asks.get_level_mut_or_activate(bid_1200).expect("level").order_count = 1;
         asks.mark_occupied(bid_1200);
         asks.get_level_mut_or_activate(bid_100).expect("level").order_count = 1;
         asks.mark_occupied(bid_100);
-        assert_eq!(asks.best_key().expect("best").price.raw(), 100);
+        assert_eq!(asks.best.expect("best").price.raw(), 100);
     }
 }

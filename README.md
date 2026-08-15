@@ -76,6 +76,10 @@ Cancel-replace preserves FIFO priority only when the price is unchanged and the
 new quantity is equal or lower. Price changes or quantity increases lose
 priority and re-enter as a fresh GTC limit order.
 
+Client order IDs are scoped to an account while live. Cancel and replace
+requests identify the original by `account_id + orig_client_order_id`, so two
+accounts may simultaneously use the same numeric client order ID.
+
 Self-trade prevention is cancel-aggressive: if projected executable liquidity
 contains a maker order from the same account, the incoming command is rejected
 before the book mutates. Risk also enforces per-account open-order count,

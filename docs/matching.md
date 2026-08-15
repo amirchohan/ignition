@@ -62,6 +62,11 @@ triggering command itself emits no trades or market-data mutations.
 
 ## Cancels
 
+Live client order IDs are scoped by account. Two accounts may use the same
+numeric ID simultaneously; duplicate IDs are rejected only when the same
+account already has that ID resting. A cancel or replace resolves the original
+using both `account_id` and `orig_client_order_id`.
+
 `CancelOrder` removes the original resting order when it is active for the same
 account. Unknown orders, wrong-account cancels, and structurally invalid cancel
 requests are rejected.

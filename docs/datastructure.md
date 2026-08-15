@@ -31,6 +31,12 @@ Each `RestingOrder` stores its side. The order already belongs to one
 lets fill, cancel, and free paths update the correct ladder from a single arena
 handle.
 
+Client order IDs are unique only among live orders within one account. The
+dense `AccountTable` therefore owns one preallocated
+`(account_id, client_order_id) -> OrderHandle` map. It does not allocate a map
+per configured account. IDs may coexist across accounts and may be reused by an
+account after the previous order leaves the book.
+
 Cancels and cancel-replaces physically unlink orders immediately. The book does
 not use lazy cancellation as the default because lazy cleanup pushes
 cancellation work into later aggressive matching and can create tail-latency
@@ -49,7 +55,7 @@ This gives predictable hot-path behavior:
 - No hash computation for price-level access.
 - No scan across empty price ticks when moving best bid/ask.
 - Strict FIFO at each price level.
-- Constant-time arbitrary cancel after `order_id -> handle` lookup.
+- Constant-time arbitrary cancel after `(account_id, order_id) -> handle` lookup.
 - Mass cancel walks only the target account's active orders.
 - Caller-owned output sinks keep normal command execution allocation-free once
   endpoint buffers and book storage are preallocated.

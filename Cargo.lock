@@ -420,6 +420,7 @@ name = "ignition"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "hashbrown 0.15.5",
  "hdrhistogram",
  "ignition_protocol_generated",
  "proptest",

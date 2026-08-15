@@ -972,6 +972,31 @@ mod tests {
     }
 
     #[test]
+    fn binary_ingress_accepts_same_client_order_id_for_different_accounts() {
+        let Some((mut runtime, mut gateway_client)) = runtime_with_orders(
+            [
+                new_order(1, 1, Side::Buy, TimeInForce::Gtc, 1_000, 10),
+                new_order(1, 2, Side::Buy, TimeInForce::Gtc, 999, 10),
+            ],
+            risk_config(10, 1_000_000),
+        ) else {
+            return;
+        };
+
+        let made_progress = runtime.poll_gateway().expect("poll gateway");
+        let reports = read_execution_reports(&mut gateway_client, 2);
+
+        assert!(made_progress);
+        assert_eq!(
+            reports.iter().map(|report| report.client_order_id.raw()).collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        assert_eq!(reports.iter().map(|report| report.account_id.raw()).collect::<Vec<_>>(), vec![1, 2]);
+        assert!(reports.iter().all(|report| report.reject_reason == RejectReason::None));
+        assert_eq!(runtime.engine.resting_order_count(), 2);
+    }
+
+    #[test]
     fn unknown_replace_reaches_engine_unknown_order_reject() {
         let Some((mut runtime, mut gateway_client)) = runtime_with_orders([replace(2, 1, 404, 1_000, 15)], risk_config(10, 1_000_000))
         else {

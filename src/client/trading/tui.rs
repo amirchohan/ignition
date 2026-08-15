@@ -86,7 +86,7 @@ struct TradingClientApp {
     statuses: VecDeque<String>,
     all_reports: VecDeque<ClientExecutionReport>,
     manual_reports: VecDeque<ClientExecutionReport>,
-    manual_report_order_ids: BTreeSet<u64>,
+    manual_report_order_ids: BTreeSet<(u32, u64)>,
     report_filter: ReportFilter,
     trades: VecDeque<ClientTradePrint>,
     bids: BTreeMap<u64, u64>,
@@ -158,7 +158,7 @@ impl TradingClientApp {
     fn apply_event(&mut self, event: ClientInboundEvent) {
         match event {
             ClientInboundEvent::ExecutionReport(report) => {
-                if self.manual_report_order_ids.contains(&report.client_order_id) {
+                if is_manual_report(&self.manual_report_order_ids, &report) {
                     push_bounded(&mut self.manual_reports, report.clone(), 100);
                 }
                 push_bounded(&mut self.all_reports, report, 100);
@@ -195,18 +195,20 @@ impl TradingClientApp {
     fn track_manual_frame(&mut self, frame: ClientOrderFrame) {
         match frame {
             ClientOrderFrame::New(order) => {
-                self.manual_report_order_ids.insert(order.client_order_id);
+                self.manual_report_order_ids.insert((order.account_id, order.client_order_id));
             }
             ClientOrderFrame::Cancel(cancel) => {
-                self.manual_report_order_ids.insert(cancel.client_order_id);
-                self.manual_report_order_ids.insert(cancel.orig_client_order_id);
+                self.manual_report_order_ids.insert((cancel.account_id, cancel.client_order_id));
+                self.manual_report_order_ids
+                    .insert((cancel.account_id, cancel.orig_client_order_id));
             }
             ClientOrderFrame::Replace(replace) => {
-                self.manual_report_order_ids.insert(replace.client_order_id);
-                self.manual_report_order_ids.insert(replace.orig_client_order_id);
+                self.manual_report_order_ids.insert((replace.account_id, replace.client_order_id));
+                self.manual_report_order_ids
+                    .insert((replace.account_id, replace.orig_client_order_id));
             }
             ClientOrderFrame::MassCancel(cancel) => {
-                self.manual_report_order_ids.insert(cancel.client_order_id);
+                self.manual_report_order_ids.insert((cancel.account_id, cancel.client_order_id));
             }
         }
     }
@@ -503,6 +505,10 @@ fn push_bounded<T>(values: &mut VecDeque<T>, value: T, max: usize) {
     values.push_back(value);
 }
 
+fn is_manual_report(tracked_orders: &BTreeSet<(u32, u64)>, report: &ClientExecutionReport) -> bool {
+    tracked_orders.contains(&(report.account_id, report.client_order_id))
+}
+
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<std::io::Stdout>>,
 }
@@ -563,5 +569,33 @@ impl From<TradingClientConfigError> for TradingClientError {
 impl From<TradingClientIoError> for TradingClientError {
     fn from(error: TradingClientIoError) -> Self {
         Self::Io(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::generated::codecs::{exec_type, ord_status, reject_reason};
+
+    fn report(account_id: u32, client_order_id: u64) -> ClientExecutionReport {
+        ClientExecutionReport {
+            engine_seq: 1,
+            client_order_id,
+            account_id,
+            exec_type: exec_type::ExecType::New,
+            ord_status: ord_status::OrdStatus::New,
+            reject_reason: reject_reason::RejectReason::None,
+            fill_price: 0,
+            fill_qty: 0,
+            remaining_qty: 10,
+        }
+    }
+
+    #[test]
+    fn manual_report_filter_scopes_client_order_id_by_account() {
+        let tracked_orders = BTreeSet::from([(1, 7)]);
+
+        assert!(is_manual_report(&tracked_orders, &report(1, 7)));
+        assert!(!is_manual_report(&tracked_orders, &report(2, 7)));
     }
 }

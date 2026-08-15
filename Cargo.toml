@@ -27,6 +27,7 @@ path = "bin/benchmark.rs"
 ignition_protocol_generated = { path = "protocol/generated" }
 crossterm = "0.28"
 hdrhistogram = "7.5"
+hashbrown = "0.15"
 ratatui = "0.29"
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde = { version = "1.0", features = ["derive"] }

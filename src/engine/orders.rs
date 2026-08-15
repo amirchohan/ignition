@@ -1,22 +1,63 @@
+//! Resting-order nodes, generation-checked handles, and fixed-capacity storage.
+//!
+//! This module owns the engine's actual resting-order records. The arena is
+//! allocated to its configured maximum size at startup and reuses those slots
+//! for the lifetime of the engine. Adding or removing a resting order therefore
+//! does not grow storage on the order-entry hot path.
+//!
+//! # Main components
+//!
+//! - [`OrderHandle`] identifies one arena slot and the generation of the order
+//!   that occupied it. The generation prevents a handle retained from an older
+//!   order from resolving after that slot has been reused.
+//! - [`RestingOrder`] stores the order's visible state and two independent sets
+//!   of intrusive links: one for FIFO order at its price level and one for the
+//!   owning account's active-order chain.
+//! - `OrderSlot` is the physical arena entry. An occupied slot contains an
+//!   order; a free slot instead carries the next index in the freelist.
+//! - [`OrderArena`] owns every slot, the freelist head, and the current number
+//!   of occupied slots.
+//!
+//! # Allocation and reuse
+//!
+//! At construction, every slot is linked into a deterministic freelist.
+//! `allocate` pops its head, stores an order, and returns a handle containing the
+//! slot's current generation. `free` removes the order, advances the generation,
+//! and pushes the slot back onto the freelist. Both operations are constant-time
+//! and use only preallocated memory.
+//!
+//! # Intrusive links
+//!
+//! Price levels and accounts store only the head and tail `OrderHandle` values
+//! for their chains. The previous and next links live in `RestingOrder`, avoiding
+//! separate list-node allocations. Price-level links preserve FIFO matching;
+//! account links let mass cancel visit one account without scanning the arena.
+//!
+//! # Important invariants
+//!
+//! A valid handle must have an in-range index and a generation equal to the
+//! current slot generation. An occupied slot contains an order and is not part
+//! of the freelist. A free slot contains no order and is reachable from
+//! `free_head`. `active` equals the number of occupied slots, and a slot's
+//! generation is never zero.
+//!
+//! `book.rs` allocates, links, unlinks, and frees orders. `ladder.rs` stores
+//! price-level chain endpoints, `accounts.rs` stores account-chain endpoints and
+//! account-scoped lookup handles, `matching.rs` updates maker leaves quantity,
+//! and `capacity.rs` checks whether the freelist has a slot available.
+
 use crate::domain::trading::order::{AccountId, OrderId, Side};
 
-/// Generation-checked index into the resting-order arena.
+/// Stable reference to one generation of an arena slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct OrderHandle {
-    /// Arena slot index.
+    /// Physical slot index inside `OrderArena`.
     index: u32,
-    /// Slot generation used to reject stale handles after reuse.
+    /// Slot generation captured when the order was allocated.
     generation: u32,
 }
 
-impl OrderHandle {
-    /// Return the arena slot index portion of this handle.
-    pub(crate) const fn index(self) -> usize {
-        self.index as usize
-    }
-}
-
-/// Resting order node linked into price-level and account FIFO chains.
+/// Resting order node linked into price-level and account chains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RestingOrder {
     /// Client-assigned order ID for the resting order.
@@ -27,37 +68,37 @@ pub(crate) struct RestingOrder {
     pub(crate) side: Side,
     /// Limit price where this order rests.
     pub(crate) price: crate::domain::Price,
-    /// Quantity still visible on the book.
+    /// Leaves quantity still visible and available to match.
     pub(crate) remaining_qty: u64,
-    /// Previous order at the same price level.
+    /// Older FIFO neighbor at the same price level.
     pub(crate) level_prev: Option<OrderHandle>,
-    /// Next order at the same price level.
+    /// Newer FIFO neighbor at the same price level.
     pub(crate) level_next: Option<OrderHandle>,
-    /// Previous active order for the same account.
+    /// Previous live order in the owning account's chain.
     pub(crate) account_prev: Option<OrderHandle>,
-    /// Next active order for the same account.
+    /// Next live order in the owning account's chain.
     pub(crate) account_next: Option<OrderHandle>,
 }
 
-/// One arena slot, either occupied by an order or linked into the freelist.
+/// One physical slot, represented either as an order or a freelist node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OrderSlot {
-    /// Current generation for handles pointing at this slot.
+    /// Generation required for a handle to resolve this slot.
     generation: u32,
     /// Resting order stored in this slot, if occupied.
     order: Option<RestingOrder>,
-    /// Next free slot index when this slot is on the freelist.
+    /// Next freelist index when this slot is unoccupied.
     next_free: Option<u32>,
 }
 
-/// Fixed-capacity resting-order arena with generation-checked handles.
+/// Fixed-capacity owner of all resting-order slots.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OrderArena {
-    /// Fixed storage for all resting-order slots.
+    /// Preallocated storage for every possible resting order.
     slots: Vec<OrderSlot>,
-    /// Head of the slot freelist.
+    /// First reusable slot, or `None` when the arena is full.
     free_head: Option<u32>,
-    /// Number of occupied slots.
+    /// Number of slots currently containing resting orders.
     active: usize,
 }
 
@@ -66,6 +107,7 @@ impl OrderArena {
     pub(crate) fn with_capacity(capacity: u32) -> Self {
         let mut slots = Vec::with_capacity(capacity as usize);
         for index in 0..capacity {
+            // initial slots form one ascending chain from zero to capacity - 1.
             let next_free = (index + 1 < capacity).then_some(index + 1);
             slots.push(OrderSlot {
                 generation: 1,
@@ -74,7 +116,7 @@ impl OrderArena {
             });
         }
 
-        // Initial freelist order is deterministic and covers every slot exactly once.
+        // the deterministic freelist covers every slot exactly once.
         Self {
             slots,
             free_head: (capacity > 0).then_some(0),
@@ -86,7 +128,7 @@ impl OrderArena {
     pub(crate) fn allocate(&mut self, order: RestingOrder) -> Option<OrderHandle> {
         let index = self.free_head?;
         let slot = &mut self.slots[index as usize];
-        // Pop this slot from the freelist before exposing its handle.
+        // detach the slot from the freelist before making its handle visible.
         self.free_head = slot.next_free;
         slot.next_free = None;
         slot.order = Some(order);
@@ -100,10 +142,13 @@ impl OrderArena {
 
     /// Remove an occupied slot and return it to the freelist.
     pub(crate) fn free(&mut self, handle: OrderHandle) -> Option<RestingOrder> {
+        // capture the old head before borrowing the slot so the released slot
+        // can be pushed onto the front of the freelist.
         let free_head = self.free_head;
         let slot = self.valid_slot_mut(handle)?;
         let order = slot.order.take()?;
-        // Bump generation so stale handles cannot address the reused slot.
+        // advance the generation before reuse so every outstanding old handle
+        // becomes invalid; reserve zero as a non-generation after wraparound.
         slot.generation = slot.generation.wrapping_add(1).max(1);
         slot.next_free = free_head;
         self.free_head = Some(handle.index);
@@ -133,13 +178,15 @@ impl OrderArena {
 
     /// Return a slot only when the handle generation still matches.
     fn valid_slot(&self, handle: OrderHandle) -> Option<&OrderSlot> {
-        let slot = self.slots.get(handle.index())?;
+        // bounds and generation are both part of handle validity.
+        let slot = self.slots.get(handle.index as usize)?;
         (slot.generation == handle.generation).then_some(slot)
     }
 
     /// Return a mutable slot only when the handle generation still matches.
     fn valid_slot_mut(&mut self, handle: OrderHandle) -> Option<&mut OrderSlot> {
-        let slot = self.slots.get_mut(handle.index())?;
+        // perform the same validation before granting exclusive slot access.
+        let slot = self.slots.get_mut(handle.index as usize)?;
         (slot.generation == handle.generation).then_some(slot)
     }
 }

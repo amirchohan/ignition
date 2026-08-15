@@ -45,6 +45,10 @@ Prices and quantities are unsigned integer-scaled values. Zero is not a valid
 domain `Price` or `Qty`; outbound optional price fields use wire value `0` as
 the current no-price sentinel.
 
+`clientOrderId` is scoped by `accountId` while an order is live. Cancel and
+replace requests resolve `origClientOrderId` within the supplied account; the
+same numeric client order ID may therefore be active in different accounts.
+
 ## Endpoint Model
 
 The protocol is exposed as two ingress endpoint families and three egress
@@ -75,7 +79,9 @@ template. Unknown template IDs are still rejected as unknown templates.
 ## Market Data
 
 `TradePrint` reports each execution with a market-data sequence, global engine
-sequence, trade ID, maker order ID, taker order ID, price, and quantity.
+sequence, trade ID, maker order ID, taker order ID, price, and quantity. Maker
+and taker client order IDs may have the same numeric value when they belong to
+different accounts; the globally unique trade reference is `tradeId`.
 
 `L1Update` is the top-of-book change stream. It carries the current best bid
 price and aggregate quantity plus the current best ask price and aggregate
