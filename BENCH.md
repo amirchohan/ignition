@@ -186,9 +186,9 @@ Pinned and unpinned results must not be presented as the same experiment.
 
 ## Observed Environment
 
-Results below were collected on 2026-08-16. The baseline used source revision
-`dce8aad` with documentation-only working-tree changes. The Noop condition used
-the same revision plus the live idle-policy implementation described below.
+Results below were collected on 2026-08-16. All three conditions used source
+revision `7ff2c82` with documentation-only working-tree changes and the same
+release binary.
 
 ```text
 CPU: Intel Core i5-4670 @ 3.40GHz
@@ -199,15 +199,14 @@ L1d / L1i: 32K / 32K
 L2 / L3: 256K / 6144K
 Memory: 15781676 kB
 NUMA nodes: 1
-Kernel: 7.0.0-28-generic
 Rust: rustc 1.95.0 (59807616e 2026-04-14)
-CPU affinity: 0-3 (not pinned to an isolated core)
+CPU affinity: 0-3 for condition A; CPU 3 for conditions B/C
 ```
 
-The host was not isolated from normal operating-system activity. Frequency was
-managed by `schedutil`, and no claim is made that these are production-hardware
-or best-case numbers. CPU 3 pinning and CPU 3 isolation are the next planned
-conditions.
+Frequency was managed by `schedutil`, and no claim is made that these are
+production-hardware or best-case numbers. Conditions A/B ran without CPU
+isolation. Condition C reserved CPU 3 from scheduler load balancing, enabled
+full dynticks there, and directed default and managed interrupts to CPUs 0–2.
 
 ## Observed Results
 
@@ -217,15 +216,17 @@ are the median of the five trials, followed by the full `(min–max)` range.
 
 | Condition | Live idle policy | CPU placement | CPU isolation | Release binary SHA-256 |
 | --- | --- | --- | --- | --- |
-| A — baseline | `std::thread::yield_now()` | Unpinned (`0-3`) | None | `90412e688c1d7ea…` |
-| B — Noop | `Yield::Noop` | Unpinned (`0-3`) | None | `a6ef8b3cbb04f44b…` |
+| A — baseline | `Yield::Noop` | Unpinned (`0-3`) | None | `a6ef8b3cbb04f44b…` |
+| B — pinned | `Yield::Noop` | CPU 3 | None | `a6ef8b3cbb04f44b…` |
+| C — isolated | `Yield::Noop` | CPU 3 | CPU 3 scheduler/tick/IRQ | `a6ef8b3cbb04f44b…` |
 
 ### Burst Service Time
 
 | Condition | Throughput (orders/s) | p50 (ns) | p99 (ns) | p99.9 (ns) | p99.99 (ns) | max (ns) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| A — baseline | 828,210 (823,447–831,691) | 1,600 (1,597–1,602) | 1,920 (1,917–1,954) | 4,283 (4,103–5,159) | 12,535 (11,599–12,671) | 39,583 (23,231–86,463) |
-| B — Noop | 818,775 (817,026–824,595) | 1,601 (1,600–1,603) | 1,992 (1,987–1,996) | 4,427 (4,355–8,583) | 12,751 (12,447–12,879) | 56,959 (22,879–142,591) |
+| A — baseline | 818,775 (817,026–824,595) | 1,601 (1,600–1,603) | 1,992 (1,987–1,996) | 4,427 (4,355–8,583) | 12,751 (12,447–12,879) | 56,959 (22,879–142,591) |
+| B — pinned | 818,257 (813,112–826,194) | 1,596 (1,596–1,600) | 1,999 (1,981–2,011) | 4,807 (4,295–9,127) | 12,663 (11,791–12,919) | 24,399 (23,519–91,967) |
+| C — isolated | 826,290 (822,041–831,923) | 1,596 (1,594–1,599) | 1,938 (1,929–1,962) | 9,727 (2,161–10,447) | 12,703 (11,783–12,943) | 81,855 (18,751–89,215) |
 
 ### Open Loop At 100k/s
 
@@ -233,35 +234,47 @@ The expected inter-arrival interval was 10,000 ns.
 
 | Condition | Throughput (orders/s) | p50 (ns) | p99 (ns) | p99.9 (ns) | p99.99 (ns) | max (ns) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| A — baseline | 100,000 (100,000–100,000) | 1,660 (1,645–1,666) | 2,045 (2,029–2,053) | 8,159 (6,547–10,423) | 13,503 (12,655–14,663) | 85,887 (37,183–122,239) |
-| B — Noop | 100,000 (100,000–100,000) | 1,652 (1,647–1,659) | 2,089 (2,073–3,987) | 8,303 (7,227–9,975) | 13,799 (12,087–16,239) | 132,863 (30,127–133,887) |
+| A — baseline | 100,000 (100,000–100,000) | 1,652 (1,647–1,659) | 2,089 (2,073–3,987) | 8,303 (7,227–9,975) | 13,799 (12,087–16,239) | 132,863 (30,127–133,887) |
+| B — pinned | 100,000 (100,000–100,000) | 1,648 (1,645–1,656) | 2,385 (2,081–3,985) | 9,775 (8,695–10,847) | 15,063 (14,031–15,423) | 86,015 (23,775–86,719) |
+| C — isolated | 100,000 (100,000–100,000) | 1,654 (1,646–1,658) | 2,063 (2,034–2,069) | 10,711 (9,231–11,655) | 14,071 (12,759–14,839) | 82,431 (23,375–106,495) |
 
-All twenty trials produced exactly 1,000,000 samples with zero allocation calls
-and zero allocated bytes during measurement.
+All thirty reported trials produced exactly 1,000,000 samples with zero
+allocation calls and zero allocated bytes during measurement.
 
 ## Interpretation
 
-Condition B's burst median throughput was 1.1% lower than baseline. Its burst
-p50 was effectively unchanged, while p99 through p99.99 were 1.7–3.8% higher.
-Open-loop p50 was 0.5% lower, while p99 through p99.99 were 1.8–2.2% higher.
-Maximum latency varied much more than the percentiles across both conditions.
+### What CPU placement changed
 
-This is a negative control, not evidence that `Yield::Noop` changed hot-path
-latency. The benchmark uses finite in-memory input: each poll either makes
-progress or detects fully drained input and exits. It never executes the live
-idle policy. The observed differences therefore represent run-to-run host
-variation and possible binary-layout effects, not removal of `yield_now()` from
-the measured path.
+Pinning and isolation barely changed throughput or the central latency
+percentiles because they do not shorten the gateway-to-report code path; they
+only remove CPU migration and some competing work. On this otherwise quiet
+host there was little such interference to remove. The inconsistent movement
+in the higher percentiles and maxima is therefore not evidence of a reliable
+placement improvement or regression.
 
-At 100k/s, offered load remains far below measured burst capacity. Open-loop
-tail variability shows the scheduler and other host activity delaying some
-absolute arrival deadlines on this unpinned `schedutil` system. Pinning and then
-isolating CPU 3 will test those environmental effects while keeping condition
-B's source and release binary fixed.
+### What the tail suggests
 
-The contrast is intentional evidence: service time alone describes matcher
-cost, while scheduled-arrival latency exposes the environment and queueing seen
-under an independent arrival process. A production performance campaign should
-add isolated-core pinning, a performance governor, repeated trials, hardware
-counters, scheduler traces, and a separate TCP round-trip benchmark before
-using these figures for capacity planning.
+The similar p99.99 service-time tail across all three placements shifts the
+next optimization effort toward the code and its memory-access patterns. The
+benchmark already excludes transport and workload generation, and it observed
+no steady-state allocations. Plausible remaining causes are:
+
+- cache or TLB misses in the preallocated book and lookup structures;
+- long active-order lookup probe chains;
+- price-level creation or removal;
+- branch misprediction; and
+- state-dependent matching and encoding work that emits several outputs.
+
+A rare service-time stall can exceed the open-loop arrival interval and pass
+backlog into subsequent samples. Reducing the core-path tail should therefore
+improve scheduled-arrival latency as well.
+
+### Next measurements
+
+1. Run `cancel`, `aggressive-ioc`, and `passive-add` separately to identify the
+   operation class responsible for the tail.
+2. Add a small preallocated outlier trace recording command kind, match count,
+   output count, lookup probes, and price-level changes above a fixed latency
+   threshold.
+3. Add per-stage timing around decode, risk, book/matching, and encoding.
+4. Collect hardware counters for cache, TLB, and branch misses.
