@@ -36,6 +36,8 @@ pub use mode::InputLifecycle;
 #[doc(hidden)]
 pub type Mode = InputLifecycle;
 
+use std::time::Duration;
+
 use self::order::{OrderProcessOutcome, OrderProcessor};
 use self::snapshot::SnapshotProcessor;
 use crate::{
@@ -60,6 +62,8 @@ pub struct Runtime {
     clock: Clock,
     /// Online or finite-ordered input lifecycle.
     input: InputLifecycle,
+    /// Action taken when live ingress is idle.
+    idle_yield: Yield,
     /// Control-plane state and ingress.
     control: ControlRuntime,
     /// Pre-match risk gate and reference-price state.
@@ -80,8 +84,10 @@ pub struct Runtime {
 
 impl Runtime {
     /// Build the single-writer runtime from pre-opened adapters and validated configs.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         input: InputLifecycle,
+        idle_yield: Yield,
         engine_config: EngineConfig,
         risk_config: RiskConfig,
         control: ControlRuntime,
@@ -93,6 +99,7 @@ impl Runtime {
         Ok(Self {
             clock: Clock::new(),
             input,
+            idle_yield,
             control,
             gateway,
             market_data,
@@ -268,8 +275,8 @@ impl Runtime {
             }));
         }
 
-        // live mode yields when both ingress endpoints are idle.
-        std::thread::yield_now();
+        // finite modes return above; only live input applies this deployment policy.
+        self.idle_yield.execute();
         Ok(true)
     }
 }
@@ -279,6 +286,25 @@ const fn capacity_resource_label(resource: CapacityResource) -> &'static str {
     match resource {
         CapacityResource::RestingOrders => "resting_orders",
         CapacityResource::ActivePages => "active_pages",
+    }
+}
+
+/// Scheduler interaction selected for an idle live-loop iteration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Yield {
+    /// Poll again immediately, keeping the runtime thread runnable.
+    Noop,
+    /// Park the runtime thread for the configured duration.
+    Sleep(Duration),
+}
+
+impl Yield {
+    /// Apply the configured idle-loop action.
+    fn execute(self) {
+        match self {
+            Self::Noop => {}
+            Self::Sleep(duration) => std::thread::sleep(duration),
+        }
     }
 }
 

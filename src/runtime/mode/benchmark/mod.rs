@@ -53,7 +53,7 @@ use crate::{
         generated::codecs::{WriteBuf, cancel_order_codec, cancel_replace_codec, new_order_codec, order_type, side, time_in_force},
     },
     runtime::{
-        InputLifecycle, Runtime, RuntimeBuildError,
+        InputLifecycle, Runtime, RuntimeBuildError, Yield,
         build::{RuntimeSpec, build_runtime},
     },
 };
@@ -115,6 +115,7 @@ fn build_benchmark_runtime(
     };
     build_runtime(RuntimeSpec {
         input: InputLifecycle::Replay { expected_input_seq: 1 },
+        idle_yield: Yield::Noop,
         core,
         control_io: IOConfig::Noop,
         gateway_io: benchmark_io,

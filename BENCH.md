@@ -186,8 +186,9 @@ Pinned and unpinned results must not be presented as the same experiment.
 
 ## Observed Environment
 
-Results below were collected on 2026-08-15 from source revision `8d5473a`
-with documentation-only working-tree changes.
+Results below were collected on 2026-08-16. The baseline used source revision
+`dce8aad` with documentation-only working-tree changes. The Noop condition used
+the same revision plus the live idle-policy implementation described below.
 
 ```text
 CPU: Intel Core i5-4670 @ 3.40GHz
@@ -205,43 +206,58 @@ CPU affinity: 0-3 (not pinned to an isolated core)
 
 The host was not isolated from normal operating-system activity. Frequency was
 managed by `schedutil`, and no claim is made that these are production-hardware
-or best-case numbers.
+or best-case numbers. CPU 3 pinning and CPU 3 isolation are the next planned
+conditions.
 
 ## Observed Results
 
-Both runs used 1,000,000 measured mixed commands and 50,000 warmup commands.
+Each condition consists of five alternating burst/open-loop trial pairs. Every
+trial used 1,000,000 measured mixed commands and 50,000 warmup commands. Values
+are the median of the five trials, followed by the full `(min–max)` range.
 
-| Metric | Burst service time | Open loop at 100k/s |
-| --- | ---: | ---: |
-| Throughput | 692,729 orders/s | 100,000 orders/s |
-| p50 | 1,687 ns | 1,958 ns |
-| p99 | 2,523 ns | 6,406,143 ns |
-| p99.9 | 13,799 ns | 19,415,039 ns |
-| p99.99 | 37,183 ns | 25,427,967 ns |
-| max | 1,598,463 ns | 26,034,175 ns |
-| Allocation calls | 0 | 0 |
-| Allocated bytes | 0 | 0 |
+| Condition | Live idle policy | CPU placement | CPU isolation | Release binary SHA-256 |
+| --- | --- | --- | --- | --- |
+| A — baseline | `std::thread::yield_now()` | Unpinned (`0-3`) | None | `90412e688c1d7ea…` |
+| B — Noop | `Yield::Noop` | Unpinned (`0-3`) | None | `a6ef8b3cbb04f44b…` |
 
-The open-loop expected inter-arrival interval was 10,000 ns. The output sample
-count matched 1,000,000 in both runs.
+### Burst Service Time
+
+| Condition | Throughput (orders/s) | p50 (ns) | p99 (ns) | p99.9 (ns) | p99.99 (ns) | max (ns) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A — baseline | 828,210 (823,447–831,691) | 1,600 (1,597–1,602) | 1,920 (1,917–1,954) | 4,283 (4,103–5,159) | 12,535 (11,599–12,671) | 39,583 (23,231–86,463) |
+| B — Noop | 818,775 (817,026–824,595) | 1,601 (1,600–1,603) | 1,992 (1,987–1,996) | 4,427 (4,355–8,583) | 12,751 (12,447–12,879) | 56,959 (22,879–142,591) |
+
+### Open Loop At 100k/s
+
+The expected inter-arrival interval was 10,000 ns.
+
+| Condition | Throughput (orders/s) | p50 (ns) | p99 (ns) | p99.9 (ns) | p99.99 (ns) | max (ns) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| A — baseline | 100,000 (100,000–100,000) | 1,660 (1,645–1,666) | 2,045 (2,029–2,053) | 8,159 (6,547–10,423) | 13,503 (12,655–14,663) | 85,887 (37,183–122,239) |
+| B — Noop | 100,000 (100,000–100,000) | 1,652 (1,647–1,659) | 2,089 (2,073–3,987) | 8,303 (7,227–9,975) | 13,799 (12,087–16,239) | 132,863 (30,127–133,887) |
+
+All twenty trials produced exactly 1,000,000 samples with zero allocation calls
+and zero allocated bytes during measurement.
 
 ## Interpretation
 
-The burst result shows a narrow core distribution through p99 and sustained
-throughput around 693k commands/s for this mixed workload. The p99.9 and above
-widen as occasional matching, page/lookup mutation, runtime phase boundaries,
-cache effects, and host preemption enter the sample. The 1.60 ms maximum is an
-outlier on an unpinned, non-isolated host rather than representative median
-service time.
+Condition B's burst median throughput was 1.1% lower than baseline. Its burst
+p50 was effectively unchanged, while p99 through p99.99 were 1.7–3.8% higher.
+Open-loop p50 was 0.5% lower, while p99 through p99.99 were 1.8–2.2% higher.
+Maximum latency varied much more than the percentiles across both conditions.
 
-At 100k/s, offered load is far below measured burst capacity, and median
-open-loop latency remains close to burst service time. Its millisecond p99 tail
-shows transient scheduling backlog that a closed-loop or handler-entry timer
-would omit. The runtime yields while waiting for the next scheduled arrival;
-on this unpinned `schedutil` host, descheduling or delayed wakeup can make many
-deadlines overdue and those commands then include the accumulated delay. The
-exact cause was not traced with scheduler/performance counters, so this is the
-most plausible interpretation rather than a proven attribution.
+This is a negative control, not evidence that `Yield::Noop` changed hot-path
+latency. The benchmark uses finite in-memory input: each poll either makes
+progress or detects fully drained input and exits. It never executes the live
+idle policy. The observed differences therefore represent run-to-run host
+variation and possible binary-layout effects, not removal of `yield_now()` from
+the measured path.
+
+At 100k/s, offered load remains far below measured burst capacity. Open-loop
+tail variability shows the scheduler and other host activity delaying some
+absolute arrival deadlines on this unpinned `schedutil` system. Pinning and then
+isolating CPU 3 will test those environmental effects while keeping condition
+B's source and release binary fixed.
 
 The contrast is intentional evidence: service time alone describes matcher
 cost, while scheduled-arrival latency exposes the environment and queueing seen

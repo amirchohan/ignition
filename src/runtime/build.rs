@@ -31,12 +31,14 @@ use crate::{
     metrics::{MetricsBackend, MetricsError, MetricsRuntime},
 };
 
-use super::{InputLifecycle, Runtime, RuntimeError};
+use super::{InputLifecycle, Runtime, RuntimeError, Yield};
 
 /// Fully resolved cold-path inputs required to construct one runtime.
 pub(crate) struct RuntimeSpec {
     /// Sequencing and completion policy for the selected input source.
     pub input: InputLifecycle,
+    /// Scheduler interaction selected for idle live-loop iterations.
+    pub idle_yield: Yield,
     /// Validated instrument, engine, risk, and poll-budget configuration.
     pub core: ResolvedCoreConfig,
     /// Control-plane transport selected by the mode.
@@ -67,7 +69,17 @@ pub(crate) fn build_runtime(spec: RuntimeSpec) -> Result<Runtime, RuntimeBuildEr
     let market_data = MarketDataRuntime::new(MarketDataFeedConfig { io: spec.market_data_io })?;
     let metrics = MetricsRuntime::new(spec.metrics, 0)?;
 
-    Runtime::new(spec.input, spec.core.engine, spec.core.risk, control, gateway, market_data, metrics).map_err(RuntimeBuildError::Runtime)
+    Runtime::new(
+        spec.input,
+        spec.idle_yield,
+        spec.core.engine,
+        spec.core.risk,
+        control,
+        gateway,
+        market_data,
+        metrics,
+    )
+    .map_err(RuntimeBuildError::Runtime)
 }
 
 /// Log resolved reference data and fixed-capacity limits before execution.

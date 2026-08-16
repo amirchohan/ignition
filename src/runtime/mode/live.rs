@@ -47,6 +47,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error:
     let core = CoreConfig::load(&args.core_config)?;
     let resolved = core.resolve().map_err(crate::config::ConfigError::Validate)?;
     let live = LiveConfig::load(&args.live_config)?;
+    let idle_yield = live.idle_yield.resolve()?;
 
     let (control_record, gateway_record) = match &live.recording {
         RecordingConfig::Noop => (None, None),
@@ -60,6 +61,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error:
 
     let mut runtime = build_runtime(RuntimeSpec {
         input: InputLifecycle::Live { next_input_seq: 1 },
+        idle_yield,
         core: resolved,
         control_io: IOConfig::Tcp {
             bind_addr: live.control.listen_addr,

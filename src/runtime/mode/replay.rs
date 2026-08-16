@@ -33,7 +33,7 @@ use crate::{
     metrics::MetricsBackend,
     protocol::MAX_ACCEPTED_WIRE_FRAME_LEN,
     runtime::{
-        InputLifecycle,
+        InputLifecycle, Yield,
         build::{RuntimeSpec, build_runtime},
     },
 };
@@ -53,6 +53,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<(), Box<dyn std::error:
         input: InputLifecycle::Replay {
             expected_input_seq: run.first_input_sequence,
         },
+        idle_yield: Yield::Noop,
         core: resolved,
         control_io: IOConfig::File {
             input_path: run.control_input,

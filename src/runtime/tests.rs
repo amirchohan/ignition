@@ -116,6 +116,7 @@ fn runtime_without_gateway_client(risk_config: RiskConfig) -> Option<Runtime> {
     Some(
         Runtime::new(
             Mode::default(),
+            Yield::Noop,
             engine_config(),
             risk_config,
             control,
@@ -157,6 +158,7 @@ fn runtime_with_control_and_orders(
     Some(
         Runtime::new(
             Mode::default(),
+            Yield::Noop,
             engine_config,
             risk_config,
             control,
@@ -768,6 +770,7 @@ fn empty_replay_with_file_market_data_output_drains_without_progress() {
     .expect("market data");
     let mut runtime = Runtime::new(
         Mode::Replay { expected_input_seq: 1 },
+        Yield::Noop,
         engine_config(),
         risk_config(10, 1_000_000),
         control,
@@ -878,6 +881,7 @@ fn live_heartbeat_timeout_ignores_endpoint_construction_skew() {
 
     let mut runtime = Runtime::new(
         Mode::default(),
+        Yield::Noop,
         engine_config(),
         risk_config(10, 1_000_000),
         control,
@@ -939,6 +943,7 @@ fn heartbeat_timeout_starts_after_first_heartbeat() {
     .expect("gateway");
     let mut runtime = Runtime::new(
         Mode::Replay { expected_input_seq: 1 },
+        Yield::Noop,
         engine_config(),
         risk_config(10, 1_000_000),
         control,
@@ -1199,6 +1204,7 @@ proptest! {
         .expect("gateway");
         let mut runtime = Runtime::new(
             Mode::Replay { expected_input_seq: 1 },
+            Yield::Noop,
             engine_config(),
             risk_config(100, 10_000_000),
             control,

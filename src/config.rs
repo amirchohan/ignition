@@ -6,6 +6,7 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,7 @@ use crate::{
     domain::{DomainError, DomainResult, Price, rd::InstrumentSpec},
     engine::EngineConfig,
     risk::RiskConfig,
+    runtime::Yield,
 };
 
 /// Canonical deterministic engine configuration shared by every runtime mode.
@@ -156,6 +158,7 @@ pub struct GatewayRuntimeConfig {
 /// Live-only transport and recording configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct LiveConfig {
+    pub idle_yield: IdleYieldConfig,
     pub control: LiveTcpEndpointConfig,
     pub gateway: LiveTcpEndpointConfig,
     pub market_data: LiveMarketDataConfig,
@@ -178,6 +181,7 @@ impl LiveConfig {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        self.idle_yield.resolve()?;
         if self.control.listen_addr.is_empty() || self.gateway.listen_addr.is_empty() {
             return Err(ConfigError::Invalid("live listen addresses must not be empty"));
         }
@@ -188,6 +192,27 @@ impl LiveConfig {
             return Err(ConfigError::Invalid("market-data pending capacity must be greater than zero"));
         }
         Ok(())
+    }
+}
+
+/// Live-loop action taken when neither ingress endpoint makes progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IdleYieldConfig {
+    /// Poll again immediately without asking the scheduler to run another task.
+    Noop,
+    /// Park the runtime thread for the configured number of nanoseconds.
+    Sleep { duration_ns: u64 },
+}
+
+impl IdleYieldConfig {
+    /// Resolve deployment-facing nanoseconds into the runtime's duration type.
+    pub(crate) fn resolve(self) -> Result<Yield, ConfigError> {
+        match self {
+            Self::Noop => Ok(Yield::Noop),
+            Self::Sleep { duration_ns: 0 } => Err(ConfigError::Invalid("idle sleep duration must be greater than zero")),
+            Self::Sleep { duration_ns } => Ok(Yield::Sleep(Duration::from_nanos(duration_ns))),
+        }
     }
 }
 
@@ -252,5 +277,28 @@ mod tests {
 
         assert_eq!(resolved.instrument.instrument_id.raw(), 1001);
         assert_eq!(resolved.risk.startup_reference_price.raw(), 6_500_000);
+    }
+
+    #[test]
+    fn canonical_live_config_selects_noop_idle_yield() {
+        let config = LiveConfig::load("configs/live.yaml").expect("live config");
+
+        assert_eq!(config.idle_yield.resolve().expect("idle yield"), Yield::Noop);
+    }
+
+    #[test]
+    fn idle_yield_config_resolves_noop_and_sleep() {
+        let sleep = serde_yaml::from_str::<IdleYieldConfig>("type: sleep\nduration_ns: 1000\n").expect("sleep yaml");
+
+        assert_eq!(IdleYieldConfig::Noop.resolve().expect("noop"), Yield::Noop);
+        assert_eq!(sleep.resolve().expect("sleep"), Yield::Sleep(Duration::from_nanos(1_000)));
+    }
+
+    #[test]
+    fn idle_yield_config_rejects_zero_sleep() {
+        assert!(matches!(
+            IdleYieldConfig::Sleep { duration_ns: 0 }.resolve(),
+            Err(ConfigError::Invalid("idle sleep duration must be greater than zero"))
+        ));
     }
 }

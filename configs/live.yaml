@@ -1,3 +1,5 @@
+idle_yield: # Selects how the live single-writer loop behaves when both ingress endpoints are idle.
+  type: noop # Polls again immediately; use type: sleep with duration_ns greater than zero to park the thread.
 control: # Configures the dedicated administrative TCP endpoint.
   listen_addr: "127.0.0.1:19001" # Sets the local address on which the server accepts one control connection.
   max_pending_write_bytes: 1048576 # Disconnects the control client if queued responses exceed this byte limit.
